@@ -1,0 +1,195 @@
+# GoReleaser v2 config for the gasworks Go monorepo.
+#
+# WHY THIS EXISTS: the forwarder daemons run unattended holding ingest credentials,
+# so artifact integrity is the load-bearing control of the whole Go rewrite. Every
+# released binary is checksummed, keyless-signed (Fulcio/Rekor), and accompanied by an
+# SBOM + SLSA provenance, so a consumer can verify the binary came from THIS repo's
+# release workflow before trusting it with a credential.
+#
+# CONSUMER VERIFY (what the pack install-stub will run — M19). The verify MUST pin both
+# the signing identity (this repo) and the OIDC issuer (GitHub Actions) and fail closed:
+#
+#   cosign verify-blob \
+#     --certificate-identity-regexp '^https://github\.com/gascity/gasworks/\.github/workflows/release\.yml@refs/tags/v.+$' \
+#     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+#     --signature   <artifact>.sig \
+#     --certificate <artifact>.pem \
+#     <artifact>
+#
+# A bare checksum match is NOT sufficient — checksums.txt is itself signed, so the chain
+# is: verify checksums.txt's .sig/.pem -> trust checksums.txt -> verify each artifact's
+# sha256 against it (and/or verify each artifact's own .sig/.pem the same way).
+#
+# OUT-OF-BAND HUMAN STEPS (cannot be done from this repo):
+#   - The org secret GASWORKS_RELEASE_TOKEN (contents:write on gascity/gasworks AND push
+#     access to gascity/homebrew-tap) must exist. GITHUB_TOKEN alone cannot push the tap.
+#   - The Homebrew tap repo gascity/homebrew-tap must be created out-of-band (empty repo);
+#     GoReleaser pushes the formula into it but will not create the repo.
+version: 2
+
+project_name: gasworks
+
+builds:
+  - id: gasworks
+    main: ./cmd/gasworks
+    binary: gasworks
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gascity/gasworks/internal/version.Version={{ .Version }}
+      - -X github.com/gascity/gasworks/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/gascity/gasworks/internal/version.Date={{ .Date }}
+
+  - id: gasworks-forwarder
+    main: ./cmd/gasworks-forwarder
+    binary: gasworks-forwarder
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/gascity/gasworks/internal/version.Version={{ .Version }}
+      - -X github.com/gascity/gasworks/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/gascity/gasworks/internal/version.Date={{ .Date }}
+
+archives:
+  - id: default
+    ids: [gasworks, gasworks-forwarder]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats: [tar.gz]
+    # Windows consumers expect a zip, not a tar.gz.
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# SBOM per archive (syft). Part of the supply-chain evidence bundle alongside the
+# signatures and provenance. Requires `syft` on the runner (the release workflow
+# installs it via anchore/sbom-action or the cosign installer's companion step).
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+
+# Cosign KEYLESS signing (Fulcio short-lived cert + Rekor transparency log). No private
+# key is stored anywhere; the identity is the GitHub Actions OIDC token of the release
+# job, which is exactly what the consumer verify command pins. id-token: write is granted
+# to the release workflow so cosign can fetch that OIDC token.
+#
+# Two sign blocks:
+#   1. checksums  — signs checksums.txt (the root of the checksum trust chain).
+#   2. artifacts  — signs every archive so a consumer can verify a single download
+#                   directly without first pulling checksums.txt.
+# Each emits a detached <artifact>.sig and the signing certificate <artifact>.pem, so the
+# verifier can pin --certificate-identity-regexp + --certificate-oidc-issuer and fail closed.
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    # COSIGN_EXPERIMENTAL kept for belt-and-braces; cosign v2 sign-blob is keyless by default.
+    env:
+      - COSIGN_EXPERIMENTAL=1
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+    output: true
+
+  - id: artifacts
+    cmd: cosign
+    artifacts: archive
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    env:
+      - COSIGN_EXPERIMENTAL=1
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+    output: true
+
+# SLSA provenance.
+#
+# DECISION: we use GoReleaser's built-in `metadata`/`artifacts.json` output here as the
+# machine-readable build manifest, and produce the authoritative SLSA provenance via the
+# slsa-github-generator in the release WORKFLOW (it consumes goreleaser's artifacts +
+# checksums and emits a v1 provenance attestation tied to the same OIDC identity). The
+# generator is the standard, audited path for SLSA Build L3 and is therefore preferred
+# over a hand-rolled goreleaser hook. The `provenance` job in .github/workflows/release.yml
+# is now ARMED (SHA-pinned slsa-github-generator), fed by the `hash` step that derives the
+# base64 sha256 subjects from this run's dist/artifacts.json. It fires on the next `v*` tag;
+# this metadata block is what that step attests over.
+metadata:
+  mod_timestamp: "{{ .CommitTimestamp }}"
+
+# Homebrew tap — the CLI ONLY. The forwarder daemons are deliberately NOT brewed: they
+# run unattended with credentials and are installed via the verified pack stub (M19), not
+# `brew install`, so their integrity check is never bypassed by a tap fast-path.
+#
+# NOTE (GoReleaser deprecation): as of v2.x `brews` (formula) is being phased out in favor
+# of `homebrew_casks`. It still validates and ships today; when we adopt casks the block
+# below moves to `homebrew_casks:` with the same repository/token/skip_upload semantics.
+# `goreleaser check` returns exit 0 (valid, with a deprecation notice).
+brews:
+  - name: gasworks
+    ids: [default]
+    repository:
+      owner: gascity
+      name: homebrew-tap
+      # GASWORKS_RELEASE_TOKEN needs PUSH access to gascity/homebrew-tap (GITHUB_TOKEN is
+      # scoped to THIS repo and cannot push cross-repo). The tap repo must be created
+      # out-of-band — GoReleaser pushes the formula but does not create the repository.
+      token: "{{ .Env.GASWORKS_RELEASE_TOKEN }}"
+    homepage: "https://github.com/gascity/gasworks"
+    description: "SSO login + getToken (EIA) CLI for Gas City"
+    license: "MIT"
+    # `auto` skips the tap push on snapshots / prereleases so a dry-run never mutates the tap.
+    skip_upload: auto
+    install: |
+      bin.install "gasworks"
+    test: |
+      system "#{bin}/gasworks", "version"
+
+release:
+  github:
+    owner: gascity
+    name: gasworks
+  # Cut as a draft would block the supply-chain step ordering; publish directly. The
+  # binaries are public by design (memory: published to the PUBLIC gascity/gasworks).
+  draft: false
+  prerelease: auto
+
+snapshot:
+  # Don't use `incpatch .Version` here: it parses the latest reachable git tag as semver
+  # and hard-fails the dry-run if an unrelated non-semver tag is reachable (e.g. a shared
+  # monorepo's component tag). A real `v*` release tag always satisfies the version_template
+  # in the release path; this snapshot name only needs to be unique, not semver.
+  version_template: "{{ .ShortCommit }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
