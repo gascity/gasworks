@@ -1,13 +1,14 @@
-# Go CI for the gasworks monorepo. This is SEPARATE from the existing Python `ci.yml`,
-# which stays in place until the Python `src/` is retired at cutover. The two run side by
-# side: ci.yml exercises pytest, this exercises the Go toolchain.
+# Go CI for the gasworks monorepo — the sole CI now that the Python CLI has been retired
+# (the old pytest `ci.yml` was removed in the retire-Python cutover). Runs on PRs and on
+# pushes to main + feature branches.
 name: go-ci
 
 on:
   pull_request:
   push:
     branches:
-      - "feat/**" # feature branches (e.g. feat/gasworks-go-cli) — NOT main, ci.yml owns main
+      - main      # the Python ci.yml (pytest) was retired; go-ci now owns main CI
+      - "feat/**" # feature branches (e.g. feat/gasworks-go-cli)
 
 permissions:
   contents: read
