@@ -1,3 +1,10 @@
+# SECURITY (pull_request_target): this workflow runs with a read/write token in the BASE
+# repo context and is triggered by untrusted PRs. To stay safe it MUST NOT:
+#   - `actions/checkout` the PR HEAD (or any untrusted ref) — that would run fork code under
+#     this privileged token. It checks out nothing; it only calls the labels API.
+#   - interpolate untrusted `${{ github.event.* }}` (PR title/body/branch/comment text) into a
+#     `run:` shell or a `script:` body — pass such values via env/inputs and read them as data.
+# It reads the added label name from context and toggles a fixed label. Keep it that way.
 name: Remove needs-triage when triaged
 
 on:

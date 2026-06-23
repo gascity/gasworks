@@ -1,0 +1,92 @@
+# Go CI for the gasworks monorepo. This is SEPARATE from the existing Python `ci.yml`,
+# which stays in place until the Python `src/` is retired at cutover. The two run side by
+# side: ci.yml exercises pytest, this exercises the Go toolchain.
+name: go-ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "feat/**" # feature branches (e.g. feat/gasworks-go-cli) — NOT main, ci.yml owns main
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # Pinned patch (not the floating "1.26"). The go.mod floor is `go 1.26.4` —
+          # REQUIRED by the github.com/gastownhall/gascity/pkg/eventexport pin (the events
+          # axis), which declares go 1.26.4. 1.26.4 is reproducible and govulncheck-clean
+          # (it also clears the stdlib CVEs that lingered at 1.24.x).
+          go-version: "1.26.4"
+
+      - name: gofmt (fail on unformatted)
+        run: |
+          # gofmt -l lists files that need formatting; any output means the tree is dirty.
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # Supply-chain guard: the build MUST use the committed vendor/ tree (M19), and that
+      # tree MUST exactly match the module graph. `go mod verify` checks the module cache
+      # against go.sum; re-running `go mod vendor` and diffing proves vendor/ is neither
+      # stale nor tampered. A non-empty diff fails the job.
+      - name: Verify vendored dependencies
+        run: |
+          go mod verify
+          go mod vendor
+          git diff --exit-code vendor/ go.mod go.sum
+
+      - name: go build
+        run: go build -mod=vendor ./...
+
+      - name: go vet
+        run: go vet -mod=vendor ./...
+
+      - name: go test (race)
+        run: go test -mod=vendor ./... -race -count=1
+
+      # Vulnerability gate. Installs govulncheck pinned to a released version and fails on
+      # any reachable CVE. Proven clean against go1.26.4 (0 reachable vulns) — 1.26.4 also
+      # clears the stdlib CVEs that lingered at 1.24.x. This gate fails only on a NEW
+      # reachable CVE in the stdlib or a dependency.
+      - name: govulncheck
+        env:
+          # govulncheck@v1.4.0's own go.mod floor is 1.25, so a default install would build
+          # it WITH 1.25 — and a 1.25-built govulncheck cannot analyze this go 1.26.4 module.
+          # GOTOOLCHAIN=local forces it to build + scan with the setup-go 1.26.4 above.
+          GOTOOLCHAIN: local
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
+          # No -mod flag (govulncheck doesn't accept it); with vendor/ present it scans in
+          # vendor mode automatically.
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  # Dry-run the release pipeline on every PR/push to PROVE the static CGO-free cross-build
+  # for all targets keeps working — catches a broken .goreleaser.yaml or a non-portable
+  # dependency before a real `v*` tag is cut. No signing/publishing happens in --snapshot.
+  goreleaser-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26.4"
+
+      - name: GoReleaser snapshot (cross-compile dry-run)
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean
