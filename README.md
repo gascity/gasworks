@@ -4,7 +4,7 @@
 
 This repo also ships **`gasworks-forwarder`**, an unattended daemon that ships coding-agent transcripts (recall) — and, in a future release, gasworks events — to their hosted ingest endpoints.
 
-> **Migration in progress.** This Go rewrite lands _alongside_ the existing Python CLI. Until the first signed `v*` release is tagged, the supported install remains `pipx install git+https://github.com/gascity/gasworks` (the Python CLI, still on `main`); the Homebrew + signed-binary paths below activate with that release. Commands and behavior are identical — see **[MIGRATION.md](./MIGRATION.md)**.
+> Coming from the old `pipx install gasworks` (the Python CLI, now retired)? The Go commands and behavior are identical — see **[MIGRATION.md](./MIGRATION.md)** for the one-step switch to Homebrew.
 
 ## Install
 
