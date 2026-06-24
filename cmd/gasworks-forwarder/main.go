@@ -1,7 +1,7 @@
-// Command gasworks-forwarder ships coding-agent transcripts (recall) and redacted
-// city events (events) to their hosted ingest endpoints. Each AXIS — recall, events —
-// has its OWN config and OWN bearer credential: a recall raw-content token is never
-// shared with the events axis, and vice versa (axis isolation). The dispatch below
+// Command gasworks-forwarder ships coding-agent transcripts (recall), redacted city
+// events (events), and usage facts (usage) to their hosted ingest endpoints. Each
+// AXIS — recall, events, usage — has its OWN config and OWN bearer credential: one
+// axis's token is never shared with another (axis isolation). The dispatch below
 // builds each axis independently so a misconfigured or compromised axis cannot leak
 // its peer's credential.
 //
@@ -9,6 +9,7 @@
 //
 //	recall   run the recall transcript forwarder (RECALL_FORWARDER_* env)
 //	events   run the events forwarder (GASWORKS_EVENTS_* env)
+//	usage    run the usage forwarder, tailing .gc/usage.jsonl (GASWORKS_USAGE_* env)
 //	all      run every axis as independently-restartable goroutines (own config + bearer)
 //
 // Add --once to run a single scan pass and exit (recall only); default is the daemon
@@ -30,6 +31,7 @@ import (
 
 	"github.com/gascity/gasworks/internal/eventsaxis"
 	"github.com/gascity/gasworks/internal/recallaxis"
+	"github.com/gascity/gasworks/internal/usageaxis"
 	"github.com/gascity/gasworks/internal/version"
 )
 
@@ -51,6 +53,8 @@ func run(argv []string) int {
 		return runRecall(ctx, rest)
 	case "events":
 		return runEvents(ctx, rest)
+	case "usage":
+		return runUsage(ctx, rest)
 	case "all":
 		return runAll(ctx, rest)
 	case "version", "--version":
@@ -171,6 +175,52 @@ func runEvents(ctx context.Context, args []string) int {
 	return 0
 }
 
+// runUsage wires the usage axis from GASWORKS_USAGE_* env. It builds the axis's OWN
+// config + bearer and tails the gc usage ledger (.gc/usage.jsonl), forwarding model
+// facts to usage-ingest. With --once it drains to EOF and exits; otherwise it runs
+// the daemon loop.
+func runUsage(ctx context.Context, args []string) int {
+	once := false
+	for _, a := range args {
+		switch a {
+		case "--once":
+			once = true
+		case "-h", "--help":
+			eprintln("usage: gasworks-forwarder usage [--once]")
+			return 0
+		default:
+			eprintf("gasworks-forwarder usage: unknown flag %q", a)
+			return 2
+		}
+	}
+
+	cfg, warn := usageaxis.ConfigFromEnv()
+	if warn != "" {
+		eprintf("gasworks-forwarder: warning: %s", warn)
+	}
+
+	// Validate the destination scheme up front so a plain-http misconfig fails loudly
+	// instead of silently idling — but only when a URL was actually provided.
+	if cfg.URL != "" && !usageaxis.URLOK(cfg.URL, cfg.AllowHTTP) {
+		eprintln("gasworks-forwarder usage: GASWORKS_USAGE_INGEST_URL must be https:// (or localhost http with GASWORKS_USAGE_ALLOW_HTTP=1)")
+		return 1
+	}
+	if !cfg.Enabled() {
+		eprintln("gasworks-forwarder usage: idle — GASWORKS_USAGE_INGEST_URL / _SOURCE_ID / _LEDGER / token not all set (opt in to enable)")
+	}
+
+	runner := usageaxis.NewRunner(cfg, logf)
+	run := runner.Run
+	if once {
+		run = runner.RunOnce
+	}
+	if err := run(ctx); err != nil {
+		eprintf("gasworks-forwarder usage: %v", err)
+		return 1
+	}
+	return 0
+}
+
 // runAll runs recall AND events concurrently, each in its own goroutine with a
 // per-axis recover() + backoff supervisor. This reinstates in-process the isolation
 // the two axes have as separate systemd units: one axis panicking, or its source
@@ -209,7 +259,7 @@ func runAll(ctx context.Context, args []string) int {
 		}
 	)
 
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		recordCode(superviseAxis(ctx, "recall", func() int { return runRecall(ctx, nil) }))
@@ -217,6 +267,10 @@ func runAll(ctx context.Context, args []string) int {
 	go func() {
 		defer wg.Done()
 		recordCode(superviseAxis(ctx, "events", func() int { return runEvents(ctx, nil) }))
+	}()
+	go func() {
+		defer wg.Done()
+		recordCode(superviseAxis(ctx, "usage", func() int { return runUsage(ctx, nil) }))
 	}()
 	wg.Wait()
 	return worst
@@ -286,15 +340,16 @@ func eprintf(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", a
 func eprintln(s string)                  { fmt.Fprintln(os.Stderr, s) }
 
 func usage() {
-	const u = `gasworks-forwarder: ship coding-agent transcripts (recall) and redacted city events to hosted ingest.
+	const u = `gasworks-forwarder: ship coding-agent transcripts (recall), redacted city events (events), and usage facts (usage) to hosted ingest.
 
 Usage:
   gasworks-forwarder recall [--once]   run the recall transcript forwarder
   gasworks-forwarder events            run the events forwarder (tails the supervisor SSE)
+  gasworks-forwarder usage  [--once]   run the usage forwarder (tails .gc/usage.jsonl)
   gasworks-forwarder all               run every axis (own goroutine + recover + backoff)
 
-Each axis has its OWN config + bearer credential (axis isolation): a recall raw-content
-token is never usable by the events axis, and vice versa. The recall axis is configured
-via RECALL_FORWARDER_* env; the events axis via GASWORKS_EVENTS_* env (see the package docs).`
+Each axis has its OWN config + bearer credential (axis isolation): one axis's token is
+never usable by another. recall is configured via RECALL_FORWARDER_* env; events via
+GASWORKS_EVENTS_* env; usage via GASWORKS_USAGE_* env (see the package docs).`
 	fmt.Fprintln(os.Stderr, u)
 }
