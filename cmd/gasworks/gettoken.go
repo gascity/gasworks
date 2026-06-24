@@ -65,14 +65,16 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		return die("you are not a member of org %s", org)
 	}
 
+	// The product must be a mintable product for this org regardless of --scope, so an
+	// explicit scope can't bypass this into a confusing raw STS 400 invalid_target.
+	prod, ok := orgCtx.Products[product]
+	if !ok || len(prod.Scopes) == 0 {
+		return die("no mintable '%s' scope for org %s (entitled products: %s)",
+			product, orgCtx.Slug, productNames(orgCtx.Products))
+	}
 	scope := *scopeFlag
 	if scope == "" {
-		prod, ok := orgCtx.Products[product]
-		if !ok || len(prod.Scopes) == 0 {
-			return die("no mintable '%s' scope for org %s (entitled products: %s)",
-				product, orgCtx.Slug, productNames(orgCtx.Products))
-		}
-		scope = strings.Join(prod.Scopes, " ")
+		scope = strings.Join(prod.Scopes, " ") // default to the discovered scopes
 	}
 
 	cacheKey := org + "|" + product + "|" + scope
