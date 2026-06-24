@@ -279,6 +279,26 @@ func TestGetTokenUnentitledProductIsClearError(t *testing.T) {
 	}
 }
 
+// G11: --scope must NOT bypass the friendly unentitled-product check into a raw STS
+// 400 invalid_target. An explicit scope still requires the product to be mintable.
+func TestGetTokenUnentitledProductWithScopeIsClearError(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+
+	_, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "crucible", "--scope", "crucible:exec"})
+	})
+	if code == 0 {
+		t.Fatal("want non-zero exit for an unentitled product even with --scope")
+	}
+	if !strings.Contains(errOut, "no mintable 'crucible' scope") {
+		t.Fatalf("stderr = %q, want the clear unentitled-product error", errOut)
+	}
+	if got := srv.reqs("/sts/v0/token"); len(got) != 0 {
+		t.Fatalf("must NOT reach the STS token endpoint for an unentitled product, got %d mints", len(got))
+	}
+}
+
 func TestGetTokenRequiresLogin(t *testing.T) {
 	srv := newStub(t)
 	seed(t, srv, map[string]any{}) // no refresh token / id token
