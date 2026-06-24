@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,50 @@ type readResult struct {
 	data    []byte
 	size    int64 // stat size at read time
 	mtimeNS int64
+	// gcSessionID is the gc session id read from the transcript's sidecar
+	// (<path>.gcmeta), or "" when there is none. Populated just before upload.
+	gcSessionID string
+}
+
+// sidecarSuffix matches the producer (gascity internal/transcriptmeta.Suffix):
+// the session-id sidecar lives at "<transcript-path>.gcmeta".
+const sidecarSuffix = ".gcmeta"
+
+// maxSidecarBytes caps the sidecar read. A sidecar holds one opaque session id
+// (far under this); the cap bounds memory the same way the transcript read does.
+const maxSidecarBytes = 256
+
+// readGCSessionID returns the gc session id recorded in the sidecar next to
+// path, or "" when the sidecar is absent, not a regular file, oversized, empty,
+// or not a safe HTTP header value. It reuses the hardened transcript read
+// primitive (readCappedOS: O_NOFOLLOW + O_NONBLOCK + fstat regular-file + size
+// cap, no TOCTOU), so a planted symlink, FIFO, device, or giant file at
+// "<path>.gcmeta" can neither exfiltrate another file's contents into the
+// egress header, wedge the single-goroutine scan loop, nor exhaust memory.
+// Best-effort: any problem yields "" and never blocks the transcript upload.
+func readGCSessionID(path string) string {
+	rr, ok := readCappedOS(path+sidecarSuffix, maxSidecarBytes)
+	if !ok {
+		return ""
+	}
+	id := strings.TrimSpace(string(rr.data))
+	if id == "" || !isSafeHeaderValue(id) {
+		return ""
+	}
+	return id
+}
+
+// isSafeHeaderValue reports whether s is safe to send as an HTTP header value:
+// printable ASCII with no spaces or control bytes, so a malformed sidecar can
+// never inject a header or smuggle CR/LF. gc session ids are opaque
+// alphanumeric+dash tokens, well within this.
+func isSafeHeaderValue(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 // readCapped opens path (no symlink follow), fstats it, and reads up to MaxBytes. It
@@ -54,6 +99,11 @@ func postSnapshot(ctx context.Context, client *http.Client, cfg Config, token st
 	h.Set("X-Cass-Sha256", s2)
 	h.Set("X-Cass-Source-Mtime-Ns", strconv.FormatInt(rr.mtimeNS, 10))
 	h.Set("X-Cass-Source-Size", strconv.FormatInt(rr.size, 10))
+	if rr.gcSessionID != "" {
+		// Lets the server tie this transcript to a gc session (and thus the
+		// event-stream run timeline). Absent when the producer wrote no sidecar.
+		h.Set("X-Cass-Gc-Session-Id", rr.gcSessionID)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -177,6 +227,11 @@ func (r *Runner) ScanOnce(ctx context.Context, st *State) ScanStats {
 			st.Put(c.path, prior)
 			continue
 		}
+
+		// Best-effort: attach the gc session id from the sidecar (if any). Read
+		// only when we are actually uploading, so it costs nothing on the
+		// unchanged-content fast path above.
+		rr.gcSessionID = readGCSessionID(c.path)
 
 		status, perr := r.post(ctx, r.client, r.cfg, token, c, rr)
 		if perr != nil {
