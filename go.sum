@@ -82,6 +82,8 @@ github.com/fsnotify/fsnotify v1.9.0/go.mod h1:8jBTzvmWwFyi3Pb8djgCCO5IBqzKJ/Jwo8
 github.com/fxamacker/cbor/v2 v2.9.0/go.mod h1:vM4b+DJCtHn+zz7h3FFp/hDAI9WNWCsZj23V5ytsSxQ=
 github.com/gastownhall/gascity v1.1.1-0.20260623105741-7f39639d10e4 h1:etqaLgALN8GLpwVn5zsLQcQqXblOkD4C2p6Lveo/W24=
 github.com/gastownhall/gascity v1.1.1-0.20260623105741-7f39639d10e4/go.mod h1:5JJlHcDWGZd2zQ+p709xihilBiLr7oLT9hTLeLa9g0M=
+github.com/gastownhall/gascity v1.1.1-0.20260625212128-87de14874a96 h1:Gp0Y0dHFcmvrd79KH3dUDg2Hzv+vWOYA4UAeQx7Paxg=
+github.com/gastownhall/gascity v1.1.1-0.20260625212128-87de14874a96/go.mod h1:5JJlHcDWGZd2zQ+p709xihilBiLr7oLT9hTLeLa9g0M=
 github.com/gastownhall/gascity-packs v0.3.1-0.20260617013242-33d3a430a67d/go.mod h1:OHqPd055b+3Q93mZqxdwTk2/3sz+xxCBUWlggvuRnMk=
 github.com/go-jose/go-jose/v4 v4.1.4/go.mod h1:x4oUasVrzR7071A4TnHLGSPpNOm2a21K9Kf04k1rs08=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=

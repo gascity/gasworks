@@ -11,6 +11,13 @@
 // or non-allowlisted event type is dropped, and the envelope is a closed struct
 // so a newly-added source field can never escape by default.
 //
+// EXCEPTION (opt-in): two envelope fields — Title and Formula — carry free-form
+// content (a bead's human title; a run's formula name). They are the deliberate
+// reversal of the envelope-only default, emitted ONLY when Options.EmitContent is
+// set (an explicit operator/org content opt-in), length-capped, and never on a
+// mail-reduced type. With EmitContent unset (the default) the projection stays
+// envelope-only and no content leaves the box.
+//
 // The package imports only the standard library. The supervisor-coupled event
 // source (which knows about internal/events) lives in a separate adapter so
 // this package stays a dependency-light, OSS-consumable projection contract.
@@ -51,8 +58,9 @@ const (
 )
 
 const (
-	maxRefLen  = 64 // run_id/session_id/ref over this are DROPPED, not truncated.
-	minSaltLen = 16 // below this the salted actor hash is brute-forceable; fail closed.
+	maxRefLen     = 64  // run_id/session_id/ref over this are DROPPED, not truncated.
+	minSaltLen    = 16  // below this the salted actor hash is brute-forceable; fail closed.
+	maxContentLen = 256 // free-form title/formula over this are DROPPED, not truncated.
 )
 
 // allowedTypes is the default-deny allowlist of exportable event types, keyed by
@@ -127,6 +135,13 @@ type Envelope struct {
 	Ref       string `json:"ref,omitempty"`        // id-regex-gated reference (opaque id/slug only)
 	RunID     string `json:"run_id,omitempty"`     // opaque run-root correlation id (safeRef-gated)
 	SessionID string `json:"session_id,omitempty"` // opaque session correlation id (safeRef-gated)
+	StepID    string `json:"step_id,omitempty"`    // opaque acting-work-bead (run step) id; safeRef-gated, EmitCorrelation
+	// Title/Formula are the DELIBERATE exception to envelope-only: free-form content
+	// (a bead's human title; a run's formula name), gated by Options.EmitContent (an
+	// explicit operator/org content opt-in), length-capped (dropped, not truncated),
+	// and NOT routed through the opaque-id machinery. They ship empty unless EmitContent.
+	Title   string `json:"title,omitempty"`
+	Formula string `json:"formula,omitempty"`
 }
 
 // Batch is one POST body: the events for a single city.
@@ -141,7 +156,8 @@ type Options struct {
 	Salt            []byte  // actor-hash salt; must be >= 16 bytes (ProjectEvent fails closed otherwise)
 	ExportRef       bool    // include the id-gated ref (opaque ids/slugs only)
 	Profile         Profile // redaction profile (default ProfileRedactedEnvelope)
-	EmitCorrelation bool    // emit opaque run_id/session_id; default false (they ship empty in v0)
+	EmitCorrelation bool    // emit opaque run_id/session_id/step_id; default false (they ship empty in v0)
+	EmitContent     bool    // emit free-form Title/Formula; default false. REVERSES the envelope-only default — set ONLY under an explicit operator/org content opt-in.
 }
 
 // ActorHash returns a salted, non-reversible, 16-hex fingerprint of an actor.
@@ -198,6 +214,21 @@ func ProjectEvent(te TaggedEvent, opt Options) (Envelope, bool) {
 		if s := safeRef(te.SessionID); s != "" {
 			env.SessionID = s
 		}
+		if st := safeRef(te.StepID); st != "" {
+			env.StepID = st
+		}
+	}
+	// Content fields are the deliberate exception to the envelope-only default:
+	// gated by EmitContent (NOT the opaque-id machinery), length-capped (dropped,
+	// not truncated), and — via the mailReduced early-return above — never on a
+	// mail-reduced type.
+	if opt.EmitContent {
+		if t := capContent(te.Title); t != "" {
+			env.Title = t
+		}
+		if f := capContent(te.Formula); f != "" {
+			env.Formula = f
+		}
 	}
 	return env, true
 }
@@ -219,7 +250,7 @@ func ValidateEnvelope(env Envelope) error {
 		return fmt.Errorf("eventexport: invalid ts %q", env.TS)
 	}
 	if mailReduced[env.Type] {
-		if env.ActorHash != "" || env.Ref != "" || env.RunID != "" || env.SessionID != "" {
+		if env.ActorHash != "" || env.Ref != "" || env.RunID != "" || env.SessionID != "" || env.StepID != "" || env.Title != "" || env.Formula != "" {
 			return fmt.Errorf("eventexport: %q must carry only {seq,type,ts}", env.Type)
 		}
 		return nil
@@ -240,6 +271,17 @@ func ValidateEnvelope(env Envelope) error {
 	}
 	if env.SessionID != "" && !IsOpaqueRef(env.SessionID) {
 		return fmt.Errorf("eventexport: session_id %q is not an opaque id", env.SessionID)
+	}
+	if env.StepID != "" && !IsOpaqueRef(env.StepID) {
+		return fmt.Errorf("eventexport: step_id %q is not an opaque id", env.StepID)
+	}
+	// Title/Formula are free-form content (the EmitContent exception): the wire
+	// invariant is a length bound, NOT opaqueness — charset is unrestricted.
+	if len(env.Title) > maxContentLen {
+		return fmt.Errorf("eventexport: title exceeds %d bytes", maxContentLen)
+	}
+	if len(env.Formula) > maxContentLen {
+		return fmt.Errorf("eventexport: formula exceeds %d bytes", maxContentLen)
 	}
 	return nil
 }
@@ -308,6 +350,17 @@ func safeRef(s string) string {
 	first := s[0]
 	firstAlnum := (first >= 'a' && first <= 'z') || (first >= '0' && first <= '9')
 	if !firstAlnum {
+		return ""
+	}
+	return s
+}
+
+// capContent returns s iff it is non-empty and within the content length bound;
+// an over-cap value is DROPPED (not truncated — a half-string is worse than
+// absent). Unlike safeRef it does NOT restrict the charset: Title/Formula are
+// free text by design (the EmitContent exception to the envelope-only contract).
+func capContent(s string) string {
+	if s == "" || len(s) > maxContentLen {
 		return ""
 	}
 	return s

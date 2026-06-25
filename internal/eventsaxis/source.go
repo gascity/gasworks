@@ -15,18 +15,67 @@ import (
 	"github.com/gastownhall/gascity/pkg/eventexport"
 )
 
-// rawEvent is the MINIMAL slice of a supervisor SSE event we ever decode. These
-// are the ONLY fields that may cross into a projectable TaggedEvent. Message,
-// Payload, and every other field on the wire are deliberately absent here — the
-// JSON decoder discards them, so free-form content can never be lifted into the
-// envelope. (The supervisor ships run_id/session_id empty in v0; we do not decode
-// them — that is the deferred typed-field follow-up.)
+// rawEvent is the slice of a supervisor SSE event we decode. seq/type/ts/actor/
+// subject are always read. Payload is decoded ONLY when content emission is opted
+// in (Config.EmitContent): liftContent then extracts the bead title + the opaque
+// gc.step_id / run-formula metadata from it. With the opt-in OFF (the default) the
+// payload is ignored and no free-form content is lifted — the envelope-only
+// contract holds. (run_id/session_id ship empty in v0; we do not decode them.)
 type rawEvent struct {
-	Seq     uint64 `json:"seq"`
-	Type    string `json:"type"`
-	TS      string `json:"ts"`
-	Actor   string `json:"actor"`
-	Subject string `json:"subject"`
+	Seq     uint64          `json:"seq"`
+	Type    string          `json:"type"`
+	TS      string          `json:"ts"`
+	Actor   string          `json:"actor"`
+	Subject string          `json:"subject"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// beadPayload is the minimal slice of a bead.* event payload read under the
+// content opt-in: the human title and the gc.* step/formula metadata.
+type beadPayload struct {
+	Bead struct {
+		Title    string            `json:"title"`
+		Metadata map[string]string `json:"metadata"`
+	} `json:"bead"`
+}
+
+// liftContent extracts the opt-in content/correlation fields from a bead.* event
+// payload: the bead title, the opaque gc.step_id, and the run formula name
+// (gc.formula_name, else derived from the gc.step_ref "mol-<formula>.<step>"
+// prefix). Best-effort: a malformed or absent payload yields empties, never an
+// error — a bad payload must never wedge the stream. This is the ONLY place the
+// axis reads the SSE payload, reached solely when Config.EmitContent is set.
+func liftContent(payload json.RawMessage) (title, stepID, formula string) {
+	if len(payload) == 0 {
+		return "", "", ""
+	}
+	var bp beadPayload
+	if err := json.Unmarshal(payload, &bp); err != nil {
+		return "", "", ""
+	}
+	title = bp.Bead.Title
+	if m := bp.Bead.Metadata; m != nil {
+		stepID = m["gc.step_id"]
+		if formula = m["gc.formula_name"]; formula == "" {
+			formula = formulaFromStepRef(m["gc.step_ref"])
+		}
+	}
+	return title, stepID, formula
+}
+
+// formulaFromStepRef derives the run formula name from a gc.step_ref of the form
+// "mol-<formula>.<step>" (e.g. "mol-randy-triage-patrol.apply" -> "randy-triage-patrol").
+// Returns "" when the ref is not in that shape.
+func formulaFromStepRef(ref string) string {
+	const pfx = "mol-"
+	if !strings.HasPrefix(ref, pfx) {
+		return ""
+	}
+	rest := ref[len(pfx):]
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 // sseSource implements eventexport.Source. It tails one supervisor SSE stream per
@@ -35,11 +84,12 @@ type rawEvent struct {
 // independently with capped backoff and resumes from its last-acked cursor via the
 // after_seq query param + Last-Event-ID header.
 type sseSource struct {
-	supervisor string
-	cities     []string
-	client     *http.Client
-	cursors    map[string]uint64 // city -> resume seq (last acked)
-	logf       func(format string, args ...any)
+	supervisor  string
+	cities      []string
+	client      *http.Client
+	cursors     map[string]uint64 // city -> resume seq (last acked)
+	logf        func(format string, args ...any)
+	emitContent bool // when true, lift bead title + gc.* step/formula off the payload
 
 	events chan eventexport.TaggedEvent
 }
@@ -52,12 +102,13 @@ func newSSESource(ctx context.Context, cfg Config, client *http.Client, cursors 
 		logf = func(string, ...any) {}
 	}
 	s := &sseSource{
-		supervisor: cfg.Supervisor,
-		cities:     append([]string(nil), cfg.Cities...),
-		client:     client,
-		cursors:    cursors,
-		logf:       logf,
-		events:     make(chan eventexport.TaggedEvent, 256),
+		supervisor:  cfg.Supervisor,
+		cities:      append([]string(nil), cfg.Cities...),
+		client:      client,
+		cursors:     cursors,
+		logf:        logf,
+		emitContent: cfg.EmitContent,
+		events:      make(chan eventexport.TaggedEvent, 256),
 	}
 	go s.run(ctx)
 	return s
@@ -155,9 +206,10 @@ func (s *sseSource) streamOnce(ctx context.Context, city string) error {
 	return sc.Err()
 }
 
-// dispatch decodes one SSE `data:` payload into a TaggedEvent — mapping ONLY the
-// typed primitive fields, never Message/Payload — and hands it to the exporter. It
-// returns false only when ctx is cancelled (the source is shutting down). A
+// dispatch decodes one SSE `data:` payload into a TaggedEvent — mapping the typed
+// primitive fields, plus (only under the EmitContent opt-in) the bead title +
+// gc.step_id/run-formula lifted from the payload via liftContent — and hands it to
+// the exporter. It returns false only when ctx is cancelled (shutting down). A
 // payload that fails to parse, or whose ts is unparseable, is dropped quietly: the
 // projector would reject it anyway, and a malformed line must not kill the stream.
 func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool {
@@ -173,6 +225,11 @@ func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool
 		Actor:   r.Actor,
 		Subject: r.Subject,
 		// RunID/SessionID intentionally left empty in v0.
+	}
+	if s.emitContent {
+		// The ONLY place this axis reads the SSE payload, reached solely under the
+		// content opt-in: lift the bead title + opaque gc.step_id / run-formula.
+		te.Title, te.StepID, te.Formula = liftContent(r.Payload)
 	}
 	select {
 	case s.events <- te:

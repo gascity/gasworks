@@ -68,6 +68,12 @@ type Config struct {
 	Salt []byte
 	// ExportRef includes the id-gated ref (opaque bead/convoy ids only).
 	ExportRef bool
+	// EmitContent opts in to lifting free-form content (bead title, run formula)
+	// plus the opaque gc.step_id off the SSE payload. It REVERSES the envelope-only
+	// default and also turns on the opaque correlation ids (run_id/session_id/
+	// step_id), since step_id is the join key those content fields exist for. Set
+	// ONLY under an explicit operator/org content opt-in; default false.
+	EmitContent bool
 	// StatePath is the per-city cursor file (resume point).
 	StatePath string
 	// BatchMax is the max events per POST.
@@ -100,6 +106,8 @@ func (c Config) Enabled() bool {
 //	GASWORKS_EVENTS_TOKEN         bearer token (dev-only, popped from env)
 //	GASWORKS_EVENTS_SALT          actor-hash salt (>= 16 bytes or events are dropped)
 //	GASWORKS_EVENTS_EXPORT_REF    include the id-gated ref (default on)
+//	GASWORKS_EVENTS_EMIT_CONTENT  "1" to lift bead title + run formula + gc.step_id
+//	                              off the payload (default off; REVERSES envelope-only)
 //	GASWORKS_EVENTS_STATE         cursor file (default XDG state dir)
 //	GASWORKS_EVENTS_BATCH_MAX     max events per POST (default 1000)
 //	GASWORKS_EVENTS_BATCH_INTERVAL flush interval seconds (default 5)
@@ -140,6 +148,7 @@ func ConfigFromEnv() (Config, string) {
 		Token:         tokenProvider,
 		Salt:          []byte(os.Getenv("GASWORKS_EVENTS_SALT")),
 		ExportRef:     envBool("GASWORKS_EVENTS_EXPORT_REF", true),
+		EmitContent:   envBool("GASWORKS_EVENTS_EMIT_CONTENT", false),
 		StatePath:     state,
 		BatchMax:      envInt("GASWORKS_EVENTS_BATCH_MAX", defaultBatchMax),
 		BatchInterval: envInterval("GASWORKS_EVENTS_BATCH_INTERVAL", defaultBatchEvery),

@@ -1,4 +1,4 @@
-# github.com/gastownhall/gascity v1.1.1-0.20260623105741-7f39639d10e4
+# github.com/gastownhall/gascity v1.1.1-0.20260625212128-87de14874a96
 ## explicit; go 1.26.4
 github.com/gastownhall/gascity/pkg/eventexport
 # github.com/klauspost/cpuid/v2 v2.3.0
