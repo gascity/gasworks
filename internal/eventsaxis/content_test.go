@@ -6,11 +6,12 @@ import (
 )
 
 func TestLiftContent(t *testing.T) {
-	payload := json.RawMessage(`{"bead":{"id":"mc-1","title":"ESCALATION: JSONL spike [HIGH]","metadata":{"gc.step_id":"review-pipeline.synthesize","gc.step_ref":"mol-randy-triage-patrol.apply"}}}`)
+	payload := json.RawMessage(`{"bead":{"id":"mc-1","title":"ESCALATION: JSONL spike [HIGH]","metadata":{"gc.active_work_bead":"review-pipeline.synthesize","gc.step_id":"ignored","gc.step_ref":"mol-randy-triage-patrol.apply"}}}`)
 	title, stepID, formula := liftContent(payload)
 	if title != "ESCALATION: JSONL spike [HIGH]" {
 		t.Errorf("title = %q", title)
 	}
+	// step_id is gc.active_work_bead (the manifold.spend.step_id join key), NOT gc.step_id.
 	if stepID != "review-pipeline.synthesize" {
 		t.Errorf("step_id = %q", stepID)
 	}

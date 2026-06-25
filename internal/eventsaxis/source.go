@@ -55,7 +55,13 @@ func liftContent(payload json.RawMessage) (title, stepID, formula string) {
 	}
 	title = bp.Bead.Title
 	if m := bp.Bead.Metadata; m != nil {
-		stepID = m["gc.step_id"]
+		// step_id = gc.active_work_bead — the logical formula-step id, byte-equal to
+		// manifold.spend.step_id (the usage Fact.StepID source, #3708), so the step->
+		// spend join is exact. NOT gc.step_id.
+		stepID = m["gc.active_work_bead"]
+		// formula = the run's recipe name. Prefer the canonical gc.formula_name (the
+		// producer stamps it on the run-root); fall back to deriving it from the
+		// step bead's gc.step_ref "mol-<formula>.<step>" prefix until that lands.
 		if formula = m["gc.formula_name"]; formula == "" {
 			formula = formulaFromStepRef(m["gc.step_ref"])
 		}
