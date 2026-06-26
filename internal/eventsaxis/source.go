@@ -45,20 +45,25 @@ type beadPayload struct {
 // prefix). Best-effort: a malformed or absent payload yields empties, never an
 // error — a bad payload must never wedge the stream. This is the ONLY place the
 // axis reads the SSE payload, reached solely when Config.EmitContent is set.
-func liftContent(payload json.RawMessage) (title, stepID, formula string) {
+func liftContent(payload json.RawMessage) (title, stepID, runID, formula string) {
 	if len(payload) == 0 {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	var bp beadPayload
 	if err := json.Unmarshal(payload, &bp); err != nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	title = bp.Bead.Title
 	if m := bp.Bead.Metadata; m != nil {
-		// step_id = gc.active_work_bead — the logical formula-step id, byte-equal to
-		// manifold.spend.step_id (the usage Fact.StepID source, #3708), so the step->
-		// spend join is exact. NOT gc.step_id.
-		stepID = m["gc.active_work_bead"]
+		// step_id = the work bead's OWN gc.step_id (the logical formula-step). The
+		// session's gc.active_work_bead (= manifold.spend.step_id) is the same step
+		// for the active bead, so the step->spend join is exact. Work beads carry
+		// gc.step_id, never gc.active_work_bead (that lives on the session).
+		stepID = m["gc.step_id"]
+		// run_id = the run-root bead id (gc.root_bead_id) = beadmeta.ResolveRunID with
+		// no workflow_id, so it equals the run_id the spend plane stamps for the run.
+		// Without this the events plane has no run key and no run can open.
+		runID = m["gc.root_bead_id"]
 		// formula = the run's recipe name. Prefer the canonical gc.formula_name (the
 		// producer stamps it on the run-root); fall back to deriving it from the
 		// step bead's gc.step_ref "mol-<formula>.<step>" prefix until that lands.
@@ -66,7 +71,7 @@ func liftContent(payload json.RawMessage) (title, stepID, formula string) {
 			formula = formulaFromStepRef(m["gc.step_ref"])
 		}
 	}
-	return title, stepID, formula
+	return title, stepID, runID, formula
 }
 
 // formulaFromStepRef derives the run formula name from a gc.step_ref of the form
@@ -234,8 +239,8 @@ func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool
 	}
 	if s.emitContent {
 		// The ONLY place this axis reads the SSE payload, reached solely under the
-		// content opt-in: lift the bead title + opaque gc.step_id / run-formula.
-		te.Title, te.StepID, te.Formula = liftContent(r.Payload)
+		// content opt-in: lift the bead title + opaque run_id/step_id + run-formula.
+		te.Title, te.StepID, te.RunID, te.Formula = liftContent(r.Payload)
 	}
 	select {
 	case s.events <- te:
