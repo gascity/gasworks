@@ -15,18 +15,84 @@ import (
 	"github.com/gastownhall/gascity/pkg/eventexport"
 )
 
-// rawEvent is the MINIMAL slice of a supervisor SSE event we ever decode. These
-// are the ONLY fields that may cross into a projectable TaggedEvent. Message,
-// Payload, and every other field on the wire are deliberately absent here — the
-// JSON decoder discards them, so free-form content can never be lifted into the
-// envelope. (The supervisor ships run_id/session_id empty in v0; we do not decode
-// them — that is the deferred typed-field follow-up.)
+// rawEvent is the slice of a supervisor SSE event we decode. seq/type/ts/actor/
+// subject and the run_id/session_id/step_id correlation ids are read straight off
+// the envelope — they are opaque, system-generated ids (PII-free), so they ride the
+// envelope-only contract and need no content opt-in. The producer stamps them on
+// every event (run_id resolves to the run-root bead id, never empty). Producers that
+// predate the envelope fields send them empty; liftContent then re-derives
+// run_id/step_id from the payload as a fallback (under the content opt-in only).
+// Payload itself is decoded ONLY under Config.EmitContent, when liftContent lifts the
+// free-form bead title + run-formula.
 type rawEvent struct {
-	Seq     uint64 `json:"seq"`
-	Type    string `json:"type"`
-	TS      string `json:"ts"`
-	Actor   string `json:"actor"`
-	Subject string `json:"subject"`
+	Seq       uint64          `json:"seq"`
+	Type      string          `json:"type"`
+	TS        string          `json:"ts"`
+	Actor     string          `json:"actor"`
+	Subject   string          `json:"subject"`
+	RunID     string          `json:"run_id"`
+	SessionID string          `json:"session_id"`
+	StepID    string          `json:"step_id"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// beadPayload is the minimal slice of a bead.* event payload read under the
+// content opt-in: the human title and the gc.* step/formula metadata.
+type beadPayload struct {
+	Bead struct {
+		Title    string            `json:"title"`
+		Metadata map[string]string `json:"metadata"`
+	} `json:"bead"`
+}
+
+// liftContent extracts the opt-in content/correlation fields from a bead.* event
+// payload: the bead title, the opaque gc.step_id, and the run formula name
+// (gc.formula_name, else derived from the gc.step_ref "mol-<formula>.<step>"
+// prefix). Best-effort: a malformed or absent payload yields empties, never an
+// error — a bad payload must never wedge the stream. This is the ONLY place the
+// axis reads the SSE payload, reached solely when Config.EmitContent is set.
+func liftContent(payload json.RawMessage) (title, stepID, runID, formula string) {
+	if len(payload) == 0 {
+		return "", "", "", ""
+	}
+	var bp beadPayload
+	if err := json.Unmarshal(payload, &bp); err != nil {
+		return "", "", "", ""
+	}
+	title = bp.Bead.Title
+	if m := bp.Bead.Metadata; m != nil {
+		// step_id = the work bead's OWN gc.step_id (the logical formula-step). The
+		// session's gc.active_work_bead (= manifold.spend.step_id) is the same step
+		// for the active bead, so the step->spend join is exact. Work beads carry
+		// gc.step_id, never gc.active_work_bead (that lives on the session).
+		stepID = m["gc.step_id"]
+		// run_id = the run-root bead id (gc.root_bead_id) = beadmeta.ResolveRunID with
+		// no workflow_id, so it equals the run_id the spend plane stamps for the run.
+		// Without this the events plane has no run key and no run can open.
+		runID = m["gc.root_bead_id"]
+		// formula = the run's recipe name. Prefer the canonical gc.formula_name (the
+		// producer stamps it on the run-root); fall back to deriving it from the
+		// step bead's gc.step_ref "mol-<formula>.<step>" prefix until that lands.
+		if formula = m["gc.formula_name"]; formula == "" {
+			formula = formulaFromStepRef(m["gc.step_ref"])
+		}
+	}
+	return title, stepID, runID, formula
+}
+
+// formulaFromStepRef derives the run formula name from a gc.step_ref of the form
+// "mol-<formula>.<step>" (e.g. "mol-randy-triage-patrol.apply" -> "randy-triage-patrol").
+// Returns "" when the ref is not in that shape.
+func formulaFromStepRef(ref string) string {
+	const pfx = "mol-"
+	if !strings.HasPrefix(ref, pfx) {
+		return ""
+	}
+	rest := ref[len(pfx):]
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 // sseSource implements eventexport.Source. It tails one supervisor SSE stream per
@@ -35,11 +101,12 @@ type rawEvent struct {
 // independently with capped backoff and resumes from its last-acked cursor via the
 // after_seq query param + Last-Event-ID header.
 type sseSource struct {
-	supervisor string
-	cities     []string
-	client     *http.Client
-	cursors    map[string]uint64 // city -> resume seq (last acked)
-	logf       func(format string, args ...any)
+	supervisor  string
+	cities      []string
+	client      *http.Client
+	cursors     map[string]uint64 // city -> resume seq (last acked)
+	logf        func(format string, args ...any)
+	emitContent bool // when true, lift bead title + gc.* step/formula off the payload
 
 	events chan eventexport.TaggedEvent
 }
@@ -52,12 +119,13 @@ func newSSESource(ctx context.Context, cfg Config, client *http.Client, cursors 
 		logf = func(string, ...any) {}
 	}
 	s := &sseSource{
-		supervisor: cfg.Supervisor,
-		cities:     append([]string(nil), cfg.Cities...),
-		client:     client,
-		cursors:    cursors,
-		logf:       logf,
-		events:     make(chan eventexport.TaggedEvent, 256),
+		supervisor:  cfg.Supervisor,
+		cities:      append([]string(nil), cfg.Cities...),
+		client:      client,
+		cursors:     cursors,
+		logf:        logf,
+		emitContent: cfg.EmitContent,
+		events:      make(chan eventexport.TaggedEvent, 256),
 	}
 	go s.run(ctx)
 	return s
@@ -155,11 +223,13 @@ func (s *sseSource) streamOnce(ctx context.Context, city string) error {
 	return sc.Err()
 }
 
-// dispatch decodes one SSE `data:` payload into a TaggedEvent — mapping ONLY the
-// typed primitive fields, never Message/Payload — and hands it to the exporter. It
-// returns false only when ctx is cancelled (the source is shutting down). A
-// payload that fails to parse, or whose ts is unparseable, is dropped quietly: the
-// projector would reject it anyway, and a malformed line must not kill the stream.
+// dispatch decodes one SSE `data:` payload into a TaggedEvent — mapping the typed
+// primitive fields + the opaque run_id/session_id/step_id correlation ids off the
+// envelope, plus (only under the EmitContent opt-in) the bead title + run-formula
+// lifted from the payload via liftContent — and hands it to the exporter. It returns
+// false only when ctx is cancelled (shutting down). A payload that fails to parse, or
+// whose ts is unparseable, is dropped quietly: the projector would reject it anyway,
+// and a malformed line must not kill the stream.
 func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool {
 	var r rawEvent
 	if err := json.Unmarshal(data, &r); err != nil {
@@ -172,7 +242,28 @@ func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool
 		Ts:      parseTS(r.TS),
 		Actor:   r.Actor,
 		Subject: r.Subject,
-		// RunID/SessionID intentionally left empty in v0.
+		// Opaque correlation ids straight off the envelope (PII-free; the projection
+		// safeRef-gates them and emits them only under EmitCorrelation). Empty on
+		// producers that predate the envelope fields — then re-derived from the payload
+		// below under the content opt-in.
+		RunID:     r.RunID,
+		SessionID: r.SessionID,
+		StepID:    r.StepID,
+	}
+	if s.emitContent {
+		// The ONLY place this axis reads the SSE payload, reached solely under the
+		// content opt-in: lift the bead title + run-formula. For producers that don't
+		// yet carry the ids on the envelope, derive run_id/step_id from the payload
+		// metadata (gc.root_bead_id/gc.step_id) as a fallback — the envelope value wins
+		// when present. session_id has no payload source.
+		title, stepID, runID, formula := liftContent(r.Payload)
+		te.Title, te.Formula = title, formula
+		if te.RunID == "" {
+			te.RunID = runID
+		}
+		if te.StepID == "" {
+			te.StepID = stepID
+		}
 	}
 	select {
 	case s.events <- te:

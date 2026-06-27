@@ -12,9 +12,11 @@
 // Payload are never read into any field — and pkg/eventexport reduces that to a
 // fixed envelope (type, time, salted actor hash, id-gated ref). An unknown or
 // non-allowlisted type is dropped, and the envelope is a closed struct so a newly
-// added source field can never escape. run_id/session_id ship EMPTY in v0
-// (EmitCorrelation stays off inside the pkg until a typed-at-record-site source
-// lands), so this axis does NOT parse them off the SSE payload.
+// added source field can never escape. The opaque run_id/session_id/step_id
+// correlation ids ARE carried — read straight off the envelope (the typed,
+// record-site source: the producer stamps them per event), safeRef-gated by
+// pkg/eventexport and emitted under EmitCorrelation. They are system-generated ids,
+// NOT free-form content; the envelope-only content boundary above is unchanged.
 //
 // AXIS ISOLATION.
 // The events bearer + config is SEPARATE from recall's: its own env set
@@ -68,6 +70,19 @@ type Config struct {
 	Salt []byte
 	// ExportRef includes the id-gated ref (opaque bead/convoy ids only).
 	ExportRef bool
+	// EmitCorrelation emits the opaque run_id/session_id/step_id correlation ids
+	// (PII-free, safeRef-gated by pkg/eventexport). They are read off the envelope —
+	// the producer stamps them per event — so this is NOT a content opt-in; default
+	// true now that a typed record-site source lands them. A producer that predates
+	// the envelope fields sends them empty (nothing is emitted). Set false to fall
+	// back to the envelope-minimal shape.
+	EmitCorrelation bool
+	// EmitContent opts in to lifting free-form content (bead title, run formula) off
+	// the SSE payload. It REVERSES the envelope-only default — set ONLY under an
+	// explicit operator/org content opt-in; default false. It additionally lets
+	// liftContent derive run_id/step_id from the payload as a fallback for producers
+	// that predate the envelope correlation fields.
+	EmitContent bool
 	// StatePath is the per-city cursor file (resume point).
 	StatePath string
 	// BatchMax is the max events per POST.
@@ -100,6 +115,10 @@ func (c Config) Enabled() bool {
 //	GASWORKS_EVENTS_TOKEN         bearer token (dev-only, popped from env)
 //	GASWORKS_EVENTS_SALT          actor-hash salt (>= 16 bytes or events are dropped)
 //	GASWORKS_EVENTS_EXPORT_REF    include the id-gated ref (default on)
+//	GASWORKS_EVENTS_EMIT_CORRELATION  emit opaque run_id/session_id/step_id off the
+//	                              envelope (default ON; PII-free ids, "0" to disable)
+//	GASWORKS_EVENTS_EMIT_CONTENT  "1" to lift bead title + run formula off the payload
+//	                              (default off; REVERSES envelope-only)
 //	GASWORKS_EVENTS_STATE         cursor file (default XDG state dir)
 //	GASWORKS_EVENTS_BATCH_MAX     max events per POST (default 1000)
 //	GASWORKS_EVENTS_BATCH_INTERVAL flush interval seconds (default 5)
@@ -134,16 +153,18 @@ func ConfigFromEnv() (Config, string) {
 	}
 
 	return Config{
-		URL:           strings.TrimRight(strings.TrimSpace(os.Getenv("GASWORKS_EVENTS_INGEST_URL")), "/"),
-		Supervisor:    strings.TrimRight(supervisor, "/"),
-		Cities:        splitCities(os.Getenv("GASWORKS_EVENTS_CITIES")),
-		Token:         tokenProvider,
-		Salt:          []byte(os.Getenv("GASWORKS_EVENTS_SALT")),
-		ExportRef:     envBool("GASWORKS_EVENTS_EXPORT_REF", true),
-		StatePath:     state,
-		BatchMax:      envInt("GASWORKS_EVENTS_BATCH_MAX", defaultBatchMax),
-		BatchInterval: envInterval("GASWORKS_EVENTS_BATCH_INTERVAL", defaultBatchEvery),
-		AllowHTTP:     os.Getenv("GASWORKS_EVENTS_ALLOW_HTTP") == "1",
+		URL:             strings.TrimRight(strings.TrimSpace(os.Getenv("GASWORKS_EVENTS_INGEST_URL")), "/"),
+		Supervisor:      strings.TrimRight(supervisor, "/"),
+		Cities:          splitCities(os.Getenv("GASWORKS_EVENTS_CITIES")),
+		Token:           tokenProvider,
+		Salt:            []byte(os.Getenv("GASWORKS_EVENTS_SALT")),
+		ExportRef:       envBool("GASWORKS_EVENTS_EXPORT_REF", true),
+		EmitCorrelation: envBool("GASWORKS_EVENTS_EMIT_CORRELATION", true),
+		EmitContent:     envBool("GASWORKS_EVENTS_EMIT_CONTENT", false),
+		StatePath:       state,
+		BatchMax:        envInt("GASWORKS_EVENTS_BATCH_MAX", defaultBatchMax),
+		BatchInterval:   envInterval("GASWORKS_EVENTS_BATCH_INTERVAL", defaultBatchEvery),
+		AllowHTTP:       os.Getenv("GASWORKS_EVENTS_ALLOW_HTTP") == "1",
 	}, warn
 }
 

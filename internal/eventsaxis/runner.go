@@ -120,8 +120,12 @@ func (r *Runner) Run(ctx context.Context) error {
 		TokenProvider: r.cfg.Token.Token,
 		Salt:          r.cfg.Salt,
 		ExportRef:     r.cfg.ExportRef,
-		BatchMax:      r.cfg.BatchMax,
-		BatchInterval: r.cfg.BatchInterval,
+		// Correlation ids (opaque run_id/session_id/step_id) ride the envelope and are
+		// independent of the free-form content opt-in — they have their own gate.
+		EmitContent:     r.cfg.EmitContent,
+		EmitCorrelation: r.cfg.EmitCorrelation,
+		BatchMax:        r.cfg.BatchMax,
+		BatchInterval:   r.cfg.BatchInterval,
 		// The ingest POST uses its OWN bounded-timeout client, NOT the no-timeout SSE
 		// client, so a hung endpoint can't stall the export loop (L3).
 		Client: r.postClient,
