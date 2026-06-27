@@ -118,13 +118,16 @@ func TestRunner_DisabledNeverDials(t *testing.T) {
 // only ever read the typed primitive fields). Message/Payload carry free-form
 // content that must NEVER reach the exported batch.
 type sseEvent struct {
-	Seq     uint64 `json:"seq"`
-	Type    string `json:"type"`
-	TS      string `json:"ts"`
-	Actor   string `json:"actor"`
-	Subject string `json:"subject"`
-	Message string `json:"message,omitempty"`
-	Payload string `json:"payload,omitempty"`
+	Seq       uint64 `json:"seq"`
+	Type      string `json:"type"`
+	TS        string `json:"ts"`
+	Actor     string `json:"actor"`
+	Subject   string `json:"subject"`
+	RunID     string `json:"run_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	StepID    string `json:"step_id,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Payload   string `json:"payload,omitempty"`
 }
 
 // sseServer streams a fixed slice of events as SSE for one city, honoring after_seq,
@@ -359,9 +362,140 @@ func TestSource_HeartbeatAndMalformedTolerated(t *testing.T) {
 	if !te.Ts.Equal(mustTime("2026-06-21T10:00:00Z")) {
 		t.Fatalf("ts = %v, want parsed RFC3339", te.Ts)
 	}
-	// run_id/session_id must stay empty in v0 (never decoded off the payload).
-	if te.RunID != "" || te.SessionID != "" {
-		t.Fatalf("run_id/session_id must be empty in v0, got %q/%q", te.RunID, te.SessionID)
+	// This envelope carries no correlation ids and there is no content opt-in, so the
+	// projected event stays empty (the producer simply didn't stamp them).
+	if te.RunID != "" || te.SessionID != "" || te.StepID != "" {
+		t.Fatalf("correlation ids must be empty when the envelope omits them, got %q/%q/%q", te.RunID, te.SessionID, te.StepID)
+	}
+}
+
+// TestDispatch_EnvelopeCorrelation proves run_id/session_id/step_id are read off the
+// envelope with no content opt-in, that the payload metadata is only a fallback for
+// producers that omit them, and that the envelope value always wins.
+func TestDispatch_EnvelopeCorrelation(t *testing.T) {
+	cases := []struct {
+		name                           string
+		data                           string
+		emitContent                    bool
+		wantRun, wantSession, wantStep string
+	}{
+		{
+			name:    "envelope ids, no content opt-in",
+			data:    `{"seq":1,"type":"bead.created","ts":"2026-06-27T00:00:00Z","actor":"a","run_id":"mc-root","session_id":"mc-sess","step_id":"synthesize"}`,
+			wantRun: "mc-root", wantSession: "mc-sess", wantStep: "synthesize",
+		},
+		{
+			name:        "no envelope ids + content opt-in -> payload fallback for run/step, session empty",
+			data:        `{"seq":2,"type":"bead.created","ts":"2026-06-27T00:00:00Z","actor":"a","payload":{"bead":{"title":"T","metadata":{"gc.root_bead_id":"mc-fallback","gc.step_id":"apply"}}}}`,
+			emitContent: true,
+			wantRun:     "mc-fallback", wantStep: "apply",
+		},
+		{
+			name:        "envelope wins over payload metadata",
+			data:        `{"seq":3,"type":"bead.created","ts":"2026-06-27T00:00:00Z","actor":"a","run_id":"mc-env","step_id":"env-step","payload":{"bead":{"metadata":{"gc.root_bead_id":"mc-payload","gc.step_id":"payload-step"}}}}`,
+			emitContent: true,
+			wantRun:     "mc-env", wantStep: "env-step",
+		},
+		{
+			name: "no envelope ids, no content opt-in -> empty",
+			data: `{"seq":4,"type":"session.woke","ts":"2026-06-27T00:00:00Z","actor":"a"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &sseSource{events: make(chan eventexport.TaggedEvent, 1), emitContent: tc.emitContent}
+			if !s.dispatch(context.Background(), "c1", []byte(tc.data)) {
+				t.Fatal("dispatch returned false without a ctx cancel")
+			}
+			te := <-s.events
+			if te.RunID != tc.wantRun {
+				t.Errorf("RunID = %q, want %q", te.RunID, tc.wantRun)
+			}
+			if te.SessionID != tc.wantSession {
+				t.Errorf("SessionID = %q, want %q", te.SessionID, tc.wantSession)
+			}
+			if te.StepID != tc.wantStep {
+				t.Errorf("StepID = %q, want %q", te.StepID, tc.wantStep)
+			}
+		})
+	}
+}
+
+// TestRunner_EmitsEnvelopeCorrelation proves the opaque envelope correlation ids flow
+// end-to-end through the projection under EmitCorrelation — WITHOUT the content opt-in —
+// and are withheld when EmitCorrelation is off.
+func TestRunner_EmitsEnvelopeCorrelation(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		emitCorrelation bool
+		wantRun         string
+	}{
+		{"correlation on -> run_id flows", true, "mc-root-bead"},
+		{"correlation off -> envelope-minimal", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := []sseEvent{{
+				Seq: 1, Type: "bead.closed", TS: "2026-06-27T10:00:00Z", Actor: "alice", Subject: "mc-wisp-1",
+				RunID: "mc-root-bead", SessionID: "mc-sess-bead", StepID: "synthesize",
+			}}
+			sse := sseServer(t, events)
+			defer sse.Close()
+			ing := &ingestCapture{}
+			ingest := httptest.NewServer(http.HandlerFunc(ing.handler))
+			defer ingest.Close()
+
+			cfg := Config{
+				URL: ingest.URL, Supervisor: sse.URL, Cities: []string{"c1"},
+				Token: saauth.EnvProvider("b"), Salt: testSalt,
+				ExportRef:       true,
+				EmitCorrelation: tc.emitCorrelation, // EmitContent stays OFF
+				StatePath:       t.TempDir() + "/cursors.json",
+				BatchMax:        100, BatchInterval: 15 * time.Millisecond, AllowHTTP: true,
+			}
+			r := NewRunner(cfg, func(string, ...any) {})
+			r.client = sse.Client()
+			r.postClient = ingest.Client()
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { _ = r.Run(ctx); close(done) }()
+			waitFor(t, 3*time.Second, func() bool {
+				bs, _, _ := ing.snapshot()
+				for _, b := range bs {
+					for _, e := range b.Events {
+						if e.Seq == 1 {
+							return true
+						}
+					}
+				}
+				return false
+			})
+			cancel()
+			<-done
+
+			batches, _, blob := ing.snapshot()
+			var gotRun, gotSession, gotStep string
+			for _, b := range batches {
+				for _, e := range b.Events {
+					if e.Seq == 1 {
+						gotRun, gotSession, gotStep = e.RunID, e.SessionID, e.StepID
+					}
+				}
+			}
+			if gotRun != tc.wantRun {
+				t.Fatalf("exported run_id = %q, want %q", gotRun, tc.wantRun)
+			}
+			if tc.emitCorrelation {
+				if gotSession != "mc-sess-bead" || gotStep != "synthesize" {
+					t.Fatalf("exported session/step = %q/%q, want mc-sess-bead/synthesize", gotSession, gotStep)
+				}
+			} else if gotSession != "" || gotStep != "" {
+				t.Fatalf("correlation off: session/step must be empty, got %q/%q", gotSession, gotStep)
+			}
+			// EmitContent is OFF, so no free-form content rides along even with correlation on.
+			if strings.Contains(blob, `"title"`) || strings.Contains(blob, `"formula"`) {
+				t.Fatalf("content leaked with EmitContent off:\n%s", blob)
+			}
+		})
 	}
 }
 

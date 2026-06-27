@@ -16,18 +16,24 @@ import (
 )
 
 // rawEvent is the slice of a supervisor SSE event we decode. seq/type/ts/actor/
-// subject are always read. Payload is decoded ONLY when content emission is opted
-// in (Config.EmitContent): liftContent then extracts the bead title + the opaque
-// gc.step_id / run-formula metadata from it. With the opt-in OFF (the default) the
-// payload is ignored and no free-form content is lifted — the envelope-only
-// contract holds. (run_id/session_id ship empty in v0; we do not decode them.)
+// subject and the run_id/session_id/step_id correlation ids are read straight off
+// the envelope — they are opaque, system-generated ids (PII-free), so they ride the
+// envelope-only contract and need no content opt-in. The producer stamps them on
+// every event (run_id resolves to the run-root bead id, never empty). Producers that
+// predate the envelope fields send them empty; liftContent then re-derives
+// run_id/step_id from the payload as a fallback (under the content opt-in only).
+// Payload itself is decoded ONLY under Config.EmitContent, when liftContent lifts the
+// free-form bead title + run-formula.
 type rawEvent struct {
-	Seq     uint64          `json:"seq"`
-	Type    string          `json:"type"`
-	TS      string          `json:"ts"`
-	Actor   string          `json:"actor"`
-	Subject string          `json:"subject"`
-	Payload json.RawMessage `json:"payload"`
+	Seq       uint64          `json:"seq"`
+	Type      string          `json:"type"`
+	TS        string          `json:"ts"`
+	Actor     string          `json:"actor"`
+	Subject   string          `json:"subject"`
+	RunID     string          `json:"run_id"`
+	SessionID string          `json:"session_id"`
+	StepID    string          `json:"step_id"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // beadPayload is the minimal slice of a bead.* event payload read under the
@@ -218,11 +224,12 @@ func (s *sseSource) streamOnce(ctx context.Context, city string) error {
 }
 
 // dispatch decodes one SSE `data:` payload into a TaggedEvent — mapping the typed
-// primitive fields, plus (only under the EmitContent opt-in) the bead title +
-// gc.step_id/run-formula lifted from the payload via liftContent — and hands it to
-// the exporter. It returns false only when ctx is cancelled (shutting down). A
-// payload that fails to parse, or whose ts is unparseable, is dropped quietly: the
-// projector would reject it anyway, and a malformed line must not kill the stream.
+// primitive fields + the opaque run_id/session_id/step_id correlation ids off the
+// envelope, plus (only under the EmitContent opt-in) the bead title + run-formula
+// lifted from the payload via liftContent — and hands it to the exporter. It returns
+// false only when ctx is cancelled (shutting down). A payload that fails to parse, or
+// whose ts is unparseable, is dropped quietly: the projector would reject it anyway,
+// and a malformed line must not kill the stream.
 func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool {
 	var r rawEvent
 	if err := json.Unmarshal(data, &r); err != nil {
@@ -235,12 +242,28 @@ func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool
 		Ts:      parseTS(r.TS),
 		Actor:   r.Actor,
 		Subject: r.Subject,
-		// RunID/SessionID intentionally left empty in v0.
+		// Opaque correlation ids straight off the envelope (PII-free; the projection
+		// safeRef-gates them and emits them only under EmitCorrelation). Empty on
+		// producers that predate the envelope fields — then re-derived from the payload
+		// below under the content opt-in.
+		RunID:     r.RunID,
+		SessionID: r.SessionID,
+		StepID:    r.StepID,
 	}
 	if s.emitContent {
 		// The ONLY place this axis reads the SSE payload, reached solely under the
-		// content opt-in: lift the bead title + opaque run_id/step_id + run-formula.
-		te.Title, te.StepID, te.RunID, te.Formula = liftContent(r.Payload)
+		// content opt-in: lift the bead title + run-formula. For producers that don't
+		// yet carry the ids on the envelope, derive run_id/step_id from the payload
+		// metadata (gc.root_bead_id/gc.step_id) as a fallback — the envelope value wins
+		// when present. session_id has no payload source.
+		title, stepID, runID, formula := liftContent(r.Payload)
+		te.Title, te.Formula = title, formula
+		if te.RunID == "" {
+			te.RunID = runID
+		}
+		if te.StepID == "" {
+			te.StepID = stepID
+		}
 	}
 	select {
 	case s.events <- te:

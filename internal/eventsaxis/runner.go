@@ -120,10 +120,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		TokenProvider: r.cfg.Token.Token,
 		Salt:          r.cfg.Salt,
 		ExportRef:     r.cfg.ExportRef,
-		// The content opt-in also turns on the opaque correlation ids: step_id is the
-		// join key the title/formula content exists to support, so they light up together.
+		// Correlation ids (opaque run_id/session_id/step_id) ride the envelope and are
+		// independent of the free-form content opt-in — they have their own gate.
 		EmitContent:     r.cfg.EmitContent,
-		EmitCorrelation: r.cfg.EmitContent,
+		EmitCorrelation: r.cfg.EmitCorrelation,
 		BatchMax:        r.cfg.BatchMax,
 		BatchInterval:   r.cfg.BatchInterval,
 		// The ingest POST uses its OWN bounded-timeout client, NOT the no-timeout SSE
