@@ -44,10 +44,15 @@ def device_login(cfg: Config, print_fn: Callable[[str], None] = print) -> Dict:
     interval = int(body.get("interval", 5))
     deadline = time.time() + int(body.get("expires_in", 600))
     uri = body.get("verification_uri_complete") or body.get("verification_uri")
-    print_fn(f"\nTo sign in, open:\n\n    {uri}\n")
-    if body.get("user_code") and not body.get("verification_uri_complete"):
-        print_fn(f"and enter the code:  {body['user_code']}\n")
-    print_fn("Waiting for you to authorize...")
+    code = body.get("user_code")
+    print_fn("")
+    print_fn("Sign in to Gas City to continue:")
+    print_fn("")
+    print_fn(f"  1. Open:  {uri}")
+    if code and not body.get("verification_uri_complete"):
+        print_fn(f"  2. Enter code:  {code}")
+    print_fn("")
+    print_fn("Waiting for you to authorize... (Ctrl-C to cancel)")
     while time.time() < deadline:
         time.sleep(max(interval, 1))
         try:

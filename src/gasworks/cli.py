@@ -119,7 +119,8 @@ def _pick_org(ctx, requested, data):
     if len(orgs) == 1:
         return orgs[0]["org_id"]
     if not orgs:
-        _die("no orgs for this account")
+        _die("no orgs for this account — run `gasworks whoami` to check your account, "
+             "or ask an admin to add you to an org")
     _die(f"you belong to multiple orgs — pass --org. Your orgs: {_org_list(orgs)}")
 
 
