@@ -195,7 +195,7 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 		return orgs[0].OrgID, nil
 	}
 	if len(orgs) == 0 {
-		return "", die("no orgs for this account")
+		return "", die("no orgs for this account — run `gasworks whoami` to check, or ask an admin to add you to an org")
 	}
 	return "", die("you belong to multiple orgs — pass --org. Your orgs: %s", orgList(orgs))
 }
