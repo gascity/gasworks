@@ -145,3 +145,9 @@ go test ./... -race
 ```
 
 The Go CI (`go-ci.yml`) runs `gofmt -l`, `go build`, `go vet`, `go test -race`, and a GoReleaser snapshot cross-build on every PR. Releases are cut by pushing a `v*` tag, which fires the signed `release.yml` pipeline (merging to `main` does **not** release).
+
+## gasworks CLI (Python)
+
+A small CLI (`src/gasworks/`) for staff/agent credentials: `login` (SSO device/browser,
+DPoP), `getToken <product>` (RFC 8693 → short-lived EIA, cached/auto-refreshed), `whoami`,
+`logout`. Install with `pip install .` (gives the `gasworks` command); tests: `pytest`.
