@@ -143,11 +143,15 @@ func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 	if uri == "" {
 		uri = asString(m["verification_uri"])
 	}
-	logf(fmt.Sprintf("\nTo sign in, open:\n\n    %s\n", uri))
+	logf("")
+	logf("Sign in to Gas City to continue:")
+	logf("")
+	logf(fmt.Sprintf("  1. Open:  %s", uri))
 	if uc := asString(m["user_code"]); uc != "" && asString(m["verification_uri_complete"]) == "" {
-		logf(fmt.Sprintf("and enter the code:  %s\n", uc))
+		logf(fmt.Sprintf("  2. Enter code:  %s", uc))
 	}
-	logf("Waiting for you to authorize...")
+	logf("")
+	logf("Waiting for you to authorize... (Ctrl-C to cancel)")
 
 	// Honor the server-supplied lifetime (the Python uses now + expires_in, default 600s),
 	// but never poll past our local cap. deadline = min(now+expires_in, now+cap).
