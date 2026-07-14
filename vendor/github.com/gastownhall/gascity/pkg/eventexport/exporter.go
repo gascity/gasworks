@@ -235,32 +235,60 @@ func (e *Exporter) flushAll(ctx context.Context) {
 	}
 }
 
-// flushCity ships one city's pending batch (if any) and, on success, advances
-// the cursor to the high-water of processed seqs — past dropped events too, so
-// filtered churn is never re-fetched.
+// flushCity ships one city's pending envelopes in chunks of at most BatchMax
+// per POST, advancing the cursor to each chunk's last seq as it lands. Once
+// pending drains, the cursor advances to the high-water of processed seqs —
+// past dropped events too, so filtered churn is never re-fetched. A failed POST
+// holds the cursor at its last durable point and leaves the unshipped tail
+// pending; the next tick resumes from there. Capping the POST size is what
+// keeps a large backlog drainable against a per-org ingest rate limit: an
+// over-limit batch is rejected whole (429) on every retry and never converges.
 func (e *Exporter) flushCity(ctx context.Context, city string) {
-	e.mu.Lock()
-	batch := e.pending[city]
-	high := e.high[city]
-	cur := e.cursor[city]
-	e.mu.Unlock()
+	for {
+		e.mu.Lock()
+		pending := e.pending[city]
+		high := e.high[city]
+		cur := e.cursor[city]
+		e.mu.Unlock()
 
-	if high <= cur {
-		return // nothing new processed
-	}
-	if len(batch) > 0 {
-		if err := e.post(ctx, city, batch); err != nil {
+		if high <= cur {
+			return // nothing new processed
+		}
+		if len(pending) == 0 {
+			// Dropped-only churn: nothing to ship, just advance the cursor.
+			e.mu.Lock()
+			if e.cursor[city] < high {
+				e.cursor[city] = high
+			}
+			e.mu.Unlock()
+			return
+		}
+		chunk := pending
+		if len(chunk) > e.cfg.BatchMax {
+			chunk = chunk[:e.cfg.BatchMax]
+		}
+		if err := e.post(ctx, city, chunk); err != nil {
 			e.cfg.Logf("eventexport: post failed for %s (cursor held at %d): %v", city, cur, err)
 			return // hold cursor; retry next tick
 		}
+		e.mu.Lock()
+		// Only clear the envelopes we shipped; anything appended since stays.
+		e.pending[city] = e.pending[city][len(chunk):]
+		drained := len(e.pending[city]) == 0
+		acked := chunk[len(chunk)-1].Seq
+		if drained && acked < high {
+			// Seqs between the last shipped envelope and high are filtered events;
+			// cover them only once pending has fully drained.
+			acked = high
+		}
+		if e.cursor[city] < acked {
+			e.cursor[city] = acked
+		}
+		e.mu.Unlock()
+		if drained {
+			return
+		}
 	}
-	e.mu.Lock()
-	// Only clear the envelopes we shipped; anything appended since stays.
-	e.pending[city] = e.pending[city][len(batch):]
-	if e.cursor[city] < high {
-		e.cursor[city] = high
-	}
-	e.mu.Unlock()
 }
 
 func (e *Exporter) post(ctx context.Context, city string, batch []Envelope) error {
