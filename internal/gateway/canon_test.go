@@ -18,6 +18,12 @@ func TestCanonicalHostGoldenVectors(t *testing.T) {
 		{"0.0.0.0", "0.0.0.0"},
 		{"localhost", "localhost"},
 		{"evil.example.", "evil.example"},
+		// Trailing IDNA-mapped separators canonicalize to a dotless host so canon is
+		// idempotent and byte-identical to bd's side.
+		{"gw.example.com。", "gw.example.com"}, // U+3002 ideographic full stop
+		{"gw.example.com．", "gw.example.com"}, // U+FF0E fullwidth full stop
+		{"gw.example.com｡", "gw.example.com"}, // U+FF61 halfwidth ideographic full stop
+		{"gw.example.com..", "gw.example.com"},
 	}
 	for _, tc := range ok {
 		got, err := CanonicalHost(tc.in)
@@ -30,7 +36,9 @@ func TestCanonicalHostGoldenVectors(t *testing.T) {
 		}
 	}
 
-	bad := []string{"", "exa mple.com"}
+	// Inputs that collapse to nothing must ERROR, never return the "" host (which would
+	// poison the allowlist and the credential cache key).
+	bad := []string{"", "exa mple.com", "[]", ".", "[.]", "。"}
 	for _, in := range bad {
 		if got, err := CanonicalHost(in); err == nil {
 			t.Errorf("CanonicalHost(%q) = %q, want an error", in, got)
@@ -42,7 +50,7 @@ func TestCanonicalHostGoldenVectors(t *testing.T) {
 // canonical form again must be a no-op, so the value fed to exec-info, the DSN, and the
 // cache key can never drift on a re-pass.
 func TestCanonicalHostIsIdempotent(t *testing.T) {
-	for _, in := range []string{"GW.Beads.GasCity.com.", "2001:DB8::1", "::FFFF:127.0.0.1", "beads"} {
+	for _, in := range []string{"GW.Beads.GasCity.com.", "2001:DB8::1", "::FFFF:127.0.0.1", "beads", "gw.example.com。", "gw.example.com..", "gw.example.com."} {
 		once, err := CanonicalHost(in)
 		if err != nil {
 			t.Fatalf("CanonicalHost(%q): %v", in, err)
