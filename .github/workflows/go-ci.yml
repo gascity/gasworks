@@ -21,11 +21,12 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # Pinned patch (not the floating "1.26"). The go.mod floor is `go 1.26.4` —
-          # REQUIRED by the github.com/gastownhall/gascity/pkg/eventexport pin (the events
-          # axis), which declares go 1.26.4. 1.26.4 is reproducible and govulncheck-clean
-          # (it also clears the stdlib CVEs that lingered at 1.24.x).
-          go-version: "1.26.4"
+          # Pinned patch (not the floating "1.26"). The go.mod floor stays `go 1.26.4`
+          # (REQUIRED by the github.com/gastownhall/gascity/pkg/eventexport pin, the events
+          # axis) — 1.26.5 satisfies that floor. Bumped 1.26.4 -> 1.26.5 for GO-2026-5856
+          # (Encrypted Client Hello privacy leak in crypto/tls, fixed in go1.26.5); 1.26.5 is
+          # reproducible and govulncheck-clean.
+          go-version: "1.26.5"
 
       - name: gofmt (fail on unformatted)
         run: |
@@ -57,14 +58,13 @@ jobs:
         run: go test -mod=vendor ./... -race -count=1
 
       # Vulnerability gate. Installs govulncheck pinned to a released version and fails on
-      # any reachable CVE. Proven clean against go1.26.4 (0 reachable vulns) — 1.26.4 also
-      # clears the stdlib CVEs that lingered at 1.24.x. This gate fails only on a NEW
-      # reachable CVE in the stdlib or a dependency.
+      # any reachable CVE. Proven clean against go1.26.5 (0 reachable vulns). This gate fails
+      # only on a NEW reachable CVE in the stdlib or a dependency.
       - name: govulncheck
         env:
           # govulncheck@v1.4.0's own go.mod floor is 1.25, so a default install would build
-          # it WITH 1.25 — and a 1.25-built govulncheck cannot analyze this go 1.26.4 module.
-          # GOTOOLCHAIN=local forces it to build + scan with the setup-go 1.26.4 above.
+          # it WITH 1.25 — and a 1.25-built govulncheck cannot analyze this go 1.26.x module.
+          # GOTOOLCHAIN=local forces it to build + scan with the setup-go 1.26.5 above.
           GOTOOLCHAIN: local
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
@@ -84,7 +84,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26.4"
+          go-version: "1.26.5"
 
       - name: GoReleaser snapshot (cross-compile dry-run)
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
