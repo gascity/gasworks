@@ -1,11 +1,13 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func setConfigDir(t *testing.T, sub string) string {
@@ -265,6 +267,57 @@ func TestUnreadableFileDoesNotWipe(t *testing.T) {
 	}
 	if string(raw) != good {
 		t.Errorf("credentials file was modified by a failed Update:\n got %q\nwant %q", string(raw), good)
+	}
+}
+
+// TestWithLockDeadlineAcquiresWhenFree: an uncontended deadline lock runs fn.
+func TestWithLockDeadlineAcquiresWhenFree(t *testing.T) {
+	setConfigDir(t, "cfg")
+	ran := false
+	if err := WithLockDeadline(time.Now().Add(time.Second), func() error {
+		ran = true
+		return nil
+	}); err != nil {
+		t.Fatalf("WithLockDeadline: %v", err)
+	}
+	if !ran {
+		t.Fatal("fn did not run")
+	}
+}
+
+// TestWithLockDeadlineTimesOut is the FIX 5 lock-bounding property: while a peer holds the lock,
+// a deadline-bounded acquire must fail fast with ErrLockTimeout (and NOT run fn) rather than
+// block unboundedly. The advisory lock discriminates by open handle/description, so a second
+// acquirer contends even in-process.
+func TestWithLockDeadlineTimesOut(t *testing.T) {
+	setConfigDir(t, "cfg")
+	held := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = WithLock(func() error {
+			close(held)
+			<-release
+			return nil
+		})
+		close(done)
+	}()
+	<-held
+
+	start := time.Now()
+	err := WithLockDeadline(time.Now().Add(150*time.Millisecond), func() error {
+		t.Error("fn ran while the lock was held by a peer")
+		return nil
+	})
+	elapsed := time.Since(start)
+	close(release)
+	<-done
+
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("err = %v, want ErrLockTimeout", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("blocked %s — WithLockDeadline should fail fast at the deadline, not block", elapsed)
 	}
 }
 

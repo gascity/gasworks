@@ -17,7 +17,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 )
+
+// ErrLockTimeout is returned by WithLockDeadline when the cross-process credential lock could
+// not be acquired before the deadline. A caller uses it to fail fast (or serve-last-good)
+// rather than block unboundedly on a wedged peer (S2-DESIGN §5.5, FIX 5).
+var ErrLockTimeout = errors.New("could not acquire the credential lock before the deadline")
 
 // Session is a per-org STS session plus the DPoP key (PEM) it is jkt-pinned to.
 type Session struct {
@@ -171,6 +177,20 @@ func Save(d *Data) error {
 // call Load/Save directly instead.
 func WithLock(fn func() error) error {
 	unlock, err := lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
+}
+
+// WithLockDeadline runs fn while holding the cross-process config-dir lock, but acquires it
+// NON-BLOCKING with retry until deadline instead of blocking indefinitely. If the lock cannot
+// be taken in time it returns ErrLockTimeout without running fn, so a waiter stuck behind a
+// wedged peer fails fast within the overall mint budget rather than serializing under bd's exec
+// cap (S2-DESIGN §5.5, FIX 5). Like WithLock, fn MUST NOT call Update/Clear/WithLock*.
+func WithLockDeadline(deadline time.Time, fn func() error) error {
+	unlock, err := lockDeadline(deadline)
 	if err != nil {
 		return err
 	}
