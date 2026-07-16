@@ -12,6 +12,7 @@ import (
 var (
 	stdout io.Writer = os.Stdout
 	stderr io.Writer = os.Stderr
+	stdin  io.Reader = os.Stdin
 )
 
 func stdoutf(format string, a ...any) {

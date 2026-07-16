@@ -41,7 +41,7 @@ func cmdWhoami(cfg config.Config, argv []string) error {
 		stdoutf("username: %s", u)
 	}
 
-	ctx, err := sts.Context(cfg, idToken, false)
+	ctx, err := sts.Context(cfg, idToken, false, 0)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 404 {

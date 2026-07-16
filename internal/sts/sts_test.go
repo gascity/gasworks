@@ -120,7 +120,7 @@ func TestLoginAndExchangeOmitSubjectTokenType(t *testing.T) {
 		t.Fatalf("NewKey: %v", err)
 	}
 
-	sess, err := Login(cfg, "ID.TOK.EN", "org_a", key)
+	sess, err := Login(cfg, "ID.TOK.EN", "org_a", key, 0)
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestLoginAndExchangeOmitSubjectTokenType(t *testing.T) {
 		t.Fatalf("session = %+v", sess)
 	}
 
-	eia, err := Exchange(cfg, sess.SessionToken, "manifold", "manifold:proxy manifold:pool:acme", key)
+	eia, err := Exchange(cfg, sess.SessionToken, "manifold", "manifold:proxy manifold:pool:acme", key, 0)
 	if err != nil {
 		t.Fatalf("Exchange: %v", err)
 	}
@@ -173,10 +173,10 @@ func TestLoginAndExchangeReuseOneKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewKey: %v", err)
 	}
-	if _, err := Login(cfg, "ID.TOK.EN", "org_a", key); err != nil {
+	if _, err := Login(cfg, "ID.TOK.EN", "org_a", key, 0); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if _, err := Exchange(cfg, "SESS", "manifold", "manifold:proxy", key); err != nil {
+	if _, err := Exchange(cfg, "SESS", "manifold", "manifold:proxy", key, 0); err != nil {
 		t.Fatalf("Exchange: %v", err)
 	}
 	loginProof := srv.reqs("/sts/v0/login")[0].headers.Get("DPoP")
@@ -188,7 +188,7 @@ func TestLoginAndExchangeReuseOneKey(t *testing.T) {
 
 func TestContextSendsBearerAndProvision(t *testing.T) {
 	cfg, srv := newStub(t)
-	ctx, err := Context(cfg, "ID.TOK.EN", true)
+	ctx, err := Context(cfg, "ID.TOK.EN", true, 0)
 	if err != nil {
 		t.Fatalf("Context: %v", err)
 	}
@@ -223,7 +223,7 @@ func TestContextSendsBearerAndProvision(t *testing.T) {
 
 func TestContextNoProvision(t *testing.T) {
 	cfg, srv := newStub(t)
-	if _, err := Context(cfg, "ID.TOK.EN", false); err != nil {
+	if _, err := Context(cfg, "ID.TOK.EN", false, 0); err != nil {
 		t.Fatalf("Context: %v", err)
 	}
 	// No ?provision=true on the path when provision is false.
@@ -236,7 +236,7 @@ func TestContextNoProvision(t *testing.T) {
 
 func TestEveryCallCarriesUserAgent(t *testing.T) {
 	cfg, srv := newStub(t)
-	if _, err := Context(cfg, "ID.TOK.EN", false); err != nil {
+	if _, err := Context(cfg, "ID.TOK.EN", false, 0); err != nil {
 		t.Fatalf("Context: %v", err)
 	}
 	srv.mu.Lock()

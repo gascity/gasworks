@@ -48,6 +48,8 @@ func run(argv []string) int {
 		err = cmdWhoami(cfg, rest)
 	case "logout":
 		err = cmdLogout(cfg, rest)
+	case "trust-gateway":
+		err = cmdTrustGateway(cfg, rest)
 	case "version", "--version":
 		stdoutLine("gasworks " + version.String())
 		return 0
@@ -132,7 +134,8 @@ func printUsage() {
 
 Usage:
   gasworks login [--device|--browser] [--org <id|slug>]
-  gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--json] [--refresh]
+  gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--gateway <host>] [--project <prj_...>] [--json] [--refresh]
+  gasworks trust-gateway <host> | --remove <host> | --list [--yes]
   gasworks whoami
   gasworks logout
   gasworks version`

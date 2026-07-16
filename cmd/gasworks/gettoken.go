@@ -4,16 +4,27 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"os"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/dpop"
+	"github.com/gascity/gasworks/internal/gateway"
 	"github.com/gascity/gasworks/internal/httpc"
 	"github.com/gascity/gasworks/internal/oidc"
 	"github.com/gascity/gasworks/internal/store"
 	"github.com/gascity/gasworks/internal/sts"
 )
+
+// execInfoEnvVar is the environment variable bd injects to name the destination it is about to
+// dial; ABSENCE marks a direct human invocation (see internal/gateway).
+const execInfoEnvVar = "BEADS_EXEC_INFO"
+
+// projectIDPattern validates the --project shape (prj_ + 16 hex). It is recorded/validated now;
+// scope-pinning against it is a later slice.
+var projectIDPattern = regexp.MustCompile(`^prj_[0-9a-f]{16}$`)
 
 // The three lifecycle freshness thresholds. (M11) They are DISTINCT — do not collapse them.
 const (
@@ -29,6 +40,8 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 	scopeFlag := fs.String("scope", "", "override the discovered scopes (space-separated)")
 	asJSON := fs.Bool("json", false, "emit a JSON envelope instead of the raw EIA")
 	refresh := fs.Bool("refresh", false, "bypass the local EIA cache")
+	gatewayFlag := fs.String("gateway", "", "the hosted gateway host this credential will dial (bd supplies it via BEADS_EXEC_INFO)")
+	projectFlag := fs.String("project", "", "the hosted beads project id (prj_...) this credential targets")
 
 	// argparse interleaves flags and the positional <product>; stdlib flag stops at the first
 	// bareword. Hoist the product out so `getToken manifold --json` and `getToken --json
@@ -38,7 +51,27 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		return die("%s", err)
 	}
 	if product == "" {
-		return die("usage: gasworks getToken <product> [--org ...] [--scope ...] [--json] [--refresh]")
+		return die("usage: gasworks getToken <product> [--org ...] [--scope ...] [--gateway <host>] [--project <prj_...>] [--json] [--refresh]")
+	}
+	if *projectFlag != "" && !projectIDPattern.MatchString(*projectFlag) {
+		return die("invalid --project %q — want a hosted project id like prj_0123456789abcdef", *projectFlag)
+	}
+
+	// Destination gate (S2-DESIGN §5.0/§5.2). Resolve the mint destination — bd's exec-info
+	// host is authoritative, --gateway is the manual fallback — and gate it against the
+	// trusted-gateway allowlist BEFORE any mint or cache read, so a warm cached token can
+	// never be served to an untrusted destination.
+	warn := func(s string) { eprintf("gasworks: %s", s) }
+	dest, err := gateway.Resolve(*gatewayFlag, os.Getenv(execInfoEnvVar), warn)
+	if err != nil {
+		return die("%s", err)
+	}
+	mode, known := gateway.ModeFromEnv(os.Getenv(gateway.EnforceEnvVar))
+	if !known {
+		warn(gateway.EnforceEnvVar + " is not a recognized value; using the compiled default")
+	}
+	if err := gateway.Gate(dest, mode, warn); err != nil {
+		return die("%s", err)
 	}
 
 	idToken, err := ensureIDToken(cfg)
@@ -46,7 +79,7 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		return err
 	}
 
-	ctx, err := sts.Context(cfg, idToken, true)
+	ctx, err := sts.Context(cfg, idToken, true, contextTimeout)
 	if err != nil {
 		return die("discovery failed: %s", err)
 	}
@@ -77,10 +110,13 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		scope = strings.Join(prod.Scopes, " ") // default to the discovered scopes
 	}
 
-	cacheKey := org + "|" + product + "|" + scope
+	// The gateway dimension is a SECURITY key component: a token minted for destination A must
+	// never be served for destination B. The human path (no destination) keys on empty.
+	cacheKey := org + "|" + product + "|" + scope + "|" + dest.Host
+	cached, hadCache := data.EIACache[cacheKey]
 	if !*refresh {
-		if cached, ok := data.EIACache[cacheKey]; ok && cached.ExpiresAt-now() > eiaSkewSecs {
-			emit(cached.EIA, scope, *asJSON)
+		if hadCache && cached.ExpiresAt-now() > eiaReadSkew() {
+			emit(cached.EIA, scope, int(cached.ExpiresAt-now()), *asJSON)
 			return nil
 		}
 	}
@@ -90,24 +126,24 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		return err
 	}
 
-	res, err := sts.Exchange(cfg, sessionToken, product, scope, key)
+	res, err := resilientExchange(cfg, sessionToken, product, scope, key)
 	if err != nil {
 		var he *httpc.HTTPError
 		switch {
 		case errors.As(err, &he) && he.Status == 401:
-			// Session not resolvable — re-establish ONCE (fresh key) and retry exactly once.
+			// Session not resolvable — re-establish ONCE (fresh key) and retry the ladder.
 			sessionToken, key, err = newSession(cfg, org, idToken)
 			if err != nil {
 				return err
 			}
-			res, err = sts.Exchange(cfg, sessionToken, product, scope, key)
+			res, err = resilientExchange(cfg, sessionToken, product, scope, key)
 			if err != nil {
-				return die("getToken failed: %s", err)
+				return serveLastGoodOrDie(err, cached, hadCache, scope, *asJSON)
 			}
 		case errors.As(err, &he) && he.Status == 403:
 			return die("getToken denied: %s (%s)", he.OAuthError(), he)
 		default:
-			return die("getToken failed: %s", err)
+			return serveLastGoodOrDie(err, cached, hadCache, scope, *asJSON)
 		}
 	}
 
@@ -126,14 +162,38 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 	if grantedScope == "" {
 		grantedScope = scope
 	}
-	emit(eia, grantedScope, *asJSON)
+	emit(eia, grantedScope, res.ExpiresIn, *asJSON)
 	return nil
 }
 
+// serveLastGoodOrDie salvages a mint failure by emitting a still-valid cached EIA (above the
+// true-validity floor) with a stderr warning, instead of dying — so a transient STS outage
+// does not break a caller that already holds a usable token. Below the floor it dies.
+func serveLastGoodOrDie(err error, cached store.EIACacheEntry, hadCache bool, scope string, asJSON bool) error {
+	if hadCache {
+		if remain := cached.ExpiresAt - now(); remain > serveLastGoodFloorSecs {
+			eprintf("gasworks: mint failed (%s); serving the still-valid cached credential (%ds left)", err, remain)
+			emit(cached.EIA, scope, int(remain), asJSON)
+			return nil
+		}
+	}
+	return die("getToken failed: %s", err)
+}
+
 // ensureIDToken returns a valid id_token, refreshing (and persisting the rotated refresh
-// token) if needed. (M10) The refresh rotation is persisted in its OWN locked write BEFORE any
-// later mint step, so a crash mid-getToken cannot lose the new refresh token.
+// token) if needed. (M10) The refresh rotation is persisted BEFORE any later mint step, so a
+// crash mid-getToken cannot lose the new refresh token.
+//
+// (§5.5) The refresh is serialized across PROCESSES with the double-checked pattern. Keycloak
+// rotates the refresh token on every use; if N racing getToken processes each present the same
+// stored token, the 2nd..Nth are reuse-detected and Keycloak can revoke the whole offline
+// session family — stranding the durable session and forcing an interactive re-login fleet-wide.
+// So: a fast unlocked freshness check (no lock, no refresh when the id_token is still fresh),
+// then under the store lock a RE-load + RE-check (a peer may have refreshed while we blocked)
+// and a refresh only if still stale, with the round-trip bounded so the lock is never held for
+// long. The first waiter refreshes once; the rest re-read the fresh token and skip.
 func ensureIDToken(cfg config.Config) (string, error) {
+	// Fast path: an unlocked read — a still-fresh id_token needs neither lock nor refresh.
 	data, err := store.Load()
 	if err != nil {
 		return "", die("could not read credentials: %s", err)
@@ -145,20 +205,31 @@ func ensureIDToken(cfg config.Config) (string, error) {
 		return "", die("not logged in — run `gasworks login`")
 	}
 
-	tok, err := oidc.Refresh(cfg, data.RefreshToken)
-	if err != nil {
-		var he *httpc.HTTPError
-		detail := err.Error()
-		if errors.As(err, &he) {
-			if oe := he.OAuthError(); oe != "" {
-				detail = oe
-			}
-		}
-		return "", die("session expired (%s) — run `gasworks login` again", detail)
-	}
-
 	var idToken string
-	if err := store.Update(func(d *store.Data) error {
+	lockErr := store.WithLock(func() error {
+		// RE-load + RE-check under the lock: a peer may have refreshed while we blocked.
+		d, err := store.Load()
+		if err != nil {
+			return die("could not read credentials: %s", err)
+		}
+		if d.IDToken != "" && tokenExp(d.IDToken)-now() > idTokenSkewSecs {
+			idToken = d.IDToken
+			return nil
+		}
+		if d.RefreshToken == "" {
+			return die("not logged in — run `gasworks login`")
+		}
+		tok, err := oidc.Refresh(cfg, d.RefreshToken, refreshTimeout)
+		if err != nil {
+			var he *httpc.HTTPError
+			detail := err.Error()
+			if errors.As(err, &he) {
+				if oe := he.OAuthError(); oe != "" {
+					detail = oe
+				}
+			}
+			return die("session expired (%s) — run `gasworks login` again", detail)
+		}
 		if tok.RefreshToken != "" {
 			d.RefreshToken = tok.RefreshToken // Keycloak rotates — persist it
 		}
@@ -166,9 +237,16 @@ func ensureIDToken(cfg config.Config) (string, error) {
 			d.IDToken = tok.IDToken
 		}
 		idToken = d.IDToken
+		if err := store.Save(d); err != nil {
+			return die("could not persist refreshed token: %s", err)
+		}
 		return nil
-	}); err != nil {
-		return "", die("could not persist refreshed token: %s", err)
+	})
+	if lockErr != nil {
+		if ce, ok := lockErr.(*cmdError); ok {
+			return "", ce
+		}
+		return "", die("could not refresh session: %s", lockErr)
 	}
 	return idToken, nil
 }
@@ -207,7 +285,7 @@ func newSession(cfg config.Config, org, idToken string) (string, *dpop.Key, erro
 	if err != nil {
 		return "", nil, die("could not generate a session key: %s", err)
 	}
-	sess, err := sts.Login(cfg, idToken, org, key)
+	sess, err := sts.Login(cfg, idToken, org, key, loginTimeout)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 403 {
@@ -254,7 +332,12 @@ func ensureSession(cfg config.Config, data *store.Data, org, idToken string) (st
 // the product. The first remaining bareword wins; later ones stay in rest for flag.Parse to
 // reject.
 func hoistPositional(argv []string) (product string, rest []string) {
-	valueFlags := map[string]bool{"-org": true, "--org": true, "-scope": true, "--scope": true}
+	valueFlags := map[string]bool{
+		"-org": true, "--org": true,
+		"-scope": true, "--scope": true,
+		"-gateway": true, "--gateway": true,
+		"-project": true, "--project": true,
+	}
 	rest = make([]string, 0, len(argv))
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -286,14 +369,21 @@ func hoistPositional(argv []string) (product string, rest []string) {
 	return product, rest
 }
 
-func emit(eia, scope string, asJSON bool) {
+// emit writes the EIA to stdout — raw (pipeable) or, with --json, an envelope carrying the
+// REAL expires_in (a thin bd trusts this for its own cache TTL, so a hardcoded value would be
+// a lie). For a cache hit / serve-last-good, expiresIn is the cached token's true remaining
+// seconds; for a fresh mint it is res.ExpiresIn.
+func emit(eia, scope string, expiresIn int, asJSON bool) {
 	if asJSON {
+		if expiresIn < 0 {
+			expiresIn = 0
+		}
 		env := struct {
 			AccessToken string `json:"access_token"`
 			TokenType   string `json:"token_type"`
 			ExpiresIn   int    `json:"expires_in"`
 			Scope       string `json:"scope"`
-		}{eia, "DPoP", 90, scope}
+		}{eia, "DPoP", expiresIn, scope}
 		b, _ := json.Marshal(env)
 		stdoutLine(string(b))
 		return

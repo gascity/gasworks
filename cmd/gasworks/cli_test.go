@@ -28,6 +28,12 @@ type stubServer struct {
 	contextStatus int
 	// refreshTok is the token body returned by the Keycloak refresh grant.
 	refreshTok map[string]any
+	// tokenFails, when > 0, makes the next N /sts/v0/token calls fail with tokenFailStatus
+	// (default 503), to exercise the mint retry ladder / serve-last-good.
+	tokenFails      int
+	tokenFailStatus int
+	// tokenExpiresIn overrides the minted EIA's expires_in (0 keeps the default 90).
+	tokenExpiresIn int
 }
 
 type recordedReq struct {
@@ -95,9 +101,27 @@ func newStub(t *testing.T) *stubServer {
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
 			})
 		case strings.HasSuffix(path, "/sts/v0/token"):
+			s.mu.Lock()
+			fail := s.tokenFails > 0
+			if fail {
+				s.tokenFails--
+			}
+			status := s.tokenFailStatus
+			exp := s.tokenExpiresIn
+			s.mu.Unlock()
+			if fail {
+				if status == 0 {
+					status = http.StatusServiceUnavailable
+				}
+				writeJSON(w, status, map[string]any{"error": "server_error"})
+				return
+			}
+			if exp == 0 {
+				exp = 90
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"access_token": "EIA.JWT", "token_type": "DPoP",
-				"expires_in": 90, "scope": form.Get("scope"),
+				"expires_in": exp, "scope": form.Get("scope"),
 			})
 		case strings.HasSuffix(path, "/sts/v0/context"):
 			if s.contextStatus != 0 {
