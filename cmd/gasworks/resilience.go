@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -10,6 +11,57 @@ import (
 	"github.com/gascity/gasworks/internal/httpc"
 	"github.com/gascity/gasworks/internal/sts"
 )
+
+// transientAuthError marks a TRANSIENT pre-exchange failure (an id_token refresh that failed on a
+// 5xx/429/network/timeout, or a lock/cooldown short-circuit) that a still-valid cached credential
+// may cover via serve-last-good — as opposed to a DEFINITIVE session expiry (invalid_grant / a
+// 4xx), which genuinely needs an interactive `gasworks login`. Keeping the login remedy for the
+// definitive case only stops a headless fleet from being told to "log in" during a Keycloak
+// brownout (S2-DESIGN §5.4, FIX 3).
+type transientAuthError struct {
+	stage string
+	err   error
+}
+
+func (e *transientAuthError) Error() string {
+	return fmt.Sprintf("%s is temporarily unavailable (%s)", e.stage, e.err)
+}
+
+func (e *transientAuthError) Unwrap() error { return e.err }
+
+// resilientContext runs discovery with the same bounded transient-retry ladder as the exchange
+// (STS 429/5xx and network/timeout): up to maxMintAttempts within the overall deadline, each
+// attempt clamped to the remaining budget. A definitive failure (401/403/404/other 4xx) returns
+// immediately so the caller can branch to serve-last-good vs a hard error (FIX 3/4).
+func resilientContext(cfg config.Config, idToken string, overall time.Time) (sts.ContextResolution, error) {
+	deadline := earliest(time.Now().Add(mintLadderBudget), overall)
+	var lastErr error
+	for attempt := 0; attempt < maxMintAttempts; attempt++ {
+		if attempt > 0 {
+			delay := backoffDelay(attempt)
+			if time.Now().Add(delay).After(deadline) {
+				break
+			}
+			time.Sleep(delay)
+		}
+		perAttempt, ok := clampStep(deadline, contextTimeout)
+		if !ok {
+			break
+		}
+		res, err := sts.Context(cfg, idToken, true, perAttempt)
+		if err == nil {
+			return res, nil
+		}
+		if !isTransient(err) {
+			return sts.ContextResolution{}, err
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("discovery ladder exhausted")
+	}
+	return sts.ContextResolution{}, lastErr
+}
 
 // Mint-path resilience budgets. bd runs the credential helper under a ~30s exec cap, so every
 // network step is bounded and the whole exchange ladder plus serve-last-good must fit inside

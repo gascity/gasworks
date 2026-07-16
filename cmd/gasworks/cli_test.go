@@ -28,6 +28,14 @@ type stubServer struct {
 	contextStatus int
 	// refreshTok is the token body returned by the Keycloak refresh grant.
 	refreshTok map[string]any
+	// refreshDelay sleeps before answering the Keycloak /token (refresh) grant.
+	refreshDelay time.Duration
+	// refreshStatus, when non-zero, makes the Keycloak /token (refresh) grant fail with that
+	// status (body {"error": refreshErr}), to exercise transient (5xx) vs definitive (4xx)
+	// refresh-failure classification.
+	refreshStatus int
+	// refreshErr is the OAuth error string for a failing refresh (defaults to "server_error").
+	refreshErr string
 	// tokenFails, when > 0, makes the next N /sts/v0/token calls fail with tokenFailStatus
 	// (default 503), to exercise the mint retry ladder / serve-last-good.
 	tokenFails      int
@@ -92,7 +100,20 @@ func newStub(t *testing.T) *stubServer {
 		case strings.HasSuffix(path, "/protocol/openid-connect/token"):
 			// Both the refresh grant and the device-code grant land here; the CLI tests only
 			// need the token body, which is the same shape for both.
-			writeJSON(w, http.StatusOK, s.refreshTok)
+			s.mu.Lock()
+			delay, status, oaErr, body := s.refreshDelay, s.refreshStatus, s.refreshErr, s.refreshTok
+			s.mu.Unlock()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			if status != 0 {
+				if oaErr == "" {
+					oaErr = "server_error"
+				}
+				writeJSON(w, status, map[string]any{"error": oaErr})
+				return
+			}
+			writeJSON(w, http.StatusOK, body)
 		case strings.HasSuffix(path, "/protocol/openid-connect/revoke"):
 			writeJSON(w, http.StatusOK, map[string]any{})
 		case strings.HasSuffix(path, "/sts/v0/login"):

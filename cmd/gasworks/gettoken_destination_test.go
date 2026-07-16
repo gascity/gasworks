@@ -364,3 +364,96 @@ func TestGetTokenServeLastGoodOnMintFailure(t *testing.T) {
 		t.Fatalf("stderr = %q, want a serve-last-good warning", errOut)
 	}
 }
+
+// FIX 3: discovery down (transient STS 5xx) with a still-valid cached EIA serves last-good on
+// stdout with exit 0 — the serve-last-good path is reachable in its target outage class, not
+// only on exchange failures.
+func TestGetTokenDiscoveryDownServesCached(t *testing.T) {
+	srv := newStub(t)
+	srv.contextStatus = 503                                         // discovery brownout (transient)
+	cacheKey := "org_a|manifold|manifold:proxy manifold:pool:acme|" // human path: empty gateway dim
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      validIDToken(), // fresh: no refresh, straight to discovery
+		"default_org":   "org_a",
+		"eia_cache": map[string]any{
+			cacheKey: map[string]any{"eia": "CACHED.EIA", "expires_at": now() + 120},
+		},
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--org", "org_a"})
+	})
+	if code != 0 {
+		t.Fatalf("discovery-down serve-last-good must exit 0, got %d stderr=%q", code, errOut)
+	}
+	if strings.TrimSpace(out) != "CACHED.EIA" {
+		t.Fatalf("stdout = %q, want the cached EIA (stdout stays pure)", out)
+	}
+	if !strings.Contains(errOut, "temporarily unavailable") {
+		t.Fatalf("stderr = %q, want a transient-outage warning", errOut)
+	}
+}
+
+// FIX 3: a TRANSIENT Keycloak refresh outage (503) with a stale id_token + a still-valid cached
+// EIA serves the cached token, and the message is a transient-outage warning — NOT the "run
+// gasworks login" remedy, which is actionable-wrong for a headless fleet.
+func TestGetTokenRefreshBrownoutServesCachedNotLogin(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshStatus = 503 // Keycloak refresh brownout (transient)
+	cacheKey := "org_a|manifold|manifold:proxy manifold:pool:acme|"
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      expiredIDToken(), // forces the refresh leg
+		"default_org":   "org_a",
+		"eia_cache": map[string]any{
+			cacheKey: map[string]any{"eia": "CACHED.EIA", "expires_at": now() + 120},
+		},
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--org", "org_a"})
+	})
+	if code != 0 {
+		t.Fatalf("refresh brownout serve-last-good must exit 0, got %d stderr=%q", code, errOut)
+	}
+	if strings.TrimSpace(out) != "CACHED.EIA" {
+		t.Fatalf("stdout = %q, want the cached EIA", out)
+	}
+	if !strings.Contains(errOut, "temporarily unavailable") {
+		t.Fatalf("stderr = %q, want a transient-outage warning", errOut)
+	}
+	if strings.Contains(errOut, "gasworks login") {
+		t.Fatalf("stderr = %q, must NOT tell a headless fleet to `gasworks login` on a transient outage", errOut)
+	}
+}
+
+// FIX 3: a DEFINITIVE refresh failure (invalid_grant / 4xx) still dies with the login remedy and
+// does NOT serve a cached token — the offline session is genuinely gone.
+func TestGetTokenDefinitiveRefreshFailureDiesWithLogin(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshStatus = 400
+	srv.refreshErr = "invalid_grant"
+	cacheKey := "org_a|manifold|manifold:proxy manifold:pool:acme|"
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      expiredIDToken(),
+		"default_org":   "org_a",
+		"eia_cache": map[string]any{
+			cacheKey: map[string]any{"eia": "CACHED.EIA", "expires_at": now() + 120},
+		},
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--org", "org_a"})
+	})
+	if code == 0 {
+		t.Fatal("a definitive invalid_grant must not serve a cached token; want non-zero exit")
+	}
+	if !strings.Contains(errOut, "gasworks login") {
+		t.Fatalf("stderr = %q, want the `gasworks login` remedy for a definitive expiry", errOut)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("stdout = %q, want empty (nothing served on a definitive failure)", out)
+	}
+}

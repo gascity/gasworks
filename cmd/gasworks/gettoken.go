@@ -82,15 +82,30 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 
 	idToken, err := ensureIDToken(cfg, deadline)
 	if err != nil {
+		// FIX 3: a TRANSIENT id_token-refresh outage (Keycloak 5xx/brownout) must not break a
+		// caller that already holds a usable token — serve the last-good cached EIA if we can
+		// resolve its key without discovery. A definitive session expiry falls through to its
+		// `gasworks login` remedy.
+		var te *transientAuthError
+		if errors.As(err, &te) {
+			if serveLastGoodByPrefix(*orgFlag, product, dest.Host, *asJSON) {
+				return nil
+			}
+			return die("%s — retry shortly (or run `gasworks login` if it persists)", te)
+		}
 		return err
 	}
 
-	ctxTimeout, ok := clampStep(deadline, contextTimeout)
-	if !ok {
-		return die("discovery budget exhausted before it could run")
-	}
-	ctx, err := sts.Context(cfg, idToken, true, ctxTimeout)
+	ctx, err := resilientContext(cfg, idToken, deadline)
 	if err != nil {
+		// FIX 3: discovery down (transient STS 5xx/restart) with a still-valid cached EIA serves
+		// last-good rather than failing every warm-cache caller into a helper-exec storm.
+		if isTransient(err) {
+			if serveLastGoodByPrefix(*orgFlag, product, dest.Host, *asJSON) {
+				return nil
+			}
+			return die("discovery failed (temporary): %s — retry shortly", err)
+		}
 		return die("discovery failed: %s", err)
 	}
 
@@ -237,6 +252,12 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 		}
 		tok, err := oidc.Refresh(cfg, d.RefreshToken, refreshTO)
 		if err != nil {
+			// FIX 3: distinguish a TRANSIENT refresh outage (5xx/429/network/timeout — the fleet
+			// should back off / serve-last-good) from a DEFINITIVE session expiry (invalid_grant /
+			// a 4xx — the user must re-login). Only the latter gets the `gasworks login` remedy.
+			if isTransient(err) {
+				return &transientAuthError{stage: "session refresh", err: err}
+			}
 			var he *httpc.HTTPError
 			detail := err.Error()
 			if errors.As(err, &he) {
@@ -271,9 +292,56 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 		if ce, ok := lockErr.(*cmdError); ok {
 			return "", ce
 		}
+		if te, ok := lockErr.(*transientAuthError); ok {
+			return "", te
+		}
 		return "", die("could not refresh session: %s", lockErr)
 	}
 	return idToken, nil
+}
+
+// serveLastGoodByPrefix salvages a TRANSIENT pre-exchange outage (id_token refresh or discovery
+// down) by emitting a still-valid cached EIA for the resolved org+product+gateway, so a Keycloak
+// or STS brownout does not break a caller that already holds a usable token (FIX 3, §5.4). The
+// org is resolved WITHOUT discovery from --org (or the stored DefaultOrg); the scope dimension is
+// wildcarded and the freshest match above the serve-last-good floor wins. The gateway dimension is
+// matched exactly, so a token minted for one gateway is never served for another. It returns true
+// iff a token was emitted; stdout stays pure (token only) on that path.
+func serveLastGoodByPrefix(orgFlag, product, gatewayHost string, asJSON bool) bool {
+	data, err := store.Load()
+	if err != nil {
+		return false
+	}
+	org := orgFlag
+	if org == "" {
+		org = data.DefaultOrg
+	}
+	if org == "" {
+		return false // cannot reconstruct the cache key without an org
+	}
+	prefix := org + "|" + product + "|"
+	suffix := "|" + gatewayHost
+	var bestKey string
+	var best store.EIACacheEntry
+	for k, e := range data.EIACache {
+		if !strings.HasPrefix(k, prefix) || !strings.HasSuffix(k, suffix) {
+			continue
+		}
+		if e.ExpiresAt-now() <= serveLastGoodFloorSecs {
+			continue
+		}
+		if bestKey == "" || e.ExpiresAt > best.ExpiresAt {
+			best, bestKey = e, k
+		}
+	}
+	if bestKey == "" {
+		return false
+	}
+	remain := best.ExpiresAt - now()
+	scope := strings.TrimSuffix(strings.TrimPrefix(bestKey, prefix), suffix)
+	eprintf("gasworks: auth is temporarily unavailable; serving the still-valid cached credential (%ds left)", remain)
+	emit(best.EIA, scope, int(remain), asJSON)
+	return true
 }
 
 // pickOrg resolves the org to mint for: --org (id or slug) ▸ stored default_org ▸ the context
