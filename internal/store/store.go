@@ -46,6 +46,12 @@ type Data struct {
 	DefaultOrg   string                   `json:"default_org,omitempty"`
 	Sessions     map[string]Session       `json:"sessions,omitempty"`
 	EIACache     map[string]EIACacheEntry `json:"eia_cache,omitempty"`
+	// RefreshCooldownUntil is a short-lived unix-second marker set when an id_token refresh
+	// FAILS transiently. Concurrent getToken processes within the window fail fast (or serve
+	// last-good) instead of serially re-presenting the same rotating Keycloak refresh token —
+	// which, after a client-side timeout that the server already committed, would trip
+	// reuse-detection and revoke the whole offline-session family (S2-DESIGN §5.5, FIX 5).
+	RefreshCooldownUntil int64 `json:"refresh_cooldown_until,omitempty"`
 }
 
 // ConfigDir resolves the gasworks config directory:

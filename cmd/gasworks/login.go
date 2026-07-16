@@ -71,9 +71,11 @@ func cmdLogin(cfg config.Config, argv []string) error {
 		if *org != "" {
 			d.DefaultOrg = *org
 		}
-		// A fresh login invalidates any prior STS sessions / cached EIAs.
+		// A fresh login invalidates any prior STS sessions / cached EIAs, and clears any stale
+		// refresh cooldown marker (the new offline session is valid).
 		d.Sessions = nil
 		d.EIACache = nil
+		d.RefreshCooldownUntil = 0
 		return nil
 	}); err != nil {
 		return die("could not save credentials: %s", err)

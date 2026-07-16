@@ -89,6 +89,10 @@ const (
 	// NOT served on a mint failure, so bd's ~10s expiry skew cannot instantly re-stale it into
 	// a helper-exec storm.
 	serveLastGoodFloorSecs = 15
+	// refreshCooldownSecs is how long a transient id_token-refresh FAILURE suppresses peer
+	// refreshes: within this window concurrent getToken processes fail fast / serve-last-good
+	// instead of re-presenting the same (possibly already-consumed) refresh token (§5.5, FIX 5).
+	refreshCooldownSecs = 5
 	// minStepFloor is the least remaining budget worth starting a network step with; below it the
 	// caller prefers serve-last-good/die over a doomed sub-timeout call — and never hands httpc a
 	// non-positive timeout (which it would treat as the 30s default, blowing the exec cap).

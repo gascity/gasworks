@@ -207,6 +207,14 @@ func serveLastGoodOrDie(err error, cached store.EIACacheEntry, hadCache bool, sc
 	return die("getToken failed: %s", err)
 }
 
+// errRefreshCooldown / errRefreshBudget are the transient markers a refresh short-circuit
+// carries (§5.5, FIX 5): a peer's recent refresh failure is cooling down, or the overall mint
+// budget was too depleted to start a refresh. Both are serve-last-good-eligible, not a login.
+var (
+	errRefreshCooldown = errors.New("a recent refresh attempt failed; backing off")
+	errRefreshBudget   = errors.New("refresh budget exhausted")
+)
+
 // ensureIDToken returns a valid id_token, refreshing (and persisting the rotated refresh
 // token) if needed. (M10) The refresh rotation is persisted BEFORE any later mint step, so a
 // crash mid-getToken cannot lose the new refresh token.
@@ -231,9 +239,18 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 	if data.RefreshToken == "" {
 		return "", die("not logged in — run `gasworks login`")
 	}
+	// FIX 5(b/c): a peer that just FAILED a refresh left a short cooldown marker. Within it, do
+	// not pile on — a client-side timeout on the prior attempt may mean Keycloak already rotated
+	// (and consumed) the on-disk refresh token, so re-presenting it would trip reuse-detection.
+	// Fail fast so the caller serves-last-good instead.
+	if data.RefreshCooldownUntil > now() {
+		return "", &transientAuthError{stage: "session refresh", err: errRefreshCooldown}
+	}
 
 	var idToken string
-	lockErr := store.WithLock(func() error {
+	// FIX 5(a): acquire the lock NON-BLOCKING with retry to the deadline, so a waiter behind a
+	// wedged peer fails fast (ErrLockTimeout) rather than blocking unboundedly under the exec cap.
+	lockErr := store.WithLockDeadline(deadline, func() error {
 		// RE-load + RE-check under the lock: a peer may have refreshed while we blocked.
 		d, err := store.Load()
 		if err != nil {
@@ -246,9 +263,13 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 		if d.RefreshToken == "" {
 			return die("not logged in — run `gasworks login`")
 		}
+		// A peer may have failed a refresh (and set the cooldown) while we waited for the lock.
+		if d.RefreshCooldownUntil > now() {
+			return &transientAuthError{stage: "session refresh", err: errRefreshCooldown}
+		}
 		refreshTO, ok := clampStep(deadline, refreshTimeout)
 		if !ok {
-			return die("session refresh budget exhausted before it could run")
+			return &transientAuthError{stage: "session refresh", err: errRefreshBudget}
 		}
 		tok, err := oidc.Refresh(cfg, d.RefreshToken, refreshTO)
 		if err != nil {
@@ -256,6 +277,12 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 			// should back off / serve-last-good) from a DEFINITIVE session expiry (invalid_grant /
 			// a 4xx — the user must re-login). Only the latter gets the `gasworks login` remedy.
 			if isTransient(err) {
+				// FIX 5(b/c): persist a short cooldown so peers fail fast instead of serially
+				// re-presenting the same refresh token. The on-disk RT is unchanged (Keycloak
+				// may or may not have rotated it — a timeout leaves that state unknown, which is
+				// exactly why the cooldown, not an immediate retry, is the safe response).
+				d.RefreshCooldownUntil = now() + refreshCooldownSecs
+				_ = store.Save(d)
 				return &transientAuthError{stage: "session refresh", err: err}
 			}
 			var he *httpc.HTTPError
@@ -276,18 +303,24 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 		// return the stale id_token as if fresh (BrowserLogin has the L4 guard; the refresh path
 		// had none). Persist the rotated RT so it is not lost, then fail with the L4 message.
 		if tok.IDToken == "" || tokenExp(tok.IDToken)-now() <= idTokenSkewSecs {
+			d.RefreshCooldownUntil = 0
 			if serr := store.Save(d); serr != nil {
 				return die("could not persist refreshed token: %s", serr)
 			}
 			return die("token response had no id_token (is the 'openid' scope enabled on the client?)")
 		}
 		d.IDToken = tok.IDToken
+		d.RefreshCooldownUntil = 0 // a successful refresh clears any prior cooldown
 		idToken = d.IDToken
 		if err := store.Save(d); err != nil {
 			return die("could not persist refreshed token: %s", err)
 		}
 		return nil
 	})
+	if errors.Is(lockErr, store.ErrLockTimeout) {
+		// A wedged peer held the lock past the deadline — fail fast so the caller serves-last-good.
+		return "", &transientAuthError{stage: "session refresh", err: lockErr}
+	}
 	if lockErr != nil {
 		if ce, ok := lockErr.(*cmdError); ok {
 			return "", ce
