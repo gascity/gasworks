@@ -17,7 +17,9 @@ const OriginBD = "bd"
 
 // ExecInfo is the parsed BEADS_EXEC_INFO payload bd injects into the credential command's
 // environment. Unknown JSON fields are ignored; a malformed payload degrades to Present=true
-// with an empty Origin/DialHost (the caller decides whether that must fail closed).
+// with an empty Origin/DialHost. Present is load-bearing for security: the caller (Resolve +
+// Gate) fails closed for ANY delegated call (Present==true) that cannot yield a trusted
+// destination, so a corrupt or version-skewed payload never mints ungated (FIX 8).
 type ExecInfo struct {
 	// Present reports that the env var was set (non-empty) — i.e. a delegated invocation.
 	Present bool

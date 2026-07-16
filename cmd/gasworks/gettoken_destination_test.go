@@ -112,6 +112,99 @@ func TestGetTokenExecInfoUntrustedEnforceRefuses(t *testing.T) {
 	}
 }
 
+// FIX 8: a present-but-corrupt BEADS_EXEC_INFO is a delegated call with no destination. It must
+// fail closed in BOTH warn and enforce mode (delegation presence is the gate, not origin=bd) —
+// never fall into the human fail-open branch and mint ungated.
+func TestGetTokenExecInfoCorruptFailsClosed(t *testing.T) {
+	for _, mode := range []string{"enforce", "warn"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := newStub(t)
+			seededGetToken(t, srv)
+			t.Setenv(gateway.EnforceEnvVar, mode)
+			t.Setenv(execInfoEnvVar, "{ this is not valid json")
+
+			_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+			if code != 1 {
+				t.Fatalf("mode %s: exit = %d, want 1 (fail closed)", mode, code)
+			}
+			if !strings.Contains(errOut, "carried no destination") {
+				t.Fatalf("mode %s: stderr = %q", mode, errOut)
+			}
+			if n := len(srv.reqs("/sts/v0/token")); n != 0 {
+				t.Fatalf("mode %s: must not mint, got %d", mode, n)
+			}
+			if n := len(srv.reqs("/sts/v0/context")); n != 0 {
+				t.Fatalf("mode %s: must not even discover, got %d", mode, n)
+			}
+		})
+	}
+}
+
+// FIX 8: a version-skewed payload that OMITS origin and carries no dialHost is still delegated
+// (env var present) → fail closed even in warn mode.
+func TestGetTokenExecInfoOriginOmittedFailsClosed(t *testing.T) {
+	srv := newStub(t)
+	seededGetToken(t, srv)
+	t.Setenv(gateway.EnforceEnvVar, "warn")
+	t.Setenv(execInfoEnvVar, execInfoJSON("", "")) // no origin, no dialHost
+
+	_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (fail closed)", code)
+	}
+	if !strings.Contains(errOut, "carried no destination") {
+		t.Fatalf("stderr = %q", errOut)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n != 0 {
+		t.Fatalf("must not mint, got %d", n)
+	}
+}
+
+// FIX 9: a delegated invocation (origin=bd) with no dialHost must NOT be rescued by a stale but
+// trusted --gateway — it must refuse per the 1c anomaly rule, never silently mint on the flag.
+func TestGetTokenStaleGatewayCannotRescueDelegatedMint(t *testing.T) {
+	srv := newStub(t)
+	seededGetToken(t, srv)
+	t.Setenv(gateway.EnforceEnvVar, "enforce")
+	t.Setenv(execInfoEnvVar, execInfoJSON(gateway.OriginBD, "")) // delegated, no dialHost
+
+	_, errOut, code := capture(t, func() int {
+		// A trusted --gateway that must NOT rescue the mint.
+		return run([]string{"getToken", "manifold", "--gateway", "gw.beads.gascity.com"})
+	})
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (delegated no-dialHost refuses despite trusted --gateway)", code)
+	}
+	if !strings.Contains(errOut, "carried no destination") {
+		t.Fatalf("stderr = %q", errOut)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n != 0 {
+		t.Fatalf("must not mint, got %d", n)
+	}
+}
+
+// FIX 9 companion: with exec-info ABSENT entirely, a trusted --gateway still mints (the direct
+// human / older-bd path is unchanged).
+func TestGetTokenAbsentExecInfoTrustedGatewayMints(t *testing.T) {
+	srv := newStub(t)
+	seededGetToken(t, srv)
+	t.Setenv(gateway.EnforceEnvVar, "enforce")
+	// BEADS_EXEC_INFO deliberately NOT set.
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--gateway", "gw.beads.gascity.com"})
+	})
+	if code != 0 {
+		t.Fatalf("absent exec-info + trusted --gateway must mint, exit=%d stderr=%q", code, errOut)
+	}
+	if strings.TrimSpace(out) != "EIA.JWT" {
+		t.Fatalf("stdout = %q", out)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n != 1 {
+		t.Fatalf("want 1 mint, got %d", n)
+	}
+}
+
 // Exit test 1c: origin=bd with no dialHost fails closed even in warn mode.
 func TestGetTokenExecInfoBDNoDestinationFailsClosed(t *testing.T) {
 	srv := newStub(t)

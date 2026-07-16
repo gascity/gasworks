@@ -75,20 +75,60 @@ func TestResolveNeitherHuman(t *testing.T) {
 }
 
 func TestResolveBDOriginatedNoDialHost(t *testing.T) {
-	// exec-info present, origin=bd, but no dialHost -> flagged bd-originated with empty host.
+	// exec-info present, origin=bd, but no dialHost -> flagged bd-originated + delegated with
+	// empty host.
 	d, err := Resolve("", execInfo(t, "bd", ""), noWarn)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if d.Host != "" || !d.BDOriginated {
+	if d.Host != "" || !d.BDOriginated || !d.Delegated {
 		t.Fatalf("got %+v", d)
 	}
 }
 
+// TestResolveDelegatedNoDialHostIgnoresGateway is FIX 9: a delegated invocation (exec-info
+// present) with no usable dialHost must NOT fall back to --gateway — a stale/hardcoded
+// --gateway can never rescue a mint whose true destination bd failed to declare. The host stays
+// empty so Gate fails closed.
+func TestResolveDelegatedNoDialHostIgnoresGateway(t *testing.T) {
+	d, err := Resolve("gw.beads.gascity.com", execInfo(t, "bd", ""), noWarn)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if d.Host != "" || !d.Delegated {
+		t.Fatalf("delegated no-dialHost must not adopt --gateway; got %+v", d)
+	}
+}
+
+// TestResolveCorruptExecInfoIsDelegated is FIX 8: a present-but-corrupt BEADS_EXEC_INFO is a
+// DELEGATED invocation with no destination (not origin=bd, no dialHost). It must be flagged
+// Delegated so Gate fails closed rather than falling into the human fail-open branch.
+func TestResolveCorruptExecInfoIsDelegated(t *testing.T) {
+	d, err := Resolve("", "{ this is not valid json", noWarn)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if d.Host != "" || d.BDOriginated || !d.Delegated {
+		t.Fatalf("corrupt exec-info must be Delegated (no host, not bd-originated); got %+v", d)
+	}
+}
+
+// TestResolveOriginOmittedNoDialHostDelegated is FIX 8: a version-skewed payload that omits
+// origin and carries no dialHost is still delegated (env var present) → fail closed.
+func TestResolveOriginOmittedNoDialHostDelegated(t *testing.T) {
+	d, err := Resolve("", execInfo(t, "", ""), noWarn) // no origin, no dialHost
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if d.Host != "" || d.BDOriginated || !d.Delegated {
+		t.Fatalf("origin-omitted no-dialHost must be Delegated; got %+v", d)
+	}
+}
+
 // TestGateBDOriginatedNoDestinationFailsClosed is exit test 1c: origin=bd with no dialHost
-// refuses even in warn mode.
+// refuses even in warn mode. A bd-originated call is always delegated.
 func TestGateBDOriginatedNoDestinationFailsClosed(t *testing.T) {
-	dest := Destination{Host: "", BDOriginated: true}
+	dest := Destination{Host: "", Delegated: true, BDOriginated: true}
 	for _, mode := range []Mode{Warn, Enforce} {
 		if err := Gate(dest, mode, noWarn); err == nil {
 			t.Fatalf("mode %v: want refusal for bd-originated mint with no destination", mode)
@@ -96,8 +136,23 @@ func TestGateBDOriginatedNoDestinationFailsClosed(t *testing.T) {
 	}
 }
 
+// TestGateDelegatedNoDestinationFailsClosed is FIX 8: the fail-closed decision keys on
+// DELEGATION presence, not origin==bd. A delegated call (env var set) that could not be parsed
+// as origin=bd — corrupt JSON, version-skewed payload — carries Delegated=true, BDOriginated=
+// false, empty host, and must STILL refuse in every mode. Otherwise it falls into the human
+// fail-open branch and mints ungated.
+func TestGateDelegatedNoDestinationFailsClosed(t *testing.T) {
+	dest := Destination{Host: "", Delegated: true, BDOriginated: false}
+	for _, mode := range []Mode{Warn, Enforce} {
+		if err := Gate(dest, mode, noWarn); err == nil {
+			t.Fatalf("mode %v: a delegated mint with no destination must fail closed even when not origin=bd", mode)
+		}
+	}
+}
+
 func TestGateHumanNoDestinationMints(t *testing.T) {
-	if err := Gate(Destination{Host: "", BDOriginated: false}, Enforce, noWarn); err != nil {
+	// A truly absent env var: not delegated, no host -> the direct-human fail-open mint.
+	if err := Gate(Destination{Host: "", Delegated: false, BDOriginated: false}, Enforce, noWarn); err != nil {
 		t.Fatalf("human no-destination must mint (fail open), got %v", err)
 	}
 }

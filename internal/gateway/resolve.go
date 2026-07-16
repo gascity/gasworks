@@ -45,8 +45,15 @@ func ModeFromEnv(v string) (Mode, bool) {
 type Destination struct {
 	// Host is the canonical destination, or "" when none was supplied.
 	Host string
-	// BDOriginated reports that a bd-injected exec-info (origin=bd) drove this invocation, so
-	// an absent/untrusted destination must fail closed rather than mint.
+	// Delegated reports that BEADS_EXEC_INFO was present — i.e. bd (or any delegator) invoked
+	// this credential command. This is the SECURITY gate: a delegated call with no usable
+	// destination must fail closed regardless of whether the payload parsed as origin=bd. A
+	// corrupt or version-skewed payload is still delegated, so it must never fall into the
+	// direct-human fail-open branch (S2-DESIGN §5.0 rule 4).
+	Delegated bool
+	// BDOriginated reports that the exec-info payload cleanly declared origin=bd. It is a
+	// messaging/telemetry marker only — NOT the security gate (see Delegated). It implies
+	// Delegated.
 	BDOriginated bool
 }
 
@@ -72,7 +79,10 @@ func Resolve(flagGateway, execInfoEnv string, warnf func(string)) (Destination, 
 		flagHost = c
 	}
 
-	dest := Destination{BDOriginated: info.Present && info.Origin == OriginBD}
+	dest := Destination{
+		Delegated:    info.Present,
+		BDOriginated: info.Present && info.Origin == OriginBD,
+	}
 	switch {
 	case info.DialHost != "" && flagHost != "" && info.DialHost != flagHost:
 		return Destination{}, fmt.Errorf(
@@ -81,7 +91,14 @@ func Resolve(flagGateway, execInfoEnv string, warnf func(string)) (Destination, 
 			info.DialHost, flagHost)
 	case info.DialHost != "":
 		dest.Host = info.DialHost
+	case info.Present:
+		// FIX 9: a delegated invocation with no usable exec-info dialHost must NOT fall back to
+		// --gateway. A stale/hardcoded --gateway must never rescue a mint whose true destination
+		// bd failed to declare — leave the host empty so Gate fails closed (FIX 8, rule 4).
+		dest.Host = ""
 	default:
+		// Only a truly ABSENT env var (direct human use, or an older bd that injects no
+		// exec-info) takes the --gateway fallback.
 		dest.Host = flagHost
 	}
 	return dest, nil
@@ -91,14 +108,18 @@ func Resolve(flagGateway, execInfoEnv string, warnf func(string)) (Destination, 
 // It returns a non-nil error only when the caller must refuse (exit 1); on a warn-mode
 // allowlist miss it logs a would-refuse warning via warnf and returns nil (the mint proceeds).
 //
-// A bd-originated mint with no destination ALWAYS refuses (fail closed) regardless of mode —
-// a new bd always injects a dialHost, so its absence is a bug or an attack, never legitimate.
-// A direct human invocation with no destination mints (fail open).
+// A DELEGATED mint with no destination ALWAYS refuses (fail closed) regardless of mode — a bd
+// invocation always injects a dialHost, so its absence (whether the payload said origin=bd,
+// was corrupt, or was version-skewed) is a bug or an attack, never legitimate. The gate keys on
+// delegation PRESENCE, not on origin==bd, so a corrupt/origin-missing payload cannot fall into
+// the fail-open branch (FIX 8). A direct human invocation (no exec-info at all) with no
+// destination mints (fail open).
 func Gate(dest Destination, mode Mode, warnf func(string)) error {
 	if dest.Host == "" {
-		if dest.BDOriginated {
+		if dest.Delegated {
 			return &RefusalError{msg: "refusing to mint a beads credential: the delegated (bd) " +
-				"invocation carried no destination (BEADS_EXEC_INFO had no dialHost) — this is a bug or an attack"}
+				"invocation carried no destination (BEADS_EXEC_INFO was absent, corrupt, or had no dialHost) — " +
+				"this is a bug or an attack"}
 		}
 		return nil
 	}
