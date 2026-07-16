@@ -42,6 +42,12 @@ type stubServer struct {
 	tokenFailStatus int
 	// tokenExpiresIn overrides the minted EIA's expires_in (0 keeps the default 90).
 	tokenExpiresIn int
+	// loginFailFrom, when > 0, makes the /sts/v0/login call fail (loginFailStatus, default 503)
+	// starting at the Nth call (1-indexed) — so a test can let ensureSession's first login
+	// succeed but fail the newSession re-login after a 401.
+	loginFailFrom   int
+	loginFailStatus int
+	loginCalls      int
 }
 
 type recordedReq struct {
@@ -117,6 +123,17 @@ func newStub(t *testing.T) *stubServer {
 		case strings.HasSuffix(path, "/protocol/openid-connect/revoke"):
 			writeJSON(w, http.StatusOK, map[string]any{})
 		case strings.HasSuffix(path, "/sts/v0/login"):
+			s.mu.Lock()
+			s.loginCalls++
+			failFrom, failStatus, n := s.loginFailFrom, s.loginFailStatus, s.loginCalls
+			s.mu.Unlock()
+			if failFrom > 0 && n >= failFrom {
+				if failStatus == 0 {
+					failStatus = http.StatusServiceUnavailable
+				}
+				writeJSON(w, failStatus, map[string]any{"error": "server_error"})
+				return
+			}
 			writeJSON(w, http.StatusCreated, map[string]any{
 				"session_token": "SESS", "session_id": "ses_1",
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
@@ -240,6 +257,15 @@ func validIDTokenIss(iss string) string {
 func expiredIDToken() string {
 	return fakeJWT(map[string]any{
 		"sub": "kc-1", "email": "u@gascity.com", "exp": time.Now().Unix() - 10,
+		"aud": []string{"gasworks-cli"}, "azp": "gasworks-cli",
+	})
+}
+
+// shortLivedIDToken is valid now but expires inside the early-refresh skew window (a realm
+// with a sub-minute id_token lifespan). It must be ACCEPTED, not treated as "no id_token".
+func shortLivedIDToken() string {
+	return fakeJWT(map[string]any{
+		"sub": "kc-1", "email": "u@gascity.com", "exp": time.Now().Unix() + 30,
 		"aud": []string{"gasworks-cli"}, "azp": "gasworks-cli",
 	})
 }
@@ -475,5 +501,26 @@ func TestRefreshWithoutIDTokenFailsAfterPersistingRotatedRT(t *testing.T) {
 	}
 	if n := len(srv.reqs("/sts/v0/token")); n != 0 {
 		t.Fatalf("must not proceed to mint with a stale id_token, got %d", n)
+	}
+}
+
+// TestRefreshShortLivedIDTokenStillMints is the FIX 7 regression guard: a refresh that returns a
+// FRESH id_token whose lifetime is below the 60s early-refresh skew (a realm with a sub-minute
+// id_token lifespan) is valid and must NOT be treated as "no id_token" — the caller must mint,
+// not wedge. (The first FIX 7 cut dued on any sub-skew id_token, wedging such realms.)
+func TestRefreshShortLivedIDTokenStillMints(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{"id_token": shortLivedIDToken(), "refresh_token": "RT2"}
+	seed(t, srv, map[string]any{"refresh_token": "RT-OLD", "id_token": expiredIDToken()})
+
+	out, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code != 0 {
+		t.Fatalf("want exit 0 (a short-lived-but-valid refreshed id_token must mint), got %d; stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "EIA.JWT") {
+		t.Fatalf("stdout = %q, want the minted EIA", out)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n == 0 {
+		t.Fatal("want the mint to proceed (>=1 /sts/v0/token), got 0 — the short-lived id_token wedged the caller")
 	}
 }

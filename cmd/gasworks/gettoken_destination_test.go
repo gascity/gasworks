@@ -365,6 +365,41 @@ func TestGetTokenServeLastGoodOnMintFailure(t *testing.T) {
 	}
 }
 
+// FIX 4: the 401 re-establish branch must serve a still-valid cached EIA when the newSession
+// re-login itself fails transiently (STS mid-restart / budget exhaustion), instead of hard-dying
+// — the same serve-last-good contract as the sibling exchange-failure paths. Before FIX 4's
+// completion this branch did `return err`, dropping a usable cached credential during a rollout.
+func TestGetToken401ReloginFailureServesCached(t *testing.T) {
+	srv := newStub(t)
+	srv.tokenFails = 1                                              // first exchange 401 -> the re-establish branch
+	srv.tokenFailStatus = 401                                       // "session not resolvable"
+	srv.loginFailFrom = 2                                           // ensureSession's login (1st) succeeds; newSession's (2nd) fails
+	srv.loginFailStatus = 503                                       // transient
+	cacheKey := "org_a|manifold|manifold:proxy manifold:pool:acme|" // human path: empty gateway dim
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      validIDToken(), // fresh: no id-token refresh, straight to session+exchange
+		"default_org":   "org_a",
+		"eia_cache": map[string]any{
+			cacheKey: map[string]any{"eia": "CACHED.EIA", "expires_at": now() + 60},
+		},
+	})
+
+	// --refresh forces the mint path (bypassing the jittered fast-serve) so the exchange runs.
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--org", "org_a", "--refresh"})
+	})
+	if code != 0 {
+		t.Fatalf("401 re-login failure must serve-last-good (exit 0), got %d stderr=%q", code, errOut)
+	}
+	if strings.TrimSpace(out) != "CACHED.EIA" {
+		t.Fatalf("stdout = %q, want the cached EIA (stdout stays pure)", out)
+	}
+	if !strings.Contains(errOut, "serving the still-valid cached credential") {
+		t.Fatalf("stderr = %q, want a serve-last-good warning", errOut)
+	}
+}
+
 // FIX 3: discovery down (transient STS 5xx) with a still-valid cached EIA serves last-good on
 // stdout with exit 0 — the serve-last-good path is reachable in its target outage class, not
 // only on exchange failures.

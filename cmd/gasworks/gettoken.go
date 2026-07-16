@@ -163,7 +163,11 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 			// cannot double the budget past the exec cap.
 			sessionToken, key, err = newSession(cfg, org, idToken, deadline)
 			if err != nil {
-				return err
+				// A transient re-login failure or budget exhaustion must still serve a
+				// valid cached EIA (same as the sibling exchange-failure paths below),
+				// so a mint outage does not hard-fail a caller that already holds a
+				// usable token and re-stale it into a helper-exec storm (§5.4).
+				return serveLastGoodOrDie(err, cached, hadCache, scope, *asJSON)
 			}
 			res, err = resilientExchange(cfg, sessionToken, product, scope, key, deadline)
 			if err != nil {
@@ -301,15 +305,21 @@ func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 		if tok.RefreshToken != "" {
 			d.RefreshToken = tok.RefreshToken
 		}
-		// FIX 7: a refresh that rotated the RT but returned no (fresh) id_token must NOT silently
-		// return the stale id_token as if fresh (BrowserLogin has the L4 guard; the refresh path
-		// had none). Persist the rotated RT so it is not lost, then fail with the L4 message.
-		if tok.IDToken == "" || tokenExp(tok.IDToken)-now() <= idTokenSkewSecs {
+		// FIX 7: a refresh that rotated the RT but returned no USABLE id_token must NOT silently
+		// return the stale one as if fresh (BrowserLogin has the L4 guard; the refresh path had
+		// none). "Usable" = present and not already expired — a merely short-lived fresh token (a
+		// realm with a sub-minute id_token lifespan) is valid and must NOT wedge the caller, so
+		// this checks actual expiry, not the 60s early-refresh skew. Persist the rotated RT first
+		// so it is not lost, then fail with the message that fits the cause.
+		if tok.IDToken == "" || tokenExp(tok.IDToken) <= now() {
 			d.RefreshCooldownUntil = 0
 			if serr := store.Save(d); serr != nil {
 				return die("could not persist refreshed token: %s", serr)
 			}
-			return die("token response had no id_token (is the 'openid' scope enabled on the client?)")
+			if tok.IDToken == "" {
+				return die("token response had no id_token (is the 'openid' scope enabled on the client?)")
+			}
+			return die("refreshed id_token is already expired (check the server clock and token lifespan)")
 		}
 		d.IDToken = tok.IDToken
 		d.RefreshCooldownUntil = 0 // a successful refresh clears any prior cooldown
