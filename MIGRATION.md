@@ -2,7 +2,7 @@
 
 The `gasworks` CLI is now a single statically-linked **Go** binary. It replaces the old Python package that shipped via `pipx install git+https://github.com/gascity/gasworks`.
 
-**The commands, flags, and behavior are identical.** `login`, `getToken`, `whoami`, `logout`, and `version` work exactly as before — only the install path changes. Nothing in your scripts needs to change beyond how the binary gets onto the box.
+**The commands and flags are identical.** `login`, `getToken`, `whoami`, `logout`, and `version` keep the same invocation shape, so scripts only need to change how the binary gets onto the box. One machine-readable compatibility correction is intentional: `getToken --json` now reports the actual `Bearer` authorization scheme, truthful remaining `expires_in`, and an absolute RFC 3339 `expires_at` instead of fabricated DPoP/lifetime metadata. Consumers that asserted the old incorrect metadata must update those assertions.
 
 ## For users
 
@@ -18,7 +18,7 @@ brew install gascity/tap/gasworks
 
 `gascity/tap` is the [`gascity/homebrew-tap`](https://github.com/gascity/homebrew-tap) repo. Or download a signed binary directly from the [GitHub Releases](https://github.com/gascity/gasworks/releases).
 
-Your existing credentials carry over: the config dir is unchanged (`~/.config/gasworks`, `%APPDATA%\gasworks` on Windows, or `GASWORKS_CONFIG_DIR`), so a prior `gasworks login` session keeps working after the swap. If anything looks off, just `gasworks login` again.
+Your existing credentials carry over: the config dir is unchanged (`~/.config/gasworks`, `%APPDATA%\gasworks` on Windows, or `GASWORKS_CONFIG_DIR`), so a prior `gasworks login` session keeps working after the swap. The first mint adds a login-generation fence and discards only old cached STS sessions/EIAs; it preserves the durable refresh login. If anything looks off, just `gasworks login` again.
 
 ### Verify the signed binary
 

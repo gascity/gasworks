@@ -22,9 +22,6 @@ const grantTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
 // expires_in.
 const defaultSessionExpiresIn = 28800
 
-// defaultEIAExpiresIn is the fallback EIA lifetime (90s) when the server omits expires_in.
-const defaultEIAExpiresIn = 90
-
 // Product is a per-org mintable product: the EIA audience and the scopes the caller may
 // request for it.
 type Product struct {
@@ -130,9 +127,6 @@ func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop
 	var eia EIA
 	if err := remarshal(body, &eia); err != nil {
 		return EIA{}, fmt.Errorf("exchange: %w", err)
-	}
-	if eia.ExpiresIn == 0 {
-		eia.ExpiresIn = defaultEIAExpiresIn
 	}
 	return eia, nil
 }

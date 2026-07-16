@@ -1,5 +1,5 @@
 // Command gasworks is the SSO login + getToken (EIA) CLI for Gas City. It wires the
-// internal client packages (oidc, sts, store, dpop, jwtutil, config) into four subcommands.
+// internal client packages (oidc, sts, store, dpop, jwtutil, config) into its subcommands.
 //
 // The token lifecycle has three layers, each cached with its own DISTINCT TTL threshold:
 //
@@ -44,6 +44,8 @@ func run(argv []string) int {
 		err = cmdLogin(cfg, rest)
 	case "getToken", "get-token":
 		err = cmdGetToken(cfg, rest)
+	case "credential-provider":
+		return cmdCredentialProvider(cfg, rest)
 	case "whoami":
 		err = cmdWhoami(cfg, rest)
 	case "logout":
@@ -70,11 +72,12 @@ func run(argv []string) int {
 	return 0
 }
 
-// cmdError carries a user-facing message and exit code. It mirrors the Python _die() contract:
-// the message is printed to stderr prefixed with "gasworks:" and the process exits non-zero.
+// cmdError carries a user-facing message and exit code. Interactive commands print its message
+// to stderr; the credential-provider boundary maps its category to a fixed JSON error instead.
 type cmdError struct {
-	msg  string
-	code int
+	msg               string
+	code              int
+	credentialErrCode string
 }
 
 func (e *cmdError) Error() string { return e.msg }
@@ -85,7 +88,11 @@ func die(format string, a ...any) *cmdError {
 	return &cmdError{msg: fmt.Sprintf(format, a...), code: 1}
 }
 
-func now() int64 { return time.Now().Unix() }
+func dieCredential(code, format string, a ...any) *cmdError {
+	return &cmdError{msg: fmt.Sprintf(format, a...), code: 1, credentialErrCode: code}
+}
+
+var now = func() int64 { return time.Now().Unix() }
 
 // eprintf prints to stderr with a trailing newline (prompts + errors go to stderr; tokens and
 // data go to stdout).
@@ -133,6 +140,7 @@ func printUsage() {
 Usage:
   gasworks login [--device|--browser] [--org <id|slug>]
   gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--json] [--refresh]
+  gasworks credential-provider
   gasworks whoami
   gasworks logout
   gasworks version`

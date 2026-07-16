@@ -21,10 +21,9 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # Pinned patch (not the floating "1.26"). The go.mod floor is `go 1.26.5` —
-          # REQUIRED by the github.com/gastownhall/gascity/pkg/eventexport pin (the events
-          # axis), which declares go 1.26.4. 1.26.5 fixes GO-2026-5856 and the
-          # stdlib CVEs that lingered at earlier toolchain versions.
+          # Pinned patch (not the floating "1.26"). The Gas City eventexport dependency
+          # establishes a 1.26.4 baseline; this module uses 1.26.5 to fix GO-2026-5856
+          # and the stdlib CVEs that lingered at earlier toolchain versions.
           go-version: "1.26.5"
 
       - name: gofmt (fail on unformatted)
@@ -70,6 +69,18 @@ jobs:
           # No -mod flag (govulncheck doesn't accept it); with vendor/ present it scans in
           # vendor mode automatically.
           "$(go env GOPATH)/bin/govulncheck" ./...
+
+  windows-locking:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26.5"
+
+      - name: Exercise credential-store locking on Windows
+        run: go test -mod=vendor ./internal/store ./cmd/gasworks -run '^(TestConcurrentUpdatePreservesFields|TestCredentialProvider(SerializesRefreshRotationAcrossProcesses|RecoversRefreshLockAfterProcessTermination))$' -count=1
 
   # Dry-run the release pipeline on every PR/push to PROVE the static CGO-free cross-build
   # for all targets keeps working — catches a broken .goreleaser.yaml or a non-portable

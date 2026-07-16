@@ -28,6 +28,20 @@ type stubServer struct {
 	contextStatus int
 	// refreshTok is the token body returned by the Keycloak refresh grant.
 	refreshTok map[string]any
+	// refreshHandler overrides refresh-grant handling when non-nil.
+	refreshHandler func(http.ResponseWriter, *http.Request, url.Values)
+	// loginHandler overrides STS session establishment when non-nil.
+	loginHandler func(http.ResponseWriter, *http.Request, url.Values)
+	// eiaHandler overrides STS token exchange when non-nil.
+	eiaHandler func(http.ResponseWriter, *http.Request, url.Values)
+	// eiaResponse overrides the successful /sts/v0/token response when non-nil.
+	eiaResponse map[string]any
+	// productAudience overrides the context product audience when non-empty.
+	productAudience string
+	// contextErrorBody overrides a failing context response when non-nil.
+	contextErrorBody map[string]any
+	// contextResponse overrides the successful context response when non-nil.
+	contextResponse map[string]any
 }
 
 type recordedReq struct {
@@ -84,25 +98,53 @@ func newStub(t *testing.T) *stubServer {
 				"interval":                  0, "expires_in": 60,
 			})
 		case strings.HasSuffix(path, "/protocol/openid-connect/token"):
+			if form.Get("grant_type") == "refresh_token" && s.refreshHandler != nil {
+				s.refreshHandler(w, r, form)
+				return
+			}
 			// Both the refresh grant and the device-code grant land here; the CLI tests only
 			// need the token body, which is the same shape for both.
 			writeJSON(w, http.StatusOK, s.refreshTok)
 		case strings.HasSuffix(path, "/protocol/openid-connect/revoke"):
 			writeJSON(w, http.StatusOK, map[string]any{})
 		case strings.HasSuffix(path, "/sts/v0/login"):
+			if s.loginHandler != nil {
+				s.loginHandler(w, r, form)
+				return
+			}
 			writeJSON(w, http.StatusCreated, map[string]any{
 				"session_token": "SESS", "session_id": "ses_1",
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
 			})
 		case strings.HasSuffix(path, "/sts/v0/token"):
-			writeJSON(w, http.StatusOK, map[string]any{
-				"access_token": "EIA.JWT", "token_type": "DPoP",
-				"expires_in": 90, "scope": form.Get("scope"),
-			})
+			if s.eiaHandler != nil {
+				s.eiaHandler(w, r, form)
+				return
+			}
+			response := s.eiaResponse
+			if response == nil {
+				response = map[string]any{
+					"access_token": "EIA.JWT", "token_type": "DPoP",
+					"expires_in": 90, "scope": form.Get("scope"),
+				}
+			}
+			writeJSON(w, http.StatusOK, response)
 		case strings.HasSuffix(path, "/sts/v0/context"):
 			if s.contextStatus != 0 {
-				writeJSON(w, s.contextStatus, map[string]any{"error": "boom"})
+				body := s.contextErrorBody
+				if body == nil {
+					body = map[string]any{"error": "boom"}
+				}
+				writeJSON(w, s.contextStatus, body)
 				return
+			}
+			if s.contextResponse != nil {
+				writeJSON(w, http.StatusOK, s.contextResponse)
+				return
+			}
+			audience := s.productAudience
+			if audience == "" {
+				audience = "manifold"
 			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"user_id": "usr_1", "default_org_id": "org_a", "orgs": []any{
@@ -110,7 +152,7 @@ func newStub(t *testing.T) *stubServer {
 						"org_id": "org_a", "slug": "acme", "role": "owner", "is_default": true,
 						"products": map[string]any{
 							"manifold": map[string]any{
-								"audience": "manifold",
+								"audience": audience,
 								"scopes":   []string{"manifold:proxy", "manifold:pool:acme"},
 							},
 						},
@@ -136,6 +178,10 @@ func seed(t *testing.T, srv *stubServer, creds map[string]any) {
 	t.Setenv("GASWORKS_OIDC_ISSUER", base+"/realms/g")
 	t.Setenv("GASWORKS_CLIENT_ID", "gasworks-cli")
 	if creds != nil {
+		if _, exists := creds["credential_generation"]; !exists &&
+			(creds["id_token"] != nil || creds["refresh_token"] != nil) {
+			creds["credential_generation"] = testCredentialGenerationA
+		}
 		writeCreds(t, creds)
 	}
 }
@@ -163,6 +209,13 @@ func capture(t *testing.T, fn func() int) (out string, errOut string, code int) 
 	defer func() { stdout, stderr = origOut, origErr }()
 	code = fn()
 	return ob.String(), eb.String(), code
+}
+
+func freezeNow(t *testing.T, instant time.Time) {
+	t.Helper()
+	originalNow := now
+	now = func() int64 { return instant.Unix() }
+	t.Cleanup(func() { now = originalNow })
 }
 
 // fakeJWT builds an unsigned JWT (alg=none) with the given claims, matching test_cli's helper.
@@ -226,6 +279,8 @@ func TestGetTokenEndToEnd(t *testing.T) {
 
 func TestGetTokenJSONEnvelope(t *testing.T) {
 	srv := newStub(t)
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	freezeNow(t, fixedNow)
 	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
 
 	out, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold", "--json"}) })
@@ -236,13 +291,139 @@ func TestGetTokenJSONEnvelope(t *testing.T) {
 		AccessToken string `json:"access_token"`
 		TokenType   string `json:"token_type"`
 		ExpiresIn   int    `json:"expires_in"`
+		ExpiresAt   string `json:"expires_at"`
+		Audience    string `json:"audience"`
 		Scope       string `json:"scope"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &env); err != nil {
 		t.Fatalf("not JSON: %v (out=%q)", err, out)
 	}
-	if env.AccessToken != "EIA.JWT" || env.ExpiresIn != 90 || env.TokenType != "DPoP" {
+	if env.AccessToken != "EIA.JWT" || env.ExpiresIn != 90 ||
+		env.TokenType != "Bearer" || env.Audience != "manifold" {
 		t.Fatalf("envelope = %+v", env)
+	}
+	if expiresAt, err := time.Parse(time.RFC3339, env.ExpiresAt); err != nil {
+		t.Fatalf("expires_at = %q: %v", env.ExpiresAt, err)
+	} else if !expiresAt.Equal(fixedNow.Add(90 * time.Second)) {
+		t.Fatalf("expires_at = %s, want %s", expiresAt, fixedNow.Add(90*time.Second))
+	}
+}
+
+func TestGetTokenJSONReportsCachedRemainingLifetime(t *testing.T) {
+	srv := newStub(t)
+	fixedNow := time.Now().UTC().Truncate(time.Second)
+	freezeNow(t, fixedNow)
+	expiresAt := fixedNow.Add(45 * time.Second)
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      validIDToken(),
+		"eia_cache": map[string]any{
+			eiaCacheKey(srv.srv.URL, "org_a", "manifold", testCredentialGenerationA, []string{"manifold:proxy"}): map[string]any{
+				"eia": "CACHED.EIA", "expires_at": expiresAt.Unix(),
+			},
+		},
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", "manifold:proxy", "--json"})
+	})
+	if code != 0 || errOut != "" {
+		t.Fatalf("exit=%d stderr=%q", code, errOut)
+	}
+	var envelope struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+		ExpiresAt   string `json:"expires_at"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
+		t.Fatalf("not JSON: %v (out=%q)", err, out)
+	}
+	if envelope.AccessToken != "CACHED.EIA" || envelope.ExpiresIn != 45 ||
+		envelope.ExpiresAt != expiresAt.Format(time.RFC3339) {
+		t.Fatalf("cached envelope = %+v", envelope)
+	}
+}
+
+func TestGetTokenDoesNotReuseCacheAfterAudienceRemap(t *testing.T) {
+	srv := newStub(t)
+	srv.productAudience = "manifold-v2"
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      validIDToken(),
+		"eia_cache": map[string]any{
+			eiaCacheKey(srv.srv.URL, "org_a", "manifold", testCredentialGenerationA, []string{"manifold:proxy"}): map[string]any{
+				"eia": "OLD-AUDIENCE.EIA", "expires_at": time.Now().Add(time.Hour).Unix(),
+			},
+			"org_a|manifold|manifold:proxy": map[string]any{
+				"eia": "LEGACY.EIA", "expires_at": time.Now().Add(time.Hour).Unix(),
+			},
+		},
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", "manifold:proxy", "--json"})
+	})
+	if code != 0 || errOut != "" {
+		t.Fatalf("exit=%d stderr=%q", code, errOut)
+	}
+	var envelope struct {
+		AccessToken string `json:"access_token"`
+		Audience    string `json:"audience"`
+	}
+	if err := json.Unmarshal([]byte(out), &envelope); err != nil {
+		t.Fatalf("not JSON: %v (out=%q)", err, out)
+	}
+	if envelope.AccessToken != "EIA.JWT" || envelope.Audience != "manifold-v2" {
+		t.Fatalf("remapped envelope = %+v", envelope)
+	}
+	if mints := len(srv.reqs("/sts/v0/token")); mints != 1 {
+		t.Fatalf("audience remap made %d token requests", mints)
+	}
+}
+
+func TestGetTokenRejectsUnexpectedGrantedScopesBeforeCaching(t *testing.T) {
+	srv := newStub(t)
+	srv.eiaResponse = map[string]any{
+		"access_token": "WIDENED.EIA",
+		"expires_in":   90,
+		"scope":        "manifold:proxy manifold:admin",
+	}
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+
+	_, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", "manifold:proxy"})
+	})
+	if code == 0 || !strings.Contains(errOut, "unexpected scopes") {
+		t.Fatalf("widened grant = exit %d stderr %q", code, errOut)
+	}
+
+	srv.eiaResponse = nil
+	response, providerErr, providerCode := runCredentialProvider(t, `{
+		"version":"gascity.dev/credential-provider/v1",
+		"audience":"manifold",
+		"required_scopes":["manifold:proxy"],
+		"interactive":false
+	}`)
+	if providerCode != 0 || providerErr != "" || response.AccessToken != "EIA.JWT" {
+		t.Fatalf("provider after rejected grant = exit %d stderr %q %+v", providerCode, providerErr, response)
+	}
+	if mints := len(srv.reqs("/sts/v0/token")); mints != 2 {
+		t.Fatalf("token requests = %d, want rejected legacy mint plus fresh provider mint", mints)
+	}
+}
+
+func TestGetTokenRejectsDuplicateScopes(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+
+	_, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", "manifold:proxy manifold:proxy"})
+	})
+	if code == 0 || !strings.Contains(errOut, "duplicate") {
+		t.Fatalf("duplicate scopes = exit %d stderr %q", code, errOut)
+	}
+	if mints := len(srv.reqs("/sts/v0/token")); mints != 0 {
+		t.Fatalf("duplicate scopes made %d token requests", mints)
 	}
 }
 
@@ -263,6 +444,27 @@ func TestGetTokenCachesSecondCall(t *testing.T) {
 	// Within 90s the second call is a cache hit: exactly ONE mint total across both calls.
 	if mints := len(srv.reqs("/sts/v0/token")); mints != 1 {
 		t.Fatalf("want exactly 1 EIA mint across both calls (cache hit), got %d", mints)
+	}
+}
+
+func TestGetTokenScopeOrderSharesCacheEntry(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+
+	firstScope := "manifold:proxy manifold:pool:acme"
+	secondScope := "manifold:pool:acme manifold:proxy"
+	if _, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", firstScope})
+	}); code != 0 || errOut != "" {
+		t.Fatalf("first request = exit %d stderr %q", code, errOut)
+	}
+	if _, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--scope", secondScope})
+	}); code != 0 || errOut != "" {
+		t.Fatalf("second request = exit %d stderr %q", code, errOut)
+	}
+	if mints := len(srv.reqs("/sts/v0/token")); mints != 1 {
+		t.Fatalf("scope-order requests made %d mints", mints)
 	}
 }
 
@@ -379,9 +581,57 @@ func TestLoginOrgSelection(t *testing.T) {
 	if data.RefreshToken != "RT-NEW" {
 		t.Errorf("refresh_token = %q, want the grant's RT-NEW", data.RefreshToken)
 	}
+	if !validCredentialGeneration(data.CredentialGeneration) || data.CredentialGeneration == testCredentialGenerationA {
+		t.Errorf("fresh login generation = %q, want a new valid generation", data.CredentialGeneration)
+	}
 	if len(data.Sessions) != 0 || len(data.EIACache) != 0 {
 		t.Errorf("fresh login must clear prior sessions/eia_cache: sessions=%v eia=%v",
 			data.Sessions, data.EIACache)
+	}
+}
+
+func TestLoginWithoutRefreshTokenPreservesPriorLogin(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{"id_token": validIDTokenIss(srv.srv.URL + "/realms/g")}
+	seed(t, srv, map[string]any{
+		"credential_generation": testCredentialGenerationA,
+		"id_token":              "OLD-ID",
+		"refresh_token":         "OLD-REFRESH",
+		"default_org":           "old-org",
+		"sessions":              map[string]any{"old": map[string]any{"session_token": "OLD", "dpop_pem": "OLD", "expires_at": 1}},
+		"eia_cache":             map[string]any{"old": map[string]any{"eia": "OLD", "expires_at": 1}},
+	})
+
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--device"}) })
+	if code == 0 || !strings.Contains(errOut, "refresh_token") {
+		t.Fatalf("login = exit %d stderr %q, want missing-refresh-token failure", code, errOut)
+	}
+	persisted := loadStore(t)
+	if persisted.CredentialGeneration != testCredentialGenerationA ||
+		persisted.IDToken != "OLD-ID" || persisted.RefreshToken != "OLD-REFRESH" ||
+		persisted.DefaultOrg != "old-org" || len(persisted.Sessions) != 1 || len(persisted.EIACache) != 1 {
+		t.Fatalf("failed login changed prior credentials: %+v", persisted)
+	}
+}
+
+func TestLoginWithoutOrgClearsPriorLoginDefaultOrg(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{
+		"id_token": validIDTokenIss(srv.srv.URL + "/realms/g"), "refresh_token": "RT-NEW",
+	}
+	seed(t, srv, map[string]any{
+		"credential_generation": testCredentialGenerationA,
+		"id_token":              "OLD-ID",
+		"refresh_token":         "OLD-REFRESH",
+		"default_org":           "prior-user-org",
+	})
+
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--device"}) })
+	if code != 0 {
+		t.Fatalf("login = exit %d stderr %q", code, errOut)
+	}
+	if persisted := loadStore(t); persisted.DefaultOrg != "" {
+		t.Fatalf("default_org = %q, want cleared for the new login", persisted.DefaultOrg)
 	}
 }
 

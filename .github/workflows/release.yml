@@ -33,9 +33,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          # Pinned to 1.26.5 — REQUIRED by the go.mod floor `go 1.26.5` (set by the
-          # gastownhall/gascity/pkg/eventexport pin). It builds the stdlib baked into the
-          # released binaries; 1.26.5 fixes GO-2026-5856 and earlier stdlib CVEs.
+          # Pinned to the module's 1.26.5 floor. The Gas City eventexport dependency
+          # establishes a 1.26.4 baseline; 1.26.5 fixes GO-2026-5856 and earlier stdlib
+          # CVEs in the released binaries.
           go-version: "1.26.5"
 
       # Verify the vendored/module dependencies match their go.sum hashes before building the

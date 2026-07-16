@@ -10,6 +10,7 @@ import (
 // streams) so tests can capture them deterministically without spawning a subprocess. Tokens
 // and machine-readable data go to stdout; prompts and errors go to stderr.
 var (
+	stdin  io.Reader = os.Stdin
 	stdout io.Writer = os.Stdout
 	stderr io.Writer = os.Stderr
 )
