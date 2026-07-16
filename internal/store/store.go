@@ -163,36 +163,43 @@ func Save(d *Data) error {
 	return nil
 }
 
+// WithLock runs fn while holding the cross-process config-dir lock — the SAME lock
+// Update/Clear take. A sibling-file writer in ConfigDir() (e.g. the trusted-gateway
+// allowlist) uses this so its read-modify-write serializes against credential writes and
+// against other writers, and no concurrent agent drops an entry. fn MUST NOT call
+// Update/Clear/WithLock (a nested lock() on a second fd of the same lock file deadlocks);
+// call Load/Save directly instead.
+func WithLock(fn func() error) error {
+	unlock, err := lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return fn()
+}
+
 // Update is a locked read-modify-write: it acquires the cross-process lock, loads, applies
 // mutate, and saves — so two concurrent getToken invocations cannot lose each other's
 // session/key. If mutate returns an error, nothing is saved.
 func Update(mutate func(*Data) error) error {
-	unlock, err := lock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	d, err := Load()
-	if err != nil {
-		return err
-	}
-	if err := mutate(d); err != nil {
-		return err
-	}
-	return Save(d)
+	return WithLock(func() error {
+		d, err := Load()
+		if err != nil {
+			return err
+		}
+		if err := mutate(d); err != nil {
+			return err
+		}
+		return Save(d)
+	})
 }
 
 // Clear removes credentials.json under the lock. A missing file is not an error.
 func Clear() error {
-	unlock, err := lock()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	if err := os.Remove(CredsPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return WithLock(func() error {
+		if err := os.Remove(CredsPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
 }
