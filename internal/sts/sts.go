@@ -9,6 +9,7 @@ package sts
 import (
 	"fmt"
 	"net/url"
+	"time"
 
 	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/dpop"
@@ -65,14 +66,15 @@ type EIA struct {
 }
 
 // Context fetches /sts/v0/context — the caller's orgs + per-org mintable scopes. It carries
-// the id_token as a Bearer and NO DPoP (it mints nothing). On a non-2xx it returns the raw
-// *httpc.HTTPError so the caller can branch on status.
-func Context(cfg config.Config, idToken string, provision bool) (ContextResolution, error) {
+// the id_token as a Bearer and NO DPoP (it mints nothing). timeout bounds the request (<= 0
+// uses the httpc default). On a non-2xx it returns the raw *httpc.HTTPError so the caller can
+// branch on status.
+func Context(cfg config.Config, idToken string, provision bool, timeout time.Duration) (ContextResolution, error) {
 	u := cfg.ContextURL()
 	if provision {
 		u += "?provision=true"
 	}
-	_, body, err := httpc.GetJSON(u, map[string]string{"Authorization": "Bearer " + idToken})
+	_, body, err := httpc.GetJSONTimeout(u, map[string]string{"Authorization": "Bearer " + idToken}, timeout)
 	if err != nil {
 		return ContextResolution{}, err
 	}
@@ -85,16 +87,17 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 
 // Login establishes a DPoP-bound session at /sts/v0/login. The DPoP proof is bound to the
 // login URL and signed by key; pass the SAME key to Exchange so the server's jkt-pin holds.
-// On a non-2xx it returns the raw *httpc.HTTPError.
-func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, error) {
+// timeout bounds the request (<= 0 uses the httpc default). On a non-2xx it returns the raw
+// *httpc.HTTPError.
+func Login(cfg config.Config, idToken, org string, key *dpop.Key, timeout time.Duration) (Session, error) {
 	proof, err := key.Proof("POST", cfg.LoginURL())
 	if err != nil {
 		return Session{}, err
 	}
-	_, body, err := httpc.PostForm(cfg.LoginURL(), url.Values{
+	_, body, err := httpc.PostFormTimeout(cfg.LoginURL(), url.Values{
 		"subject_token": {idToken},
 		"org":           {org},
-	}, map[string]string{"DPoP": proof})
+	}, map[string]string{"DPoP": proof}, timeout)
 	if err != nil {
 		return Session{}, err
 	}
@@ -111,19 +114,20 @@ func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, erro
 // Exchange performs the RFC 8693 token-exchange at /sts/v0/token, returning the EIA
 // (access_token). subject_token_type is intentionally OMITTED: the STS accepts only empty or
 // the gascity session URN, so the RFC-canonical access_token default would 400. The DPoP
-// proof is bound to the token URL and MUST be signed by the same key as Login. On a non-2xx
-// it returns the raw *httpc.HTTPError.
-func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key) (EIA, error) {
+// proof is bound to the token URL and MUST be signed by the same key as Login. timeout bounds
+// the request (<= 0 uses the httpc default) so the mint ladder can retry it per-attempt. On a
+// non-2xx it returns the raw *httpc.HTTPError.
+func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key, timeout time.Duration) (EIA, error) {
 	proof, err := key.Proof("POST", cfg.TokenURL())
 	if err != nil {
 		return EIA{}, err
 	}
-	_, body, err := httpc.PostForm(cfg.TokenURL(), url.Values{
+	_, body, err := httpc.PostFormTimeout(cfg.TokenURL(), url.Values{
 		"grant_type":    {grantTokenExchange},
 		"subject_token": {sessionToken},
 		"audience":      {audience},
 		"scope":         {scope},
-	}, map[string]string{"DPoP": proof})
+	}, map[string]string{"DPoP": proof}, timeout)
 	if err != nil {
 		return EIA{}, err
 	}

@@ -92,6 +92,9 @@ func parse(raw []byte) any {
 }
 
 func do(method, rawURL string, body io.Reader, headers map[string]string, timeout time.Duration) (int, any, error) {
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
 	req, err := http.NewRequest(method, rawURL, body)
 	if err != nil {
 		return 0, nil, err
@@ -123,15 +126,28 @@ func do(method, rawURL string, body io.Reader, headers map[string]string, timeou
 // GetJSON issues a GET and returns (status, parsedBody). On a non-2xx it returns an
 // *HTTPError carrying the parsed body.
 func GetJSON(url string, headers map[string]string) (int, any, error) {
-	return do(http.MethodGet, url, nil, headers, defaultTimeout)
+	return GetJSONTimeout(url, headers, defaultTimeout)
+}
+
+// GetJSONTimeout is GetJSON with an explicit per-request timeout (a value <= 0 uses the 30s
+// default). The mint path bounds each attempt well under bd's helper-exec cap so one hang
+// cannot consume the whole budget.
+func GetJSONTimeout(url string, headers map[string]string, timeout time.Duration) (int, any, error) {
+	return do(http.MethodGet, url, nil, headers, timeout)
 }
 
 // PostForm issues a urlencoded POST and returns (status, parsedBody). On a non-2xx it
 // returns an *HTTPError carrying the parsed body.
 func PostForm(rawURL string, values url.Values, headers map[string]string) (int, any, error) {
+	return PostFormTimeout(rawURL, values, headers, defaultTimeout)
+}
+
+// PostFormTimeout is PostForm with an explicit per-request timeout (a value <= 0 uses the 30s
+// default).
+func PostFormTimeout(rawURL string, values url.Values, headers map[string]string, timeout time.Duration) (int, any, error) {
 	h := map[string]string{"Content-Type": "application/x-www-form-urlencoded"}
 	for k, v := range headers {
 		h[k] = v
 	}
-	return do(http.MethodPost, rawURL, strings.NewReader(values.Encode()), h, defaultTimeout)
+	return do(http.MethodPost, rawURL, strings.NewReader(values.Encode()), h, timeout)
 }

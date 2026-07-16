@@ -193,7 +193,7 @@ func TestDeviceLoginHonorsServerExpiresIn(t *testing.T) {
 
 func TestRefreshReturnsRotatedToken(t *testing.T) {
 	cfg, _ := newStub(t)
-	tok, err := Refresh(cfg, "RT")
+	tok, err := Refresh(cfg, "RT", 0)
 	if err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestRefreshReturnsRotatedToken(t *testing.T) {
 
 func TestRefreshSendsScopeAndGrant(t *testing.T) {
 	cfg, srv := newStub(t)
-	if _, err := Refresh(cfg, "RT"); err != nil {
+	if _, err := Refresh(cfg, "RT", 0); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	req := srv.reqs("/openid-connect/token")
@@ -243,7 +243,7 @@ func TestScopeByteIdenticalAcrossGrants(t *testing.T) {
 	if _, err := DeviceLogin(cfg, func(string) {}); err != nil {
 		t.Fatalf("DeviceLogin: %v", err)
 	}
-	if _, err := Refresh(cfg, "RT"); err != nil {
+	if _, err := Refresh(cfg, "RT", 0); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	deviceScope := srv.reqs("/auth/device")[0].form.Get("scope")

@@ -28,6 +28,26 @@ type stubServer struct {
 	contextStatus int
 	// refreshTok is the token body returned by the Keycloak refresh grant.
 	refreshTok map[string]any
+	// refreshDelay sleeps before answering the Keycloak /token (refresh) grant.
+	refreshDelay time.Duration
+	// refreshStatus, when non-zero, makes the Keycloak /token (refresh) grant fail with that
+	// status (body {"error": refreshErr}), to exercise transient (5xx) vs definitive (4xx)
+	// refresh-failure classification.
+	refreshStatus int
+	// refreshErr is the OAuth error string for a failing refresh (defaults to "server_error").
+	refreshErr string
+	// tokenFails, when > 0, makes the next N /sts/v0/token calls fail with tokenFailStatus
+	// (default 503), to exercise the mint retry ladder / serve-last-good.
+	tokenFails      int
+	tokenFailStatus int
+	// tokenExpiresIn overrides the minted EIA's expires_in (0 keeps the default 90).
+	tokenExpiresIn int
+	// loginFailFrom, when > 0, makes the /sts/v0/login call fail (loginFailStatus, default 503)
+	// starting at the Nth call (1-indexed) — so a test can let ensureSession's first login
+	// succeed but fail the newSession re-login after a 401.
+	loginFailFrom   int
+	loginFailStatus int
+	loginCalls      int
 }
 
 type recordedReq struct {
@@ -86,18 +106,60 @@ func newStub(t *testing.T) *stubServer {
 		case strings.HasSuffix(path, "/protocol/openid-connect/token"):
 			// Both the refresh grant and the device-code grant land here; the CLI tests only
 			// need the token body, which is the same shape for both.
-			writeJSON(w, http.StatusOK, s.refreshTok)
+			s.mu.Lock()
+			delay, status, oaErr, body := s.refreshDelay, s.refreshStatus, s.refreshErr, s.refreshTok
+			s.mu.Unlock()
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			if status != 0 {
+				if oaErr == "" {
+					oaErr = "server_error"
+				}
+				writeJSON(w, status, map[string]any{"error": oaErr})
+				return
+			}
+			writeJSON(w, http.StatusOK, body)
 		case strings.HasSuffix(path, "/protocol/openid-connect/revoke"):
 			writeJSON(w, http.StatusOK, map[string]any{})
 		case strings.HasSuffix(path, "/sts/v0/login"):
+			s.mu.Lock()
+			s.loginCalls++
+			failFrom, failStatus, n := s.loginFailFrom, s.loginFailStatus, s.loginCalls
+			s.mu.Unlock()
+			if failFrom > 0 && n >= failFrom {
+				if failStatus == 0 {
+					failStatus = http.StatusServiceUnavailable
+				}
+				writeJSON(w, failStatus, map[string]any{"error": "server_error"})
+				return
+			}
 			writeJSON(w, http.StatusCreated, map[string]any{
 				"session_token": "SESS", "session_id": "ses_1",
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
 			})
 		case strings.HasSuffix(path, "/sts/v0/token"):
+			s.mu.Lock()
+			fail := s.tokenFails > 0
+			if fail {
+				s.tokenFails--
+			}
+			status := s.tokenFailStatus
+			exp := s.tokenExpiresIn
+			s.mu.Unlock()
+			if fail {
+				if status == 0 {
+					status = http.StatusServiceUnavailable
+				}
+				writeJSON(w, status, map[string]any{"error": "server_error"})
+				return
+			}
+			if exp == 0 {
+				exp = 90
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"access_token": "EIA.JWT", "token_type": "DPoP",
-				"expires_in": 90, "scope": form.Get("scope"),
+				"expires_in": exp, "scope": form.Get("scope"),
 			})
 		case strings.HasSuffix(path, "/sts/v0/context"):
 			if s.contextStatus != 0 {
@@ -195,6 +257,15 @@ func validIDTokenIss(iss string) string {
 func expiredIDToken() string {
 	return fakeJWT(map[string]any{
 		"sub": "kc-1", "email": "u@gascity.com", "exp": time.Now().Unix() - 10,
+		"aud": []string{"gasworks-cli"}, "azp": "gasworks-cli",
+	})
+}
+
+// shortLivedIDToken is valid now but expires inside the early-refresh skew window (a realm
+// with a sub-minute id_token lifespan). It must be ACCEPTED, not treated as "no id_token".
+func shortLivedIDToken() string {
+	return fakeJWT(map[string]any{
+		"sub": "kc-1", "email": "u@gascity.com", "exp": time.Now().Unix() + 30,
 		"aud": []string{"gasworks-cli"}, "azp": "gasworks-cli",
 	})
 }
@@ -406,5 +477,50 @@ func TestRefreshRotationPersistsBeforeMint(t *testing.T) {
 	if data := loadStore(t); data.RefreshToken != "RT-ROTATED" {
 		t.Fatalf("refresh_token = %q, want the rotated 'RT-ROTATED' persisted before the mint step",
 			data.RefreshToken)
+	}
+}
+
+// TestRefreshWithoutIDTokenFailsAfterPersistingRotatedRT is the FIX 7 property: a refresh that
+// ROTATES the refresh token but returns NO id_token must persist the rotated RT (so it is not
+// lost) AND fail with the L4 openid-scope message — never silently return the stale id_token as
+// fresh (which would also burn an RT rotation every call).
+func TestRefreshWithoutIDTokenFailsAfterPersistingRotatedRT(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{"refresh_token": "RT-ROTATED"} // rotated RT, NO id_token
+	seed(t, srv, map[string]any{"refresh_token": "RT-OLD", "id_token": expiredIDToken()})
+
+	_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code == 0 {
+		t.Fatal("want non-zero exit when the refresh response carries no id_token")
+	}
+	if !strings.Contains(errOut, "no id_token") || !strings.Contains(errOut, "openid") {
+		t.Fatalf("stderr = %q, want the L4 openid-scope message", errOut)
+	}
+	if data := loadStore(t); data.RefreshToken != "RT-ROTATED" {
+		t.Fatalf("refresh_token = %q, want the rotated 'RT-ROTATED' persisted (not lost)", data.RefreshToken)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n != 0 {
+		t.Fatalf("must not proceed to mint with a stale id_token, got %d", n)
+	}
+}
+
+// TestRefreshShortLivedIDTokenStillMints is the FIX 7 regression guard: a refresh that returns a
+// FRESH id_token whose lifetime is below the 60s early-refresh skew (a realm with a sub-minute
+// id_token lifespan) is valid and must NOT be treated as "no id_token" — the caller must mint,
+// not wedge. (The first FIX 7 cut dued on any sub-skew id_token, wedging such realms.)
+func TestRefreshShortLivedIDTokenStillMints(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{"id_token": shortLivedIDToken(), "refresh_token": "RT2"}
+	seed(t, srv, map[string]any{"refresh_token": "RT-OLD", "id_token": expiredIDToken()})
+
+	out, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code != 0 {
+		t.Fatalf("want exit 0 (a short-lived-but-valid refreshed id_token must mint), got %d; stderr=%q", code, errOut)
+	}
+	if !strings.Contains(out, "EIA.JWT") {
+		t.Fatalf("stdout = %q, want the minted EIA", out)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n == 0 {
+		t.Fatal("want the mint to proceed (>=1 /sts/v0/token), got 0 — the short-lived id_token wedged the caller")
 	}
 }

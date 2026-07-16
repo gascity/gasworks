@@ -329,14 +329,16 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 }
 
 // Refresh runs the refresh grant. Keycloak ROTATES the refresh token, so the returned
-// Tokens.RefreshToken is the new one the caller must persist.
-func Refresh(cfg config.Config, refreshToken string) (Tokens, error) {
-	_, body, err := httpc.PostForm(cfg.OIDCTokenURL(), url.Values{
+// Tokens.RefreshToken is the new one the caller must persist. timeout bounds the request
+// (<= 0 uses the httpc default) so the cross-process refresh serialization holds the store
+// lock for a bounded time well under bd's helper-exec cap.
+func Refresh(cfg config.Config, refreshToken string, timeout time.Duration) (Tokens, error) {
+	_, body, err := httpc.PostFormTimeout(cfg.OIDCTokenURL(), url.Values{
 		"grant_type":    {grantRefresh},
 		"refresh_token": {refreshToken},
 		"client_id":     {cfg.ClientID},
 		"scope":         {OIDCScope},
-	}, nil)
+	}, nil, timeout)
 	if err != nil {
 		return Tokens{}, err
 	}
