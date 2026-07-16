@@ -428,6 +428,35 @@ func TestGetTokenRefreshBrownoutServesCachedNotLogin(t *testing.T) {
 	}
 }
 
+// FIX 3: a TRANSIENT refresh outage with NO cached credential to fall back on dies asking for a
+// retry — NOT for `gasworks login` (that remedy is reserved for a definitive expiry).
+func TestGetTokenTransientRefreshNoCacheAsksRetryNotLogin(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshStatus = 503 // transient
+	seed(t, srv, map[string]any{
+		"refresh_token": "RT",
+		"id_token":      expiredIDToken(),
+		"default_org":   "org_a",
+		// no eia_cache
+	})
+
+	out, errOut, code := capture(t, func() int {
+		return run([]string{"getToken", "manifold", "--org", "org_a"})
+	})
+	if code == 0 {
+		t.Fatal("want non-zero exit when the refresh is down and there is no cache")
+	}
+	if !strings.Contains(errOut, "temporarily unavailable") || !strings.Contains(errOut, "retry") {
+		t.Fatalf("stderr = %q, want a transient retry message", errOut)
+	}
+	if strings.Contains(errOut, "gasworks login") {
+		t.Fatalf("stderr = %q, must NOT ask a headless fleet to `gasworks login` on a transient outage", errOut)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("stdout = %q, want empty", out)
+	}
+}
+
 // FIX 3: a DEFINITIVE refresh failure (invalid_grant / 4xx) still dies with the login remedy and
 // does NOT serve a cached token — the offline session is genuinely gone.
 func TestGetTokenDefinitiveRefreshFailureDiesWithLogin(t *testing.T) {

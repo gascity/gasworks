@@ -91,7 +91,9 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 			if serveLastGoodByPrefix(*orgFlag, product, dest.Host, *asJSON) {
 				return nil
 			}
-			return die("%s — retry shortly (or run `gasworks login` if it persists)", te)
+			// Transient outage, no cached credential to fall back on: ask for a retry, NOT a
+			// login — telling a headless fleet to `gasworks login` here would be wrong (FIX 3).
+			return die("%s — retry shortly", te)
 		}
 		return err
 	}
