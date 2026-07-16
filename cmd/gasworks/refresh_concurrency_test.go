@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gascity/gasworks/internal/config"
 )
@@ -33,7 +34,7 @@ func TestEnsureIDTokenSerializesRefresh(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			toks[i], errs[i] = ensureIDToken(cfg)
+			toks[i], errs[i] = ensureIDToken(cfg, time.Now().Add(overallBudget))
 		}(i)
 	}
 	wg.Wait()

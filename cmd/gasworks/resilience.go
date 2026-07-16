@@ -37,14 +37,48 @@ const (
 	// NOT served on a mint failure, so bd's ~10s expiry skew cannot instantly re-stale it into
 	// a helper-exec storm.
 	serveLastGoodFloorSecs = 15
+	// minStepFloor is the least remaining budget worth starting a network step with; below it the
+	// caller prefers serve-last-good/die over a doomed sub-timeout call — and never hands httpc a
+	// non-positive timeout (which it would treat as the 30s default, blowing the exec cap).
+	minStepFloor = 300 * time.Millisecond
 )
+
+// overallBudget is the single end-to-end deadline for the whole getToken mint chain. bd runs the
+// credential helper under a ~30s exec cap, so every network step is clamped to the time remaining
+// before this deadline and the per-step timeouts can never SUM past it — leaving headroom for
+// serve-last-good instead of a bd SIGKILL (S2-DESIGN §5.4, FIX 4). It is a var so tests can
+// shrink it; production keeps ~5s of headroom under the 30s cap.
+var overallBudget = 25 * time.Second
+
+// clampStep returns the per-step timeout clamped to the overall deadline. ok is false when the
+// remaining budget is below minStepFloor: the caller must NOT start the step and should fall back
+// to serve-last-good/die.
+func clampStep(deadline time.Time, step time.Duration) (timeout time.Duration, ok bool) {
+	rem := time.Until(deadline)
+	if rem < minStepFloor {
+		return 0, false
+	}
+	if rem < step {
+		return rem, true
+	}
+	return step, true
+}
+
+// earliest returns the earlier of two deadlines.
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
 
 // resilientExchange runs the EIA exchange with a bounded retry ladder for transient failures
 // (STS 429/5xx and network/timeout errors): up to maxMintAttempts within mintLadderBudget,
 // exponential backoff + jitter between attempts, each attempt bounded by perAttemptTimeout.
 // A non-transient failure (401/403/other 4xx) returns immediately so the caller can branch.
-func resilientExchange(cfg config.Config, sessionToken, product, scope string, key *dpop.Key) (sts.EIA, error) {
-	deadline := time.Now().Add(mintLadderBudget)
+func resilientExchange(cfg config.Config, sessionToken, product, scope string, key *dpop.Key, overall time.Time) (sts.EIA, error) {
+	// The ladder gets its own budget, but never runs past the overall deadline (FIX 4).
+	deadline := earliest(time.Now().Add(mintLadderBudget), overall)
 	var lastErr error
 	for attempt := 0; attempt < maxMintAttempts; attempt++ {
 		if attempt > 0 {
@@ -54,11 +88,8 @@ func resilientExchange(cfg config.Config, sessionToken, product, scope string, k
 			}
 			time.Sleep(delay)
 		}
-		perAttempt := perAttemptTimeout
-		if rem := time.Until(deadline); rem < perAttempt {
-			perAttempt = rem
-		}
-		if perAttempt <= 0 {
+		perAttempt, ok := clampStep(deadline, perAttemptTimeout)
+		if !ok {
 			break
 		}
 		res, err := sts.Exchange(cfg, sessionToken, product, scope, key, perAttempt)

@@ -432,3 +432,27 @@ func TestRefreshRotationPersistsBeforeMint(t *testing.T) {
 			data.RefreshToken)
 	}
 }
+
+// TestRefreshWithoutIDTokenFailsAfterPersistingRotatedRT is the FIX 7 property: a refresh that
+// ROTATES the refresh token but returns NO id_token must persist the rotated RT (so it is not
+// lost) AND fail with the L4 openid-scope message — never silently return the stale id_token as
+// fresh (which would also burn an RT rotation every call).
+func TestRefreshWithoutIDTokenFailsAfterPersistingRotatedRT(t *testing.T) {
+	srv := newStub(t)
+	srv.refreshTok = map[string]any{"refresh_token": "RT-ROTATED"} // rotated RT, NO id_token
+	seed(t, srv, map[string]any{"refresh_token": "RT-OLD", "id_token": expiredIDToken()})
+
+	_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code == 0 {
+		t.Fatal("want non-zero exit when the refresh response carries no id_token")
+	}
+	if !strings.Contains(errOut, "no id_token") || !strings.Contains(errOut, "openid") {
+		t.Fatalf("stderr = %q, want the L4 openid-scope message", errOut)
+	}
+	if data := loadStore(t); data.RefreshToken != "RT-ROTATED" {
+		t.Fatalf("refresh_token = %q, want the rotated 'RT-ROTATED' persisted (not lost)", data.RefreshToken)
+	}
+	if n := len(srv.reqs("/sts/v0/token")); n != 0 {
+		t.Fatalf("must not proceed to mint with a stale id_token, got %d", n)
+	}
+}

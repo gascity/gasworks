@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"flag"
+	"time"
 
 	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/httpc"
@@ -26,7 +27,7 @@ func cmdWhoami(cfg config.Config, argv []string) error {
 		return die("not logged in — run `gasworks login`")
 	}
 
-	idToken, err := ensureIDToken(cfg)
+	idToken, err := ensureIDToken(cfg, time.Now().Add(overallBudget))
 	if err != nil {
 		return err
 	}

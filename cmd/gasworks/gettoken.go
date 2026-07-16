@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/dpop"
@@ -74,12 +75,21 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		return die("%s", err)
 	}
 
-	idToken, err := ensureIDToken(cfg)
+	// One overall deadline bounds the ENTIRE mint chain (refresh + discovery + login + exchange
+	// ladder + serve-last-good) so its per-step timeouts can never sum past bd's ~30s exec cap
+	// (S2-DESIGN §5.4, FIX 4). Every network step below clamps to the remaining budget.
+	deadline := time.Now().Add(overallBudget)
+
+	idToken, err := ensureIDToken(cfg, deadline)
 	if err != nil {
 		return err
 	}
 
-	ctx, err := sts.Context(cfg, idToken, true, contextTimeout)
+	ctxTimeout, ok := clampStep(deadline, contextTimeout)
+	if !ok {
+		return die("discovery budget exhausted before it could run")
+	}
+	ctx, err := sts.Context(cfg, idToken, true, ctxTimeout)
 	if err != nil {
 		return die("discovery failed: %s", err)
 	}
@@ -121,22 +131,24 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 		}
 	}
 
-	sessionToken, key, err := ensureSession(cfg, data, org, idToken)
+	sessionToken, key, err := ensureSession(cfg, data, org, idToken, deadline)
 	if err != nil {
 		return err
 	}
 
-	res, err := resilientExchange(cfg, sessionToken, product, scope, key)
+	res, err := resilientExchange(cfg, sessionToken, product, scope, key, deadline)
 	if err != nil {
 		var he *httpc.HTTPError
 		switch {
 		case errors.As(err, &he) && he.Status == 401:
-			// Session not resolvable — re-establish ONCE (fresh key) and retry the ladder.
-			sessionToken, key, err = newSession(cfg, org, idToken)
+			// Session not resolvable — re-establish ONCE (fresh key) and retry the ladder. The
+			// re-login + second ladder ride the SAME overall deadline (FIX 4), so the 401 path
+			// cannot double the budget past the exec cap.
+			sessionToken, key, err = newSession(cfg, org, idToken, deadline)
 			if err != nil {
 				return err
 			}
-			res, err = resilientExchange(cfg, sessionToken, product, scope, key)
+			res, err = resilientExchange(cfg, sessionToken, product, scope, key, deadline)
 			if err != nil {
 				return serveLastGoodOrDie(err, cached, hadCache, scope, *asJSON)
 			}
@@ -192,7 +204,7 @@ func serveLastGoodOrDie(err error, cached store.EIACacheEntry, hadCache bool, sc
 // then under the store lock a RE-load + RE-check (a peer may have refreshed while we blocked)
 // and a refresh only if still stale, with the round-trip bounded so the lock is never held for
 // long. The first waiter refreshes once; the rest re-read the fresh token and skip.
-func ensureIDToken(cfg config.Config) (string, error) {
+func ensureIDToken(cfg config.Config, deadline time.Time) (string, error) {
 	// Fast path: an unlocked read — a still-fresh id_token needs neither lock nor refresh.
 	data, err := store.Load()
 	if err != nil {
@@ -219,7 +231,11 @@ func ensureIDToken(cfg config.Config) (string, error) {
 		if d.RefreshToken == "" {
 			return die("not logged in — run `gasworks login`")
 		}
-		tok, err := oidc.Refresh(cfg, d.RefreshToken, refreshTimeout)
+		refreshTO, ok := clampStep(deadline, refreshTimeout)
+		if !ok {
+			return die("session refresh budget exhausted before it could run")
+		}
+		tok, err := oidc.Refresh(cfg, d.RefreshToken, refreshTO)
 		if err != nil {
 			var he *httpc.HTTPError
 			detail := err.Error()
@@ -230,12 +246,21 @@ func ensureIDToken(cfg config.Config) (string, error) {
 			}
 			return die("session expired (%s) — run `gasworks login` again", detail)
 		}
+		// Persist the rotated refresh token FIRST (M10): Keycloak rotates on every use, so a
+		// crash after this point must not strand the user with the spent old token.
 		if tok.RefreshToken != "" {
-			d.RefreshToken = tok.RefreshToken // Keycloak rotates — persist it
+			d.RefreshToken = tok.RefreshToken
 		}
-		if tok.IDToken != "" {
-			d.IDToken = tok.IDToken
+		// FIX 7: a refresh that rotated the RT but returned no (fresh) id_token must NOT silently
+		// return the stale id_token as if fresh (BrowserLogin has the L4 guard; the refresh path
+		// had none). Persist the rotated RT so it is not lost, then fail with the L4 message.
+		if tok.IDToken == "" || tokenExp(tok.IDToken)-now() <= idTokenSkewSecs {
+			if serr := store.Save(d); serr != nil {
+				return die("could not persist refreshed token: %s", serr)
+			}
+			return die("token response had no id_token (is the 'openid' scope enabled on the client?)")
 		}
+		d.IDToken = tok.IDToken
 		idToken = d.IDToken
 		if err := store.Save(d); err != nil {
 			return die("could not persist refreshed token: %s", err)
@@ -279,13 +304,18 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 }
 
 // newSession generates a FRESH DPoP key, establishes a new STS session, and persists it
-// (locked). A fresh key per new session matches the server's per-session jkt-pin.
-func newSession(cfg config.Config, org, idToken string) (string, *dpop.Key, error) {
+// (locked). A fresh key per new session matches the server's per-session jkt-pin. The login step
+// is clamped to the overall deadline (FIX 4).
+func newSession(cfg config.Config, org, idToken string, deadline time.Time) (string, *dpop.Key, error) {
 	key, err := dpop.NewKey()
 	if err != nil {
 		return "", nil, die("could not generate a session key: %s", err)
 	}
-	sess, err := sts.Login(cfg, idToken, org, key, loginTimeout)
+	loginTO, ok := clampStep(deadline, loginTimeout)
+	if !ok {
+		return "", nil, die("login budget exhausted before it could run")
+	}
+	sess, err := sts.Login(cfg, idToken, org, key, loginTO)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 403 {
@@ -315,7 +345,7 @@ func newSession(cfg config.Config, org, idToken string) (string, *dpop.Key, erro
 
 // ensureSession reuses the stored per-org session when it has >30s left (loading its DPoP key
 // from PEM), otherwise establishes a fresh one.
-func ensureSession(cfg config.Config, data *store.Data, org, idToken string) (string, *dpop.Key, error) {
+func ensureSession(cfg config.Config, data *store.Data, org, idToken string, deadline time.Time) (string, *dpop.Key, error) {
 	if sess, ok := data.Sessions[org]; ok && sess.ExpiresAt-now() > sessionSkewSecs {
 		key, err := dpop.FromPEM(sess.DPoPPEM)
 		if err == nil {
@@ -323,7 +353,7 @@ func ensureSession(cfg config.Config, data *store.Data, org, idToken string) (st
 		}
 		// A corrupt stored key falls through to a fresh session rather than crashing.
 	}
-	return newSession(cfg, org, idToken)
+	return newSession(cfg, org, idToken, deadline)
 }
 
 // hoistPositional pulls the single bareword product out of argv (in any position, like
