@@ -1,0 +1,2 @@
+{"type":"message","role":"user","text":"first complete record","ts":"2026-07-17T10:00:00Z"}
+{"type":"tool_call","tool":"git","category":"SHELL","command":"git status --short

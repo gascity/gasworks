@@ -1,0 +1,4 @@
+{"type":"session","transition":"STARTED","start_source":"STARTUP","session_id":"sess-abc","provider":"codex","model":"gpt-5-codex","ts":"2026-07-17T10:04:00Z"}
+{"type":"session","transition":"RESUMED","start_source":"RESUME","session_id":"sess-abc","provider":"codex","ts":"2026-07-17T10:04:01Z"}
+{"type":"session","transition":"CLEARED","start_source":"CLEAR","session_id":"sess-abc","provider":"codex","ts":"2026-07-17T10:04:02Z"}
+{"type":"session","transition":"COMPACTED","start_source":"COMPACT","session_id":"sess-abc","provider":"codex","ts":"2026-07-17T10:04:03Z"}

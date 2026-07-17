@@ -1,0 +1,1 @@
+{"type":"tool_result","tool":"curl","category":"NETWORK","status":"OK","output":"fetched https://example.com/ga-1234 then wrote /var/log/ga-2026-build.log and ga-9wsri-artifact.tar.gz\n","ts":"2026-07-17T10:13:00Z"}

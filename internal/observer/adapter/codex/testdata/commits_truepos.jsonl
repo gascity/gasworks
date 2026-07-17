@@ -1,0 +1,2 @@
+{"type":"tool_result","tool":"git","category":"SHELL","status":"OK","output":"commit da39a3ee5e6b4b0d3255bfef95601890afd80709\nMerge: 356a192b7913b04c54574d18c28d46e6395428ab da39a3ee5e6b4b0d3255bfef95601890afd80709\nAuthor: Dev <dev@example.com>\n\n    fix the parser\n","ts":"2026-07-17T10:05:00Z"}
+{"type":"tool_call","tool":"git","category":"SHELL","command":"git show e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","ts":"2026-07-17T10:05:01Z"}

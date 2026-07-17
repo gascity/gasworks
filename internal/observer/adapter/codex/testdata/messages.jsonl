@@ -1,0 +1,4 @@
+{"type":"message","role":"user","text":"Please run the build","ts":"2026-07-17T10:00:00Z"}
+{"type":"message","role":"assistant","text":"Sure, running it now.","token_count":7,"ts":"2026-07-17T10:00:01Z"}
+{"type":"message","role":"system","text":"You are a helpful agent.","ts":"2026-07-17T10:00:02Z"}
+{"type":"message","role":"tool","text":"exit 0","ts":"2026-07-17T10:00:03Z"}

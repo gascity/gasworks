@@ -1,0 +1,3 @@
+{"type":"message","role":"user","text":"hi","ts":"2026-07-17T10:00:00Z"}
+{"type":"reasoning","text":"internal chain of thought that this adapter version does not recognize","ts":"2026-07-17T10:00:01Z"}
+{"type":"usage","quality":"PROVIDER_REPORTED","input_tokens":5,"ts":"2026-07-17T10:00:02Z"}
