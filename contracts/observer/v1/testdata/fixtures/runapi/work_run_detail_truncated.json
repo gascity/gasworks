@@ -1,0 +1,130 @@
+{
+  "work_run": {
+    "team_server_project_id": "btsproj_019f0011",
+    "group_bead_id": "bd-convoy-1",
+    "group_bead_type": "convoy"
+  },
+  "evaluated_at": "2026-07-16T10:04:00.000Z",
+  "work_axis_available": true,
+  "members": [
+    {
+      "bead": {
+        "bead_id": "bd-123",
+        "issue_type": "task",
+        "title": "Ship ingest",
+        "status": "in_progress",
+        "updated_at": "2026-07-16T10:03:00.000Z",
+        "priority": "1",
+        "assignee": "alice",
+        "blocked": false,
+        "blocks_bead_ids": []
+      },
+      "is_group_bead": false,
+      "associated_runs": [
+        {
+          "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+          "boundary_authority": "AUTHORITATIVE",
+          "lifecycle": "CLOSED",
+          "outcome": "UNKNOWN",
+          "session": {
+            "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+            "adapter": "codex-hook",
+            "model": "gpt-5-codex"
+          },
+          "usage": [
+            {
+              "origin": "DECLARED",
+              "quality": "PROVIDER_REPORTED",
+              "input_tokens": 1200,
+              "output_tokens": 640
+            }
+          ],
+          "vcs_chips": [
+            {
+              "ref_kind": "PULL_REQUEST",
+              "identifier": "#4178",
+              "repo_slug": "gascity/gasworks-platform",
+              "origin": "DECLARED",
+              "via_run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac"
+            }
+          ],
+          "work_ref_origin": "DECLARED"
+        },
+        {
+          "run_id": "gwr_019f7a10-eeee-7d4e-8f50-6172839405bb",
+          "boundary_authority": "INFERRED",
+          "lifecycle": "CLOSED",
+          "outcome": "UNKNOWN",
+          "session": {
+            "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+            "adapter": "codex-hook"
+          },
+          "usage": [
+            {
+              "origin": "EXTRACTED",
+              "quality": "PROVIDER_REPORTED",
+              "input_tokens": 1200,
+              "output_tokens": 640
+            }
+          ],
+          "work_ref_origin": "EXTRACTED"
+        }
+      ],
+      "run_truncation": {
+        "truncated": true,
+        "returned": 2,
+        "total": 5
+      }
+    },
+    {
+      "bead": {
+        "bead_id": "bd-sub-convoy",
+        "issue_type": "convoy",
+        "title": "Sub-convoy",
+        "status": "open",
+        "updated_at": "2026-07-16T09:55:00.000Z",
+        "blocked": true,
+        "blocks_bead_ids": [
+          "bd-900",
+          "bd-901"
+        ]
+      },
+      "is_group_bead": true,
+      "sub_work_run": {
+        "team_server_project_id": "btsproj_019f0011",
+        "group_bead_id": "bd-sub-convoy",
+        "group_bead_type": "convoy"
+      },
+      "associated_runs": [],
+      "run_truncation": {
+        "truncated": false,
+        "returned": 0,
+        "total": 0
+      }
+    }
+  ],
+  "member_truncation": {
+    "truncated": true,
+    "returned": 2,
+    "total": 8
+  },
+  "aggregates": {
+    "declared_usage": [
+      {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 1200,
+        "output_tokens": 640
+      }
+    ],
+    "extracted_usage": [
+      {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 1200,
+        "output_tokens": 640
+      }
+    ],
+    "declared_run_count": 1,
+    "extracted_run_count": 1
+  },
+  "next_page_token": "eyJwIjoiYnRzcHJval8wMTlmMDAxMSIsImIiOiJiZC1jb252b3ktMSJ9"
+}

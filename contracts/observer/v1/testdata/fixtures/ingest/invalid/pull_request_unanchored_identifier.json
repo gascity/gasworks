@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 1,
+  "last_sequence": 1,
+  "observations": [
+    {
+      "sequence": 1,
+      "observation_id": "obs_0000000000000001",
+      "kind": "VCS_REFERENCE",
+      "occurred_at": "2026-07-16T10:01:00.100Z",
+      "captured_at": "2026-07-16T10:01:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "vcs_reference": {
+        "ref_kind": "PULL_REQUEST",
+        "identifier": "4178",
+        "extraction": {
+          "surface": "TOOL_CALL",
+          "pattern_id": "gh-pr-view-v1",
+          "extractor_version": "1.0.0"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 30,
+  "last_sequence": 31,
+  "observations": [
+    {
+      "sequence": 30,
+      "observation_id": "obs_000000000000001e",
+      "kind": "TOOL_CALL",
+      "occurred_at": "2026-07-16T10:30:00.100Z",
+      "captured_at": "2026-07-16T10:30:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "tool_call": {
+        "category": "SHELL",
+        "argument_byte_count": 64
+      }
+    },
+    {
+      "sequence": 31,
+      "observation_id": "obs_000000000000001f",
+      "kind": "TOOL_RESULT",
+      "occurred_at": "2026-07-16T10:31:00.100Z",
+      "captured_at": "2026-07-16T10:31:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "tool_result": {
+        "category": "SHELL",
+        "status": "OK",
+        "result_byte_count": 2048
+      }
+    }
+  ]
+}

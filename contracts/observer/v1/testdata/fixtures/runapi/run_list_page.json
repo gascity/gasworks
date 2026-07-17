@@ -1,0 +1,40 @@
+{
+  "runs": [
+    {
+      "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+      "projection_version": 1,
+      "projection_revision": 7,
+      "boundary_authority": "AUTHORITATIVE",
+      "lifecycle": "CLOSED",
+      "outcome": "UNKNOWN",
+      "started_at": "2026-07-16T10:00:00.100Z",
+      "updated_at": "2026-07-16T10:03:12.500Z",
+      "last_evidence_ingested_at": "2026-07-16T10:03:10.412Z",
+      "work_item_refs": [
+        {
+          "team_server_project_id": "btsproj_019f0011",
+          "bead_id": "bd-123",
+          "origin": "DECLARED"
+        }
+      ],
+      "has_partial_capture": false
+    },
+    {
+      "run_id": "gwr_019f7a10-9999-7d4e-8f50-6172839405ff",
+      "projection_version": 1,
+      "projection_revision": 2,
+      "boundary_authority": "INFERRED",
+      "lifecycle": "OPEN",
+      "outcome": "UNKNOWN",
+      "updated_at": "2026-07-16T10:02:00.000Z",
+      "last_evidence_ingested_at": "2026-07-16T10:01:58.000Z",
+      "has_partial_capture": true
+    }
+  ],
+  "quiescence_rule": {
+    "version": 1,
+    "threshold_seconds": 900
+  },
+  "updates_cursor": "eyJIIjoxMjM0LCJ3cyI6ImFjbWUifQ",
+  "next_page_token": "eyJrIjpbIjIwMjYtMDctMTYiLCJnd3JfMDE5ZiJdfQ"
+}

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 70,
+  "last_sequence": 70,
+  "observations": [
+    {
+      "sequence": 70,
+      "observation_id": "obs_0000000000000046",
+      "kind": "CAPTURE_DIAGNOSTIC",
+      "occurred_at": "2026-07-16T10:10:00.100Z",
+      "captured_at": "2026-07-16T10:10:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "line1\u0001\u0007tail",
+        "source_locator": "codex/2026/07/16/abc\u202egnj\u202c.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "capture_diagnostic": {
+        "code": "UNSUPPORTED_FORMAT",
+        "severity": "WARNING",
+        "completeness_effect": "PARTIAL",
+        "context": "\u001b[31mDROP TABLE\u001b[0m <script>alert('xss')</script>"
+      }
+    }
+  ]
+}

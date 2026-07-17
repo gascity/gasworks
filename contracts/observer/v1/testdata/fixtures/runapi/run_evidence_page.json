@@ -1,0 +1,27 @@
+{
+  "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+  "projection_version": 1,
+  "projection_revision": 7,
+  "evidence": [
+    {
+      "observation_id": "obs_0000000000000029",
+      "sequence": 41,
+      "kind": "RUN_BOUNDARY",
+      "occurred_at": "2026-07-16T10:00:00.100Z",
+      "source_id": "src_019f7a1000observerpilot0001",
+      "confidence": "AUTHORITATIVE",
+      "label": "RUN_STARTED"
+    },
+    {
+      "observation_id": "obs_000000000000002b",
+      "sequence": 43,
+      "kind": "SESSION_LIFECYCLE",
+      "occurred_at": "2026-07-16T10:00:00.100Z",
+      "source_id": "src_019f7a1000observerpilot0001",
+      "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+      "confidence": "AUTHORITATIVE",
+      "label": "STARTED"
+    }
+  ],
+  "next_page_token": "eyJvIjoiMjAyNi0wNy0xNiIsInMiOjQzfQ"
+}

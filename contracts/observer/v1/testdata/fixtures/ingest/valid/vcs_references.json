@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 100,
+  "last_sequence": 103,
+  "observations": [
+    {
+      "sequence": 100,
+      "observation_id": "obs_0000000000000064",
+      "kind": "VCS_REFERENCE",
+      "occurred_at": "2026-07-16T10:40:00.100Z",
+      "captured_at": "2026-07-16T10:40:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "vcs_reference": {
+        "ref_kind": "COMMIT",
+        "identifier": "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d",
+        "extraction": {
+          "surface": "TOOL_RESULT",
+          "pattern_id": "git-log-oneline-v1",
+          "extractor_version": "1.0.0"
+        }
+      }
+    },
+    {
+      "sequence": 101,
+      "observation_id": "obs_0000000000000065",
+      "kind": "VCS_REFERENCE",
+      "occurred_at": "2026-07-16T10:41:00.100Z",
+      "captured_at": "2026-07-16T10:41:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "vcs_reference": {
+        "ref_kind": "COMMIT",
+        "identifier": "0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "extraction": {
+          "surface": "TOOL_RESULT",
+          "pattern_id": "git-log-sha256-v1",
+          "extractor_version": "1.0.0"
+        }
+      }
+    },
+    {
+      "sequence": 102,
+      "observation_id": "obs_0000000000000066",
+      "kind": "VCS_REFERENCE",
+      "occurred_at": "2026-07-16T10:42:00.100Z",
+      "captured_at": "2026-07-16T10:42:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "vcs_reference": {
+        "ref_kind": "PULL_REQUEST",
+        "identifier": "#4178",
+        "repo_slug": "gascity/gasworks-platform",
+        "extraction": {
+          "surface": "TOOL_CALL",
+          "pattern_id": "gh-pr-view-v1",
+          "extractor_version": "1.0.0"
+        }
+      }
+    },
+    {
+      "sequence": 103,
+      "observation_id": "obs_0000000000000067",
+      "kind": "VCS_REFERENCE",
+      "occurred_at": "2026-07-16T10:43:00.100Z",
+      "captured_at": "2026-07-16T10:43:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "vcs_reference": {
+        "ref_kind": "PULL_REQUEST",
+        "identifier": "https://github.com/gascity/gasworks-platform/pull/4178",
+        "repo_slug": "gascity/gasworks-platform",
+        "extraction": {
+          "surface": "TOOL_RESULT",
+          "pattern_id": "gh-pr-url-v1",
+          "extractor_version": "1.0.0"
+        }
+      }
+    }
+  ]
+}

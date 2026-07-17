@@ -1,0 +1,8 @@
+{
+  "new_source_id": "src_019f7a1000observerpilot0002",
+  "loss_range": {
+    "first_sequence": 46,
+    "last_sequence": 99
+  },
+  "acknowledge_evidence_loss": true
+}

@@ -1,0 +1,36 @@
+{
+  "run_id": "gwr_\u001b[31mDROP TABLE\u001b[0m",
+  "projection_version": 1,
+  "projection_revision": 3,
+  "boundary_authority": "INFERRED",
+  "lifecycle": "OPEN",
+  "outcome": "UNKNOWN",
+  "updated_at": "2026-07-16T10:00:00.000Z",
+  "last_evidence_ingested_at": "2026-07-16T10:00:00.000Z",
+  "sessions": [
+    {
+      "native_session_id": "line1\u0001\u0007tail",
+      "adapter": "codex-hook",
+      "intervals": []
+    }
+  ],
+  "work_item_refs": [
+    {
+      "team_server_project_id": "btsproj_019f0011",
+      "bead_id": "<script>alert('xss')</script>",
+      "origin": "EXTRACTED"
+    }
+  ],
+  "usage_totals": [],
+  "timeline_summary": {
+    "observation_count": 0
+  },
+  "diagnostics": [
+    {
+      "code": "UNSUPPORTED_FORMAT",
+      "severity": "WARNING",
+      "detail": "abc\u202egnj\u202c <script>alert('xss')</script>"
+    }
+  ],
+  "has_partial_capture": true
+}

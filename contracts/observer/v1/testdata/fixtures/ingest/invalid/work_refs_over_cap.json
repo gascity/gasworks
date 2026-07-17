@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 1,
+  "last_sequence": 1,
+  "observations": [
+    {
+      "sequence": 1,
+      "observation_id": "obs_0000000000000001",
+      "kind": "SESSION_LIFECYCLE",
+      "occurred_at": "2026-07-16T10:01:00.100Z",
+      "captured_at": "2026-07-16T10:01:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-0",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-1",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-2",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-3",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-4",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-5",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-6",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-7",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-8",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-9",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-10",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-11",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-12",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-13",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-14",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-15",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-16",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-17",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-18",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-19",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-20",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-21",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-22",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-23",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-24",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-25",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-26",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-27",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-28",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-29",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-30",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-31",
+            "origin": "DECLARED"
+          },
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-32",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "session_lifecycle": {
+        "transition": "STARTED",
+        "start_source": "STARTUP",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "provider": "codex"
+      }
+    }
+  ]
+}

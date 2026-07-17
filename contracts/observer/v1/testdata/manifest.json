@@ -1,0 +1,445 @@
+{
+  "description": "Canonical Observer contract fixture manifest. openapi_spec_test.go re-checks every sha256, validates each fixture against its named component schema (expect=valid must conform; expect=invalid must be rejected), and fails on any fixture file absent from this list. semantic_violation entries are schema-well-formed but violate a server-validated wire-contract rule not expressible in OpenAPI 3.0 (contiguity, drain-pair, ESTIMATED price-table, cross-batch idempotency); they are negative inputs for the P0.4/S2.4 Go validators.",
+  "spec": "docs/reference/schema/observer.openapi.json",
+  "spec_sha256": "1befe74b3ddfa3fd6768547a3a0502569298d66c55c209ddc4987ff69831919e",
+  "fixtures": [
+    {
+      "path": "fixtures/auth/forbidden.json",
+      "sha256": "4753014edc434bc133374979bf12bbf75846c37301cd09bbe35c5037b5dc2de7",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "auth-shape",
+      "note": "403 body"
+    },
+    {
+      "path": "fixtures/auth/rate_limited.json",
+      "sha256": "729c055d380be74c9c688649b21a2a7831bcd042dc8fd432736ad02092090dde",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "auth-shape",
+      "note": "429 body; retryable true"
+    },
+    {
+      "path": "fixtures/auth/unauthorized.json",
+      "sha256": "c34b1cb8e0101dd1e4d355c4eb8a1778c29ff6269fd018d83aa70ff87925df94",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "auth-shape",
+      "note": "401 body"
+    },
+    {
+      "path": "fixtures/errors/invalid_page_token.json",
+      "sha256": "477bdac39575d9e0bb99ce9eb06fd1b66575046ed16fc716e8385945369a74a4",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "error-shape",
+      "note": "400 body"
+    },
+    {
+      "path": "fixtures/errors/not_found.json",
+      "sha256": "85c975307a191fbfe6a0c45756a2b03e0e41eeeb8efeeff8f2f9e31e5e2db11e",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "error-shape",
+      "note": "uniform 404 body"
+    },
+    {
+      "path": "fixtures/errors/range_not_contiguous.json",
+      "sha256": "35c2b075c0bda3f4770d813097f4ccfa5ae1e0293f8b5aee224352d6572d992c",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "error-shape",
+      "note": "422 body"
+    },
+    {
+      "path": "fixtures/hostile/batch_hostile_strings.json",
+      "sha256": "7c20b6d6f59ace8bf2581001635ea6b00b81ccd8f7607c67b22afa97f530cec1",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "hostile-string",
+      "note": "ANSI/control/bidi/HTML in source_locator, native_session_id, and diagnostic context survive as opaque text"
+    },
+    {
+      "path": "fixtures/hostile/run_detail_hostile.json",
+      "sha256": "2af904243b6e11bd68ad37cabedd838fe0deef36d23e4194a0defdb46b6c0f5f",
+      "schema": "RunDetail",
+      "expect": "valid",
+      "category": "hostile-string",
+      "note": "hostile strings in run_id, native_session_id, bead_id, and diagnostic detail; consumers render as text"
+    },
+    {
+      "path": "fixtures/ingest/ack/ack_first_write.json",
+      "sha256": "fe3c6379733f9ba67fbf1fde4434eb0cb928143c858cc48688c9908b07a3b4a6",
+      "schema": "IngestAck",
+      "expect": "valid",
+      "category": "ingest-ack",
+      "note": "first durable write: all accepted"
+    },
+    {
+      "path": "fixtures/ingest/ack/ack_replay.json",
+      "sha256": "c86fe60d4496e727654ac9556dbc65ee407d830e4f5f759fcfcfcb72c5f970d1",
+      "schema": "IngestAck",
+      "expect": "valid",
+      "category": "ingest-ack",
+      "note": "idempotent replay: all duplicates"
+    },
+    {
+      "path": "fixtures/ingest/capabilities/capabilities.json",
+      "sha256": "2ee2b75ad927758d01be13acbd17fa28d970bb711ed5866bcc721136abcbe3a3",
+      "schema": "CapabilitiesResponse",
+      "expect": "valid",
+      "category": "ingest-capabilities",
+      "note": "published limits (incl max_record_bytes) + authenticated binding only; no client-supplied tenant/workspace"
+    },
+    {
+      "path": "fixtures/ingest/conflict/estimated_usage_missing_price_table.json",
+      "sha256": "71c217c34589dcb5e8aceb3e06b560b743b1bafa6634571e297c7631e70b5908",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "ESTIMATED_PRICE_TABLE",
+      "note": "ESTIMATED usage without price_table_version: schema-valid (coupling demoted), server validator requires price_table_version for ESTIMATED"
+    },
+    {
+      "path": "fixtures/ingest/conflict/observation_id_reuse.json",
+      "sha256": "cf27d11f028a517b4eb4197b1dccd43d6a23633075ac789cb3586751303f79d6",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "OBSERVATION_CONFLICT",
+      "note": "reuses observation_id obs_0000000000000005 (bound at sequence 5 by fixtures/ingest/valid/work_references.json) at sequence 7 with byte-identical payload; server rejects 409"
+    },
+    {
+      "path": "fixtures/ingest/conflict/run_ended_drain_without_watermark.json",
+      "sha256": "8966e85471c923e9ca28634fb2ef3edbd0be685fa8a52feb4599087f66903bc0",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "DRAIN_PAIR",
+      "note": "RUN_ENDED with drain_status but no covered_watermark: schema-valid (both optional), server validator requires the pair to travel together"
+    },
+    {
+      "path": "fixtures/ingest/conflict/run_ended_watermark_without_drain.json",
+      "sha256": "13f7f955f148f73ac2ae1e754732c6052b45eb1614e2ff1b43c383a0e0c5448e",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "DRAIN_PAIR",
+      "note": "RUN_ENDED with covered_watermark but no drain_status: schema-valid, server validator requires the pair"
+    },
+    {
+      "path": "fixtures/ingest/conflict/sequence_conflict.json",
+      "sha256": "5801d662f3785dadb7995763b9eea2dea2fed5d1599180523736353f20972820",
+      "schema": "ObserverError",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "note": "409 body; the spec's canonical conflict envelope"
+    },
+    {
+      "path": "fixtures/ingest/conflict/sequence_content_conflict.json",
+      "sha256": "de41cb12e37d37db6824945815df7235877abb1ba6a7f1b184d704e8e9a24e5c",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "SEQUENCE_CONFLICT",
+      "note": "same (source, sequence 5) as fixtures/ingest/valid/work_references.json but different content/observation_id; server rejects 409"
+    },
+    {
+      "path": "fixtures/ingest/conflict/sequence_gap.json",
+      "sha256": "b94ad0e6d5300e895ca8521ac0ebd6b668b6d89e9bb8bd45845932d5d8487c4c",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-conflict",
+      "semantic_violation": "RANGE_NOT_CONTIGUOUS",
+      "note": "schema-well-formed but non-contiguous (range 41..43, len 2, sequence 42 missing); server rejects 422"
+    },
+    {
+      "path": "fixtures/ingest/invalid/abbreviated_commit.json",
+      "sha256": "d5aee8ade3589f9c320dfd2cbf2ef2db46d63bc3b4a61744555e46d7ac1aa91d",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "abbreviated 7-hex COMMIT identifier fails the CommitVcsReference full-length-hex pattern"
+    },
+    {
+      "path": "fixtures/ingest/invalid/bad_schema_version.json",
+      "sha256": "64f6b2ee759e1ec67fcf35d1210ce60f3f83941484498ad1d5c6b62f27ef8884",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "unsupported schema_version (enum is [1])"
+    },
+    {
+      "path": "fixtures/ingest/invalid/bad_source_id.json",
+      "sha256": "4219f39360a67ce414b876ae6a29923618c1db15dedb7b7a3fc514ef9878fbe2",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "source_id missing the src_ prefix violates the pattern"
+    },
+    {
+      "path": "fixtures/ingest/invalid/missing_observation_id.json",
+      "sha256": "fb8a708909f3ae68c4c9d5137e1fba47d14ed83d9f0397ecd70358f616613ad1",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "observation missing required observation_id"
+    },
+    {
+      "path": "fixtures/ingest/invalid/pull_request_unanchored_identifier.json",
+      "sha256": "692d6bfc9bac13a141c424302e9e053101d53109709dced8d50b36440bd37a88",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "unanchored PR identifier (no # or URL) fails the PullRequestVcsReference pattern"
+    },
+    {
+      "path": "fixtures/ingest/invalid/run_started_with_drain.json",
+      "sha256": "edb0eb9761ba34d203907d06c22e866edc4f0f12e3b75cd0b6ec69f107d3628b",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "a RUN_STARTED carrying drain_status is rejected: RunStartedBoundary has no drain fields (additionalProperties:false), and it is not a RUN_ENDED"
+    },
+    {
+      "path": "fixtures/ingest/invalid/session_model_empty.json",
+      "sha256": "50577b1d8dd7931587162863ed15411622d518a0ddc2739edbe7febbaad5c6de",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "SESSION_LIFECYCLE.model empty string violates minLength:1 (absent-not-empty)"
+    },
+    {
+      "path": "fixtures/ingest/invalid/unknown_kind.json",
+      "sha256": "d3abef2c9459295f99a32dc46e48efae0aad806ce01cc2ad012d2887a241d1eb",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "unknown kind is the SINGLE defect: the session_lifecycle payload is well-formed, but no oneOf variant matches FABRICATED_KIND"
+    },
+    {
+      "path": "fixtures/ingest/invalid/work_refs_over_cap.json",
+      "sha256": "68dcb2f96183257ce47195a04b440f2ca1c654584973ad71e5a37e31db398b2b",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "33 work_item_refs exceeds the 32-per-observation cap (maxItems)"
+    },
+    {
+      "path": "fixtures/ingest/replay/replay_work_references.json",
+      "sha256": "58bd8dda5649f2ea4a12392f3c4463c98c2acc8453081e70d42293b227663ea0",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-replay",
+      "note": "byte-identical replay of an already-bound range; server reports duplicates, accepted 0"
+    },
+    {
+      "path": "fixtures/ingest/valid/capture_diagnostics.json",
+      "sha256": "d6c72b913e1db4fc8b5d7497a1b28ac34bec78ab2ea416e5bfb23dfd4ed79458",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "content-free capture diagnostics"
+    },
+    {
+      "path": "fixtures/ingest/valid/launch_failed.json",
+      "sha256": "de7d899bce4248ecc362b162117f5a38a0bd6d6216e239a89ce8bc21d7c69ba6",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "launch-failure terminal: PROCESS_LAUNCH_FAILED then RUN_ENDED with NO drain_status/covered_watermark (valid under the RunEndedBoundary variant)"
+    },
+    {
+      "path": "fixtures/ingest/valid/passive_session.json",
+      "sha256": "47bac6034288d16e74937df471e29b9155918a92465b2460d413feecce391f77",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "passive native session: NO run_context on any observation"
+    },
+    {
+      "path": "fixtures/ingest/valid/run_lifecycle_complete.json",
+      "sha256": "87033a649df24acb8fe7b40fbfda518848abaa1ae27536f6985b90e4c6b1f2e4",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "explicit wrapped run; terminal order PROCESS_EXITED, drained records, RUN_ENDED(COMPLETE) with covered watermark"
+    },
+    {
+      "path": "fixtures/ingest/valid/session_with_model.json",
+      "sha256": "d91b53bfe2a95131055b47347d7e91435eb1b05e69854788d069675170834b76",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "optional bounded SESSION_LIFECYCLE.model present"
+    },
+    {
+      "path": "fixtures/ingest/valid/tools.json",
+      "sha256": "1f2bfb2f0aae37c2067d4bfd6c5799933da9664823e1a9e77e02c18025a2ecbd",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "normalized tool category/status only; no command/args/env/url under METADATA_ONLY"
+    },
+    {
+      "path": "fixtures/ingest/valid/usage.json",
+      "sha256": "925ef681e484c4ffc599150f8d86d3107897ded0e3aa04d7aafa6f92b8b096c6",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "PROVIDER_REPORTED, ESTIMATED (with price_table_version), and AUTHORITATIVE quality samples"
+    },
+    {
+      "path": "fixtures/ingest/valid/vcs_references.json",
+      "sha256": "4fcd4c249a74265a6080c74a195618d117854bb06df0df8cfb1ce3f1a4f4ff37",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid-vcs",
+      "note": "COMMIT 40-hex, COMMIT 64-hex, PULL_REQUEST anchored #N, PULL_REQUEST URL-form; extraction provenance present"
+    },
+    {
+      "path": "fixtures/ingest/valid/work_references.json",
+      "sha256": "58bd8dda5649f2ea4a12392f3c4463c98c2acc8453081e70d42293b227663ea0",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid",
+      "note": "DECLARED and EXTRACTED work references; sequence 5 observation_id obs_0000000000000005 is the prior binding referenced by the conflict fixtures"
+    },
+    {
+      "path": "fixtures/runapi/run_detail.json",
+      "sha256": "d6a2fcea44eeb469542b774288297f72befd0da524aca4edf97519f167f6b674",
+      "schema": "RunDetail",
+      "expect": "valid",
+      "category": "runapi-pagination",
+      "note": "full run detail; interval carries start/end evidence IDs, timestamps, and native start source"
+    },
+    {
+      "path": "fixtures/runapi/run_evidence_page.json",
+      "sha256": "98459fd57b0f49ff732b112f333fff65ed12bc0eea41f1f1689c80db0332b846",
+      "schema": "RunEvidencePage",
+      "expect": "valid",
+      "category": "runapi-pagination",
+      "note": "keyset evidence page pinned to a projection revision; no content fields under metadata-only"
+    },
+    {
+      "path": "fixtures/runapi/run_list_page.json",
+      "sha256": "164e5b09f31744eaa8be6852b5b42c011ef0918b93f58bb22bf679d7bc8ff3d3",
+      "schema": "RunListResponse",
+      "expect": "valid",
+      "category": "runapi-pagination",
+      "note": "initial list page: mixed AUTHORITATIVE/INFERRED, quiescence rule, next_page_token"
+    },
+    {
+      "path": "fixtures/runapi/run_list_updates.json",
+      "sha256": "9452ede25e6734ee378aec68ca18585a50637a95511e5a14566e11091328d001",
+      "schema": "RunListResponse",
+      "expect": "valid",
+      "category": "runapi-pagination",
+      "note": "updates_after incremental page: one coalesced latest revision, empty next_page_token"
+    },
+    {
+      "path": "fixtures/runapi/work_run_detail_bts_unavailable.json",
+      "sha256": "5a230e51be3d6d41d4652c5d37bfa9cd7ca36f180328d4c5022bcaa2b2dcff93",
+      "schema": "WorkRunDetail",
+      "expect": "valid",
+      "category": "runapi-workrun",
+      "note": "partial BTS failure: Observer half returned with work_axis_available=false, no cached substitute"
+    },
+    {
+      "path": "fixtures/runapi/work_run_detail_truncated.json",
+      "sha256": "2818493bac68d92a27a802d7f24c947bea3a13ea9f9de65445376ccc30e6d315",
+      "schema": "WorkRunDetail",
+      "expect": "valid",
+      "category": "runapi-workrun",
+      "note": "convoy work run: member/run truncation, nested group bead with blocks_bead_ids, DECLARED aggregates plus a populated (segregated) EXTRACTED band"
+    },
+    {
+      "path": "fixtures/sources/source_decommission_request.json",
+      "sha256": "d8e43a26d2b4186f90246ca8472dd41cec804efa819800b62f27278cf3e1b12b",
+      "schema": "SourceDecommissionRequest",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "no evidence-loss acknowledgment on decommission (it revokes ingest, does not lose acknowledged evidence)"
+    },
+    {
+      "path": "fixtures/sources/source_descriptor.json",
+      "sha256": "7e66fad8fd07aca2ea4e1672d23c6cd8e5ab6edfd25577f8b0bf0e0b8d8c9fbd",
+      "schema": "SourceDescriptor",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "ENROLLED descriptor"
+    },
+    {
+      "path": "fixtures/sources/source_descriptor_rotating.json",
+      "sha256": "eebf7deea2060884dfe282174cfbdcc649e101a46897d341eca86431b3e80607",
+      "schema": "SourceDescriptor",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "ROTATING state descriptor"
+    },
+    {
+      "path": "fixtures/sources/source_enroll_request.json",
+      "sha256": "3928f6b244bfec2df3abcd65183ee30e55dc2ce467adfae17248e341f08975c2",
+      "schema": "SourceEnrollRequest",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "body never supplies tenancy/authorization"
+    },
+    {
+      "path": "fixtures/sources/source_rotation.json",
+      "sha256": "47b584fb80db31e3ef15e99657de896519696209b48e512832603b07d24c6970",
+      "schema": "SourceRotationResult",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "atomic rotation: old decommissioned, replacement enrolled at sequence zero"
+    },
+    {
+      "path": "fixtures/sources/source_rotation_request.json",
+      "sha256": "1ea90c73a07c8bd4a85c360deb67173a9b6ae7bcc247d3bc88077018c0b14dca",
+      "schema": "SourceRotationRequest",
+      "expect": "valid",
+      "category": "source-lifecycle",
+      "note": "acknowledge_evidence_loss must be true (enum [true])"
+    },
+    {
+      "path": "fixtures/ingest/valid/num_sequence_int64_max.json",
+      "sha256": "3c3348e104372d511dae22d2dce1b8d9233c657a88ad920cedf42c9aaa62f883",
+      "schema": "ObservationBatch",
+      "expect": "valid",
+      "category": "ingest-valid-number",
+      "note": "sequence field at the int64/BIGINT ceiling 9223372036854775807 (x-limits sequence_max); the typed canonical encoder preserves it exactly, never coercing through float64"
+    },
+    {
+      "path": "fixtures/ingest/ack/num_ack_negative_zero.json",
+      "sha256": "55c8cd0b64359965041345936c0dbb495b51bad5f0c9b8cfe3e8db6c5007594d",
+      "schema": "IngestAck",
+      "expect": "valid",
+      "category": "ingest-ack-number",
+      "note": "negative-zero -0 in a top-level int64 field: schema-valid (>= minimum 0); the typed canonical form normalizes it to 0 (canonical integers carry no negative zero)"
+    },
+    {
+      "path": "fixtures/ingest/invalid/num_sequence_fraction.json",
+      "sha256": "f3ce7089d72d0d9171a9eac71d7f1f69dced256c13942316ebc626200dc878e3",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "trailing-zero fraction 1.50 in first_sequence is not an integer; the schema rejects it and the typed decoder rejects it as an out-of-range sequence"
+    },
+    {
+      "path": "fixtures/ingest/invalid/usage_quality_out_of_enum.json",
+      "sha256": "833e8b923b514cb56c782cd10b76c00898b03f635cef3360e1473ebc83e66709",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "USAGE quality 'ESTIMATED_X' is outside the closed enum: the schema rejects it and the runtime decoder rejects it via the generated Valid() membership check (ErrEnumOutOfRange), so out-of-enum data never reaches the store or the ESTIMATED coupling"
+    },
+    {
+      "path": "fixtures/ingest/invalid/usage_payload_null.json",
+      "sha256": "224ef2ef00d2b6d79c5b0a68e8e9b41930a98b6caac8c6feac178b5df155fc1f",
+      "schema": "ObservationBatch",
+      "expect": "invalid",
+      "category": "ingest-invalid",
+      "note": "kind USAGE with usage:null: the schema rejects it (no oneOf variant matches) and the runtime decoder rejects the absent/null dispatched payload member (ErrMissingPayload) instead of zero-filling a UsagePayload"
+    }
+  ]
+}

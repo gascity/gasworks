@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 50,
+  "last_sequence": 51,
+  "observations": [
+    {
+      "sequence": 50,
+      "observation_id": "obs_0000000000000032",
+      "kind": "CAPTURE_DIAGNOSTIC",
+      "occurred_at": "2026-07-16T10:50:00.100Z",
+      "captured_at": "2026-07-16T10:50:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "capture_diagnostic": {
+        "code": "PARTIAL_CAPTURE",
+        "severity": "WARNING",
+        "completeness_effect": "PARTIAL",
+        "context": "drain timed out after 2s"
+      }
+    },
+    {
+      "sequence": 51,
+      "observation_id": "obs_0000000000000033",
+      "kind": "CAPTURE_DIAGNOSTIC",
+      "occurred_at": "2026-07-16T10:51:00.100Z",
+      "captured_at": "2026-07-16T10:51:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f6979-1a2b-7c3d-8e4f-5a6b7c8d9e0f",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "run_context": {
+        "run_id": "gwr_019f7a10-2b3c-7d4e-8f50-6172839405ac",
+        "membership_evidence": "DECLARED_BOUNDARY",
+        "work_item_refs": [
+          {
+            "team_server_project_id": "btsproj_019f0011",
+            "bead_id": "bd-123",
+            "origin": "DECLARED"
+          }
+        ]
+      },
+      "capture_diagnostic": {
+        "code": "REFERENCE_OVERFLOW",
+        "severity": "INFO",
+        "completeness_effect": "NONE",
+        "context": "more than 32 references in one observation"
+      }
+    }
+  ]
+}

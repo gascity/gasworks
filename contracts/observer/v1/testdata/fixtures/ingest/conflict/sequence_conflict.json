@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "SEQUENCE_CONFLICT",
+    "message": "sequence 41 already identifies different content",
+    "retryable": false
+  }
+}
