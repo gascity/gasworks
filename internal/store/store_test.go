@@ -18,7 +18,8 @@ func setConfigDir(t *testing.T, sub string) string {
 func TestSaveLoadRoundtrip(t *testing.T) {
 	setConfigDir(t, "cfg")
 	want := &Data{
-		RefreshToken: "rt",
+		RefreshToken:         "rt",
+		CredentialGeneration: "g1:00000000000000000000000000000001",
 		Sessions: map[string]Session{
 			"org_a": {SessionToken: "t", DPoPPEM: "...", ExpiresAt: 42},
 		},

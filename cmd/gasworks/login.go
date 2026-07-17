@@ -38,6 +38,9 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	if idt == "" {
 		return die("login returned no id_token (is the 'openid' scope enabled on the client?)")
 	}
+	if !validOpaqueToken(tok.RefreshToken) {
+		return die("login returned no refresh_token (is the 'offline_access' scope enabled on the client?)")
+	}
 
 	// (M9/M3) Advisory sanity checks over the DECODED-BUT-UNVERIFIED id_token. These are
 	// NOT a trust boundary — the CLI never verifies the JWT signature; the STS is the real
@@ -62,15 +65,16 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	if exp := jwtutil.Exp(claims); exp != 0 && exp <= time.Now().Unix() {
 		return die("the id_token is already expired (exp=%d) — check the client clock", exp)
 	}
+	generation, err := newCredentialGeneration()
+	if err != nil {
+		return die("could not create a login generation: %s", err)
+	}
 
 	if err := store.Update(func(d *store.Data) error {
 		d.IDToken = idt
-		if tok.RefreshToken != "" {
-			d.RefreshToken = tok.RefreshToken
-		}
-		if *org != "" {
-			d.DefaultOrg = *org
-		}
+		d.CredentialGeneration = generation
+		d.RefreshToken = tok.RefreshToken
+		d.DefaultOrg = *org
 		// A fresh login invalidates any prior STS sessions / cached EIAs.
 		d.Sessions = nil
 		d.EIACache = nil

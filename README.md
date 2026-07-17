@@ -34,9 +34,11 @@ gasworks login --org acme      # remember a default org for getToken
 
 gasworks getToken manifold     # mint an EIA for manifold (raw token on stdout — pipeable)
 gasworks getToken crucible --org acme        # pick an org by slug or id
-gasworks getToken manifold --json            # {access_token, token_type, expires_in, scope}
+gasworks getToken manifold --json            # Bearer + truthful remaining/absolute expiry
 gasworks getToken manifold --refresh         # bypass the local EIA cache
 MANIFOLD_TOKEN=$(gasworks getToken manifold) # capture for a tool
+
+gasworks credential-provider < request.json  # versioned noninteractive JSON protocol
 
 gasworks whoami                # who you are + the orgs you can mint for
 gasworks logout                # revoke the refresh token + wipe local credentials
@@ -47,11 +49,48 @@ gasworks version               # print the build version
 |---|---|
 | `gasworks login [--device\|--browser] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--org` remembers a default org. |
 | `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
+| `gasworks credential-provider` | Read a v1 credential request from stdin and emit one typed JSON response for automation. |
 | `gasworks whoami` | Print your subject/email and the orgs (with roles + products) you can mint for. |
 | `gasworks logout` | Revoke the refresh token at the IdP and wipe local credentials. |
 | `gasworks version` | Print the build version (`--version` also works). |
 
 You don't pass scopes or an org id by hand: `getToken` **discovers** which orgs you belong to and the exact mintable scopes per product (including the org-derived `manifold:pool:<name>` you couldn't guess). Pass `--org` only if you belong to more than one. Override the discovered scopes with `--scope "<space separated>"` only if you really need to.
+
+### Credential-provider protocol
+
+`credential-provider` is the stable, noninteractive interface for tools such as `gc`. It reads
+exactly one bounded JSON object from stdin, never starts a login flow, and writes exactly one JSON
+object to stdout. Run `gasworks login` separately to establish the durable human session.
+
+Request:
+
+```json
+{
+  "version": "gascity.dev/credential-provider/v1",
+  "audience": "manifold",
+  "required_scopes": ["manifold:proxy"],
+  "org": "",
+  "force_refresh": false,
+  "interactive": false
+}
+```
+
+Success:
+
+```json
+{
+  "version": "gascity.dev/credential-provider/v1",
+  "kind": "Credential",
+  "access_token": "<opaque>",
+  "authorization_scheme": "Bearer",
+  "expires_at": "2026-07-16T01:02:03Z",
+  "audience": "manifold",
+  "scopes": ["manifold:proxy"]
+}
+```
+
+Failures are typed JSON with `kind: "Error"` and a stable code such as
+`interaction_required`; they exit nonzero and never echo credentials or upstream response bodies.
 
 ## How it works
 

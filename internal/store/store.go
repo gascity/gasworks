@@ -32,14 +32,16 @@ type EIACacheEntry struct {
 	ExpiresAt int64  `json:"expires_at"`
 }
 
-// Data is the on-disk credential document. Maps are omitempty so a fresh, never-written
-// store roundtrips to {} rather than {"sessions":null,...}.
+// Data is the on-disk credential document. CredentialGeneration fences session and EIA
+// writes across login/logout changes. Maps are omitempty so a fresh, never-written store
+// roundtrips to {} rather than {"sessions":null,...}.
 type Data struct {
-	IDToken      string                   `json:"id_token,omitempty"`
-	RefreshToken string                   `json:"refresh_token,omitempty"`
-	DefaultOrg   string                   `json:"default_org,omitempty"`
-	Sessions     map[string]Session       `json:"sessions,omitempty"`
-	EIACache     map[string]EIACacheEntry `json:"eia_cache,omitempty"`
+	IDToken              string                   `json:"id_token,omitempty"`
+	RefreshToken         string                   `json:"refresh_token,omitempty"`
+	CredentialGeneration string                   `json:"credential_generation,omitempty"`
+	DefaultOrg           string                   `json:"default_org,omitempty"`
+	Sessions             map[string]Session       `json:"sessions,omitempty"`
+	EIACache             map[string]EIACacheEntry `json:"eia_cache,omitempty"`
 }
 
 // ConfigDir resolves the gasworks config directory:
