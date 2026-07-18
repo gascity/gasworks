@@ -135,9 +135,12 @@ func TestValidateBatchCardinality(t *testing.T) {
 	t.Run("exactly_max_is_ok_for_cardinality", func(t *testing.T) {
 		obs := make([]wire.DecodedObservation, MaxObservationsPerBatch)
 		for i := range obs {
-			obs[i] = wire.DecodedObservation{Kind: "MESSAGE", Sequence: int64(1 + i)}
+			// A valid source_id and a non-empty observation_id are required now that the
+			// defense-in-depth identity/source checks also run; the subtest still exercises
+			// the cardinality boundary at exactly MaxObservationsPerBatch.
+			obs[i] = wire.DecodedObservation{Kind: "MESSAGE", Sequence: int64(1 + i), ObservationID: "obs_x"}
 		}
-		b := &wire.DecodedBatch{FirstSequence: 1, LastSequence: int64(MaxObservationsPerBatch), Observations: obs}
+		b := &wire.DecodedBatch{SourceID: "src_019f7a1000observerpilot0001", FirstSequence: 1, LastSequence: int64(MaxObservationsPerBatch), Observations: obs}
 		if err := ValidateBatch(b); err != nil {
 			t.Fatalf("a full 1000-observation contiguous batch must pass, got %v", err)
 		}

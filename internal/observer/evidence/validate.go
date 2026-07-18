@@ -3,6 +3,7 @@ package evidence
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -31,6 +32,29 @@ const MaxReferencesPerObservation = 32
 // max_observations_per_batch / the observations maxItems). minItems is 1.
 const MaxObservationsPerBatch = 1000
 
+// The three non-VCS field constraints the platform apigen constraint validator added
+// (gasworks-platform, commit e505060): observation_id required/non-empty, session
+// lifecycle model minLength, and the source_id pattern. OpenAPI 3.0 carries these as
+// schema keywords, but the strict wire decoder (wire.DecodeObservationBatch) enforces
+// shape/enum/sequence only and leaves these to this layer. The endpoint is the TRUSTED
+// producer — observation_id is spool-assigned, source_id is server-assigned at
+// enrollment, and an empty model is unrepresentable through the constructors — so these
+// are defense-in-depth SYMMETRY with the platform gate, not the load-bearing check. We
+// mirror them so a batch the endpoint accepts locally is one the Collector accepts on
+// ingest, and so the shared invalid-fixture corpus (missing_observation_id,
+// session_model_empty, bad_source_id) rejects identically on both sides.
+const (
+	// MaxObservationIDLen is the observation_id maxLength (schema maxLength 128).
+	MaxObservationIDLen = 128
+	// MaxModelLen is the session_lifecycle.model maxLength (schema maxLength 128).
+	MaxModelLen = 128
+)
+
+// sourceIDPattern is the vendored source_id charset/format (^src_[0-9a-zA-Z]{1,64}$, which
+// also carries the minLength:1/maxLength:68 bounds), compiled once from the contract
+// (contracts/observer/v1/openapi.json). It mirrors the platform's source_id constraint.
+var sourceIDPattern = regexp.MustCompile(`^src_[0-9a-zA-Z]{1,64}$`)
+
 // ValidationRule identifies a demoted wire-contract coupling enforced by these
 // validators rather than by the OpenAPI 3.0 schema.
 type ValidationRule string
@@ -53,6 +77,15 @@ const (
 	// observations (x-limits minItems/maxItems) — an empty or oversized batch is rejected
 	// before it reaches ingest/watermark logic.
 	RuleBatchCardinality ValidationRule = "BATCH_CARDINALITY"
+	// RuleObservationIDRequired: every observation carries a present, non-empty
+	// observation_id within the schema maxLength (defense-in-depth mirror of the platform's
+	// required/non-empty observation_id constraint).
+	RuleObservationIDRequired ValidationRule = "OBSERVATION_ID_REQUIRED"
+	// RuleModelMinLength: a present session_lifecycle.model is non-empty (minLength 1) and
+	// within maxLength — an unknown model must be absent, never the empty string.
+	RuleModelMinLength ValidationRule = "MODEL_MIN_LENGTH"
+	// RuleSourceIDPattern: the batch source_id matches ^src_[0-9a-zA-Z]{1,64}$.
+	RuleSourceIDPattern ValidationRule = "SOURCE_ID_PATTERN"
 )
 
 // Sentinel per-rule errors so callers can branch with errors.Is.
@@ -62,14 +95,23 @@ var (
 	ErrEstimatedPriceTable = errors.New("observer evidence: ESTIMATED usage requires price_table_version")
 	ErrReferenceCap        = errors.New("observer evidence: per-observation reference cap exceeded")
 	ErrBatchCardinality    = errors.New("observer evidence: batch observation count out of bounds")
+	// ErrObservationIDRequired matches a missing/empty/over-long observation_id.
+	ErrObservationIDRequired = errors.New("observer evidence: observation_id must be present and non-empty")
+	// ErrModelMinLength matches a present-but-empty (or over-long) session_lifecycle.model.
+	ErrModelMinLength = errors.New("observer evidence: session_lifecycle.model must be non-empty when present")
+	// ErrSourceIDPattern matches a source_id that violates the vendored pattern.
+	ErrSourceIDPattern = errors.New("observer evidence: source_id does not match the required pattern")
 )
 
 var ruleSentinel = map[ValidationRule]error{
-	RuleRangeNotContiguous:  ErrRangeNotContiguous,
-	RuleDrainPair:           ErrDrainPairMismatch,
-	RuleEstimatedPriceTable: ErrEstimatedPriceTable,
-	RuleReferenceCap:        ErrReferenceCap,
-	RuleBatchCardinality:    ErrBatchCardinality,
+	RuleRangeNotContiguous:    ErrRangeNotContiguous,
+	RuleDrainPair:             ErrDrainPairMismatch,
+	RuleEstimatedPriceTable:   ErrEstimatedPriceTable,
+	RuleReferenceCap:          ErrReferenceCap,
+	RuleBatchCardinality:      ErrBatchCardinality,
+	RuleObservationIDRequired: ErrObservationIDRequired,
+	RuleModelMinLength:        ErrModelMinLength,
+	RuleSourceIDPattern:       ErrSourceIDPattern,
 }
 
 // ValidationError is a typed semantic-coupling violation. Rule names the demoted
@@ -117,7 +159,14 @@ func validationErr(rule ValidationRule, idx int, id, detail string) *ValidationE
 //   - per-observation reference caps (defense-in-depth behind the schema maxItems);
 //   - drain-pair: a RUN_ENDED boundary's drain_status and covered_watermark travel
 //     together (both present or both absent);
-//   - ESTIMATED usage requires a non-empty price_table_version.
+//   - ESTIMATED usage requires a non-empty price_table_version;
+//   - the source_id pattern (^src_[0-9a-zA-Z]{1,64}$);
+//   - per-observation identity: a present, non-empty, bounded observation_id, and a
+//     present session_lifecycle.model that is non-empty and bounded (minLength/maxLength).
+//
+// The last three are the non-VCS defense-in-depth constraints the platform apigen
+// validator enforces; they are mirrored here for parity (the endpoint is the trusted
+// producer, so they are symmetry, not the load-bearing gate).
 //
 // It returns the first violation as a typed *ValidationError (errors.Is matches the
 // per-rule sentinels). It performs no cross-batch or stateful checks.
@@ -131,9 +180,55 @@ func ValidateBatch(b *wire.DecodedBatch) error {
 	if err := validateContiguity(b); err != nil {
 		return err
 	}
+	if err := validateSourceID(b.SourceID); err != nil {
+		return err
+	}
 	for i := range b.Observations {
 		if err := validateObservation(i, &b.Observations[i]); err != nil {
 			return err
+		}
+		if err := validateObservationIdentity(i, &b.Observations[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateSourceID enforces the vendored source_id pattern. The strict wire decoder carries
+// source_id through untouched, so this is the endpoint's mirror of the platform's
+// source_id constraint (defense-in-depth: a real source_id is server-assigned at
+// enrollment and always conforms).
+func validateSourceID(sourceID string) error {
+	if !sourceIDPattern.MatchString(sourceID) {
+		return validationErr(RuleSourceIDPattern, -1, "",
+			"source_id must match ^src_[0-9a-zA-Z]{1,64}$")
+	}
+	return nil
+}
+
+// validateObservationIdentity mirrors the two per-observation non-VCS constraints the
+// platform apigen validator adds: a present, non-empty, bounded observation_id, and a
+// present session_lifecycle.model that is non-empty (minLength 1) and within maxLength. An
+// absent model is legal; only a present-but-empty (or over-long) model is a violation.
+func validateObservationIdentity(i int, o *wire.DecodedObservation) error {
+	if o.ObservationID == "" {
+		return validationErr(RuleObservationIDRequired, i, "",
+			"observation_id must be present and non-empty")
+	}
+	if n := len(o.ObservationID); n > MaxObservationIDLen {
+		return validationErr(RuleObservationIDRequired, i, o.ObservationID,
+			fmt.Sprintf("observation_id length %d exceeds max %d", n, MaxObservationIDLen))
+	}
+	if sl, ok := o.Variant.(wire.SessionLifecycleObservation); ok {
+		if m := sl.SessionLifecycle.Model; m != nil {
+			if *m == "" {
+				return validationErr(RuleModelMinLength, i, o.ObservationID,
+					"session_lifecycle.model is present but empty (minLength 1); an unknown model must be absent")
+			}
+			if n := len(*m); n > MaxModelLen {
+				return validationErr(RuleModelMinLength, i, o.ObservationID,
+					fmt.Sprintf("session_lifecycle.model length %d exceeds max %d", n, MaxModelLen))
+			}
 		}
 	}
 	return nil
