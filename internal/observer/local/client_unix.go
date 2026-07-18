@@ -156,6 +156,51 @@ func (c *Client) Status(ctx context.Context) (HealthSnapshot, error) {
 	return *resp.Health, nil
 }
 
+// LookupRegisteredProcess asks the daemon registry whether id was registered by a wrapper (E1.6
+// PROCESS_LIFECYCLE{REGISTERED}) and, if so, the run it opened. A miss returns found=false with a
+// nil error — a queried process that is not a registered wrapper is the ordinary case; a non-nil
+// error is reserved for a transport/query failure and is always path-free.
+func (c *Client) LookupRegisteredProcess(ctx context.Context, id wire.ProcessIdentity) (runID string, found bool, err error) {
+	resp, err := c.roundTrip(ctx, Request{
+		Kind:             KindLookupRegisteredProcess,
+		LookupRegistered: &LookupRegisteredProcessRequest{Identity: id},
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if resp.Status != StatusOK {
+		return "", false, responseError(resp)
+	}
+	if resp.LookupRegistered == nil {
+		return "", false, ErrMalformedResponse
+	}
+	return resp.LookupRegistered.RunID, resp.LookupRegistered.Found, nil
+}
+
+// ResolveInheritedRun classifies how runID resolves against this source's boundary index, passing
+// workspace for the daemon's same-workspace comparison. A definite classification returns a valid
+// status and a nil error; a transport/query failure returns a path-free error. An unrecognized
+// status token from the daemon is rejected fail-closed rather than surfaced as trustworthy.
+func (c *Client) ResolveInheritedRun(ctx context.Context, runID, workspace string) (InheritedRunStatus, error) {
+	resp, err := c.roundTrip(ctx, Request{
+		Kind:             KindResolveInheritedRun,
+		ResolveInherited: &ResolveInheritedRunRequest{RunID: runID, Workspace: workspace},
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Status != StatusOK {
+		return "", responseError(resp)
+	}
+	if resp.ResolveInherited == nil {
+		return "", ErrMalformedResponse
+	}
+	if !resp.ResolveInherited.Status.Valid() {
+		return "", ErrMalformedResponse
+	}
+	return resp.ResolveInherited.Status, nil
+}
+
 // roundTrip dials the socket, writes the request, and reads the typed response under a bounded
 // deadline. It opens and closes a fresh connection per call.
 func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {

@@ -56,7 +56,48 @@ const (
 	KindReleaseRun RequestKind = "RELEASE_RUN"
 	// KindStatus reads a content-free health/capacity snapshot.
 	KindStatus RequestKind = "STATUS"
+	// KindLookupRegisteredProcess asks the daemon's registry whether an OS process identity was
+	// registered by a wrapper (E1.6 PROCESS_LIFECYCLE{REGISTERED}) and, if so, the run it opened.
+	// A miss is an ordinary found=false answer, not an error — the ancestry-query seam the hook
+	// (E1.7) relies on to prove exact process lineage.
+	KindLookupRegisteredProcess RequestKind = "LOOKUP_REGISTERED_PROCESS"
+	// KindResolveInheritedRun classifies how an inherited run id resolves against this source's
+	// durable boundary index, comparing the caller's workspace against the run's recorded scope —
+	// the boundary-resolve seam the hook (E1.7) uses to validate an inherited GASWORKS_RUN_ID.
+	KindResolveInheritedRun RequestKind = "RESOLVE_INHERITED_RUN"
 )
+
+// InheritedRunStatus is the closed classification KindResolveInheritedRun returns for an
+// inherited run id, mirroring the endpoint's boundary-and-membership rules. Only
+// InheritedRunOpenSameScope is a trustworthy attachment proof; every other value is a quarantine
+// input at the hook. The daemon owns the source/workspace scoping and returns the classified
+// status; the wire carries only the closed token, never a path or run detail.
+type InheritedRunStatus string
+
+const (
+	// InheritedRunUnknown means the run id is not present in this source's boundary index. A run id
+	// authored by another Observer source/installation is simply absent here, so this also covers
+	// the cross-source case.
+	InheritedRunUnknown InheritedRunStatus = "UNKNOWN"
+	// InheritedRunOpenSameScope means the run id resolves to a durable OPEN boundary in the same
+	// source AND the same workspace as the caller — the only trustworthy inherited-id status.
+	InheritedRunOpenSameScope InheritedRunStatus = "OPEN_SAME_SCOPE"
+	// InheritedRunClosed means the run id is known but its boundary was already closed by RUN_ENDED.
+	InheritedRunClosed InheritedRunStatus = "CLOSED"
+	// InheritedRunCrossWorkspace means the run id resolves to an OPEN boundary in this source but a
+	// different workspace than the caller's.
+	InheritedRunCrossWorkspace InheritedRunStatus = "CROSS_WORKSPACE"
+)
+
+// Valid reports whether s is a member of the closed InheritedRunStatus set.
+func (s InheritedRunStatus) Valid() bool {
+	switch s {
+	case InheritedRunUnknown, InheritedRunOpenSameScope, InheritedRunClosed, InheritedRunCrossWorkspace:
+		return true
+	default:
+		return false
+	}
+}
 
 // ResponseStatus is the closed outcome discriminator on every response.
 type ResponseStatus string
@@ -77,6 +118,8 @@ const (
 	CodeReserveFailed      = "RESERVE_FAILED"
 	CodeReleaseFailed      = "RELEASE_FAILED"
 	CodeHealthFailed       = "HEALTH_FAILED"
+	CodeLookupFailed       = "LOOKUP_FAILED"
+	CodeResolveFailed      = "RESOLVE_FAILED"
 )
 
 // Protocol errors. All are matchable with errors.Is.
@@ -105,13 +148,29 @@ type RunReserveRequest struct {
 	RunID string `json:"run_id"`
 }
 
+// LookupRegisteredProcessRequest carries the OS process identity to look up in the daemon's
+// registered-ancestor index. It is a closed typed body — an identity in, a found+run out.
+type LookupRegisteredProcessRequest struct {
+	Identity wire.ProcessIdentity `json:"identity"`
+}
+
+// ResolveInheritedRunRequest carries the inherited run id and the caller's workspace token. The
+// daemon compares the workspace against the run's recorded scope; an empty workspace is a valid
+// (unset) scope, not a malformed request.
+type ResolveInheritedRunRequest struct {
+	RunID     string `json:"run_id"`
+	Workspace string `json:"workspace"`
+}
+
 // Request is the single typed envelope for every local request. Exactly one body pointer is
 // set, selected by Kind; Status carries no body.
 type Request struct {
-	Kind       RequestKind               `json:"kind"`
-	Append     *AppendObservationRequest `json:"append,omitempty"`
-	ReserveRun *RunReserveRequest        `json:"reserve_run,omitempty"`
-	ReleaseRun *RunReserveRequest        `json:"release_run,omitempty"`
+	Kind             RequestKind                     `json:"kind"`
+	Append           *AppendObservationRequest       `json:"append,omitempty"`
+	ReserveRun       *RunReserveRequest              `json:"reserve_run,omitempty"`
+	ReleaseRun       *RunReserveRequest              `json:"release_run,omitempty"`
+	LookupRegistered *LookupRegisteredProcessRequest `json:"lookup_registered,omitempty"`
+	ResolveInherited *ResolveInheritedRunRequest     `json:"resolve_inherited,omitempty"`
 }
 
 // AppendAck is the durable acknowledgement for an appended observation: the daemon-assigned
@@ -144,6 +203,18 @@ type HealthSnapshot struct {
 	CeilingBytes        int64  `json:"ceiling_bytes"`
 }
 
+// LookupRegisteredProcessAck reports whether the queried identity was registered and, when it
+// was, the run it opened. Found=false with an empty RunID is the ordinary "not a wrapper" answer.
+type LookupRegisteredProcessAck struct {
+	Found bool   `json:"found"`
+	RunID string `json:"run_id"`
+}
+
+// ResolveInheritedRunAck carries the closed inherited-run classification.
+type ResolveInheritedRunAck struct {
+	Status InheritedRunStatus `json:"status"`
+}
+
 // ErrorBody is the content-free typed error a failed request returns.
 type ErrorBody struct {
 	Code    string `json:"code"`
@@ -153,11 +224,13 @@ type ErrorBody struct {
 // Response is the single typed envelope for every reply. On StatusOK exactly one body pointer
 // matching the request kind is set; on StatusError only Error is set.
 type Response struct {
-	Status  ResponseStatus  `json:"status"`
-	Error   *ErrorBody      `json:"error,omitempty"`
-	Append  *AppendAck      `json:"append,omitempty"`
-	Reserve *RunReserveAck  `json:"reserve,omitempty"`
-	Health  *HealthSnapshot `json:"health,omitempty"`
+	Status           ResponseStatus              `json:"status"`
+	Error            *ErrorBody                  `json:"error,omitempty"`
+	Append           *AppendAck                  `json:"append,omitempty"`
+	Reserve          *RunReserveAck              `json:"reserve,omitempty"`
+	Health           *HealthSnapshot             `json:"health,omitempty"`
+	LookupRegistered *LookupRegisteredProcessAck `json:"lookup_registered,omitempty"`
+	ResolveInherited *ResolveInheritedRunAck     `json:"resolve_inherited,omitempty"`
 }
 
 // validate rejects an unknown discriminator and a body that does not match its kind, so a
@@ -178,6 +251,17 @@ func (r Request) validate() error {
 		}
 	case KindStatus:
 		// no body
+	case KindLookupRegisteredProcess:
+		if r.LookupRegistered == nil {
+			return fmt.Errorf("%w: lookup_registered body missing", ErrMalformedRequest)
+		}
+		if r.LookupRegistered.Identity.BootId == "" {
+			return fmt.Errorf("%w: lookup_registered body missing boot_id", ErrMalformedRequest)
+		}
+	case KindResolveInheritedRun:
+		if r.ResolveInherited == nil || r.ResolveInherited.RunID == "" {
+			return fmt.Errorf("%w: resolve_inherited body missing or empty run_id", ErrMalformedRequest)
+		}
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownRequestKind, r.Kind)
 	}

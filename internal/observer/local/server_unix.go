@@ -56,12 +56,35 @@ type Spool interface {
 	Health() (HealthSnapshot, error)
 }
 
+// Registry is the daemon's in-memory boundary/ancestry projection, folded from observations as
+// they are durably appended and rebuilt by replaying the WAL on boot. The socket server folds
+// every durable append into it and answers the two query kinds from it. It is nil when the daemon
+// runs without the projection: the append path then never folds and the ancestry-query and
+// boundary-resolve kinds report the registry unavailable. Implemented by
+// internal/observer/daemon.Registry.
+type Registry interface {
+	// Fold projects one durably-appended observation into the registered/boundary indexes. It is
+	// judgment-free; a malformed observation is a projection error, never a reason to fail an
+	// already-durable append.
+	Fold(obs wire.Observation) error
+	// LookupRegistered reports whether id was registered by a wrapper and, if so, the run it
+	// opened. found=false is the ordinary miss, not an error.
+	LookupRegistered(id wire.ProcessIdentity) (runID string, found bool)
+	// ResolveInherited classifies how runID resolves against this source's boundary index, using
+	// workspace for the same-workspace comparison.
+	ResolveInherited(runID, workspace string) InheritedRunStatus
+}
+
 // ServerConfig configures the daemon socket server.
 type ServerConfig struct {
 	// Dir is the observer state directory; the socket lives at Dir/socket.
 	Dir string
 	// Spool is the durable single-writer seam (required).
 	Spool Spool
+	// Registry is the daemon's boundary/ancestry projection. When non-nil the server folds every
+	// durable append into it and services the ancestry-query and boundary-resolve kinds from it;
+	// when nil those two kinds report the registry unavailable and the append path does not fold.
+	Registry Registry
 	// ExpectedUID is the peer UID the server accepts; nil defaults to the daemon's own euid.
 	// A pointer distinguishes "unset" from a legitimate uid 0 (root).
 	ExpectedUID *uint32
@@ -89,6 +112,7 @@ type Server struct {
 	dir             string
 	socketPath      string
 	spool           Spool
+	registry        Registry
 	expectedUID     uint32
 	peerUID         func(*net.UnixConn) (uint32, error)
 	maxConcurrent   int
@@ -147,6 +171,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		dir:             cfg.Dir,
 		socketPath:      filepath.Join(cfg.Dir, socketFilename),
 		spool:           cfg.Spool,
+		registry:        cfg.Registry,
 		expectedUID:     expected,
 		peerUID:         peer,
 		maxConcurrent:   maxConc,
@@ -300,6 +325,15 @@ func (s *Server) dispatch(req Request) Response {
 		if err != nil {
 			return errorResponse(CodeAppendFailed, "append failed")
 		}
+		// Fold the durable observation into the boundary/ancestry projection. The append is already
+		// durable and the projection is rebuildable from the WAL on boot, so a fold error never
+		// fails the ack — an acknowledged write cannot depend on a lossy in-memory notification.
+		// Folding the producer's pre-restamp observation is equivalent to folding the WAL's
+		// restamped frame: the fold ignores sequence and observation id, which are all the spool
+		// re-stamps.
+		if s.registry != nil {
+			_ = s.registry.Fold(req.Append.Observation)
+		}
 		return Response{Status: StatusOK, Append: &ack}
 	case KindReserveRun:
 		ack, err := s.spool.ReserveRun(req.ReserveRun.RunID)
@@ -319,6 +353,18 @@ func (s *Server) dispatch(req Request) Response {
 			return errorResponse(CodeHealthFailed, "health read failed")
 		}
 		return Response{Status: StatusOK, Health: &h}
+	case KindLookupRegisteredProcess:
+		if s.registry == nil {
+			return errorResponse(CodeLookupFailed, "registry unavailable")
+		}
+		runID, found := s.registry.LookupRegistered(req.LookupRegistered.Identity)
+		return Response{Status: StatusOK, LookupRegistered: &LookupRegisteredProcessAck{Found: found, RunID: runID}}
+	case KindResolveInheritedRun:
+		if s.registry == nil {
+			return errorResponse(CodeResolveFailed, "registry unavailable")
+		}
+		status := s.registry.ResolveInherited(req.ResolveInherited.RunID, req.ResolveInherited.Workspace)
+		return Response{Status: StatusOK, ResolveInherited: &ResolveInheritedRunAck{Status: status}}
 	default:
 		return errorResponse(CodeBadRequest, "unknown request kind")
 	}
