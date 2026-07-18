@@ -64,6 +64,31 @@ type CandidateSink interface {
 	DeliverCandidates(ctx context.Context, ref TranscriptRef, cands []*Candidate) error
 }
 
+// PartialCandidateSink is an optional refinement of CandidateSink whose DeliverCandidatesPartial
+// reports how many leading candidates were durably delivered before any failure. The watcher uses
+// that count to advance its cursor over the fully-delivered leading transcript LINES (a partial
+// commit) instead of re-reading — and re-delivering — the whole batch on the next poll, which is
+// what stops a mid-batch failure from double-appending the already-durable leading records
+// (E1.10a red-team finding 2: an at-least-once re-append gets a fresh daemon sequence/observation
+// id, so a re-read of an already-durable record is NOT collapsed by logical dedup). Delivery stays
+// ordered and stop-on-first-failure; a sink that does not implement this keeps the all-or-nothing
+// behavior, so existing sinks are unaffected.
+//
+// SCOPE — the double-append is eliminated across LINE boundaries only. The cursor advances a whole
+// transcript line at a time, so when a single line emits MULTIPLE candidates (a tool_call plus its
+// extracted git/gh reference candidates) and delivery fails PART-WAY through that one line, the
+// line is not committed and the retry re-appends the line's already-durable leading candidates.
+// That residual is a bounded at-least-once duplicate the platform's observation-id dedup tolerates
+// — never a loss and never a cross-line duplicate; the common one-candidate-per-line case (message,
+// usage, session records) is exact.
+type PartialCandidateSink interface {
+	CandidateSink
+	// DeliverCandidatesPartial delivers cands in transcript order, stopping at the first failure,
+	// and returns the number of leading candidates durably delivered (or safely dropped) before
+	// it. A nil error means the whole batch was delivered (delivered == len(cands)).
+	DeliverCandidatesPartial(ctx context.Context, ref TranscriptRef, cands []*Candidate) (delivered int, err error)
+}
+
 // ReadRangeFunc reads length bytes starting at off from an already-opened, identity-validated file
 // handle, returning the bytes actually available (a short read at EOF is not an error). Reading
 // from the handle the watcher opened and fstat-validated — never re-resolving the path — is what
@@ -376,14 +401,94 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		return nil
 	}
 	cands, commit := tf.cursor.Ingest(newBytes, w.cfg.References)
-	if len(cands) > 0 {
-		if err := w.cfg.Sink.DeliverCandidates(ctx, tf.ref(), cands); err != nil {
-			return err // do not advance the cursor; re-read these bytes next poll
+	if len(cands) == 0 {
+		commit()
+		tf.cursor.observe(size, mod)
+		return tf.cursor.Save()
+	}
+	delivered, derr := deliverCandidates(ctx, w.cfg.Sink, tf.ref(), cands)
+	if derr == nil {
+		commit()
+		tf.cursor.observe(size, mod)
+		return tf.cursor.Save()
+	}
+	// A mid-batch delivery failure. Advance the cursor over only the leading transcript LINES whose
+	// every candidate was durably delivered (a partial commit), so the next poll re-reads from the
+	// first undelivered record rather than re-delivering — and re-appending — the already-durable
+	// leading records. A line is committed only when all of its candidates were delivered, so no
+	// candidate is ever skipped. When no whole leading line was fully delivered, or a partial commit
+	// is unsafe (a mid-overflow resync accounts bytes mid-line), nothing is committed and the whole
+	// tail is re-read next poll — the original all-or-nothing behavior. The re-Ingest of the
+	// fully-delivered prefix mutates the cursor only through the same commit path; its re-parsed
+	// candidates are already durable and are discarded, never re-delivered.
+	if !tf.cursor.skip {
+		if p, ok := deliveredLinePrefix(cands, delivered, newBytes); ok {
+			_, commitPrefix := tf.cursor.Ingest(newBytes[:p], w.cfg.References)
+			commitPrefix()
+			tf.cursor.observe(size, mod)
+			if serr := tf.cursor.Save(); serr != nil {
+				return serr
+			}
 		}
 	}
-	commit()
-	tf.cursor.observe(size, mod)
-	return tf.cursor.Save()
+	return derr
+}
+
+// deliverCandidates delivers one poll's candidates and reports how many leading candidates were
+// durably delivered. A sink that implements PartialCandidateSink reports the exact count so a
+// mid-batch failure can partial-commit; a plain CandidateSink reports all-or-nothing (a failure is
+// treated as zero delivered, preserving the original re-read-the-whole-batch behavior).
+func deliverCandidates(ctx context.Context, sink CandidateSink, ref TranscriptRef, cands []*Candidate) (int, error) {
+	if ps, ok := sink.(PartialCandidateSink); ok {
+		return ps.DeliverCandidatesPartial(ctx, ref, cands)
+	}
+	if err := sink.DeliverCandidates(ctx, ref, cands); err != nil {
+		return 0, err
+	}
+	return len(cands), nil
+}
+
+// deliveredLinePrefix returns the byte length of the leading newBytes whose transcript lines were
+// fully delivered, given that `delivered` leading candidates were durably delivered. It is the
+// offset just past the newline of the last line before the first undelivered candidate's source
+// line, so every candidate on a committed line was delivered (no candidate is skipped) and no
+// committed line is re-read (no already-durable record is re-appended). ok is false when no whole
+// leading line was fully delivered or when the first undelivered candidate carries no source line.
+func deliveredLinePrefix(cands []*Candidate, delivered int, newBytes []byte) (int, bool) {
+	if delivered <= 0 || delivered >= len(cands) {
+		return 0, false
+	}
+	nextLine := cands[delivered].LineNumber
+	if nextLine <= 1 {
+		// The first undelivered record is on the first parsed line (or carries no line number):
+		// there is no whole leading line to commit.
+		return 0, false
+	}
+	p := offsetAfterNthNewline(newBytes, nextLine-1)
+	if p <= 0 {
+		return 0, false
+	}
+	return p, true
+}
+
+// offsetAfterNthNewline returns the byte offset just past the n-th '\n' in b (1-based), or -1 when
+// b holds fewer than n newlines. Because the cursor's in-memory remainder never contains a newline,
+// the n-th newline in the freshly-read newBytes is the n-th line boundary of the parse buffer, so
+// this maps a delivered line count to the exact prefix the cursor must advance over.
+func offsetAfterNthNewline(b []byte, n int) int {
+	if n <= 0 {
+		return -1
+	}
+	count := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\n' {
+			count++
+			if count == n {
+				return i + 1
+			}
+		}
+	}
+	return -1
 }
 
 // offsetInvalidated reports whether the cursor's consumed offset can no longer be trusted as an

@@ -394,6 +394,26 @@ func shimTarget() []string {
 	return nil
 }
 
+// sanitizeUnobservedEnv is the --allow-unobserved counterpart of shimChildEnv: it strips the
+// wrapper's run-id variable AND every RUNWRAP_-prefixed control variable, so the unobserved child
+// sees the same sanitized environment the observed child gets. The observed path launches through
+// the shim, which strips RUNWRAP_ via shimChildEnv before exec; the unobserved path has no shim, so
+// without this strip an inherited RUNWRAP_* (e.g. a nested wrapper's RUNWRAP_SHIM) would leak into
+// the child. The inherited outer run id is dropped so an independently captured native session stays
+// its own inferred run rather than referencing an unknown boundary.
+func sanitizeUnobservedEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			if k == RunIDEnvVar || strings.HasPrefix(k, controlEnvPrefix) {
+				continue
+			}
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // shimChildEnv is the environment the shim hands the child: its own environment minus every
 // wrapper control variable. GASWORKS_RUN_ID (set by the parent) is preserved.
 func shimChildEnv() []string {

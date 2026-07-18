@@ -354,7 +354,7 @@ func runUnobserved(cfg Config) (Result, error) {
 		"WARNING: --allow-unobserved bypasses Gas City Observer. This run is UNOBSERVED: "+
 			"no run boundary, no process ancestry, and no GASWORKS_RUN_ID are recorded.")
 
-	childEnv := withoutRunID(cfg.baseEnv())
+	childEnv := sanitizeUnobservedEnv(cfg.baseEnv())
 	proc, err := launchUnobserved(cfg, childEnv)
 	if err != nil {
 		return Result{Observed: false}, err
