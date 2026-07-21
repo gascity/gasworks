@@ -120,6 +120,69 @@ func TestParseRealClaudeTranscript(t *testing.T) {
 	assertToken(t, "cache_read_tokens", u.CacheReadTokens, 0)
 }
 
+// TestParseClaudeCapturesMessageID proves the assistant record's provider message.id (msg_…) is
+// carried through onto the USAGE candidate as the exact-lane spend-join key. This is the primary
+// enabler for promoting a captured atom to metering-grade at read time.
+func TestParseClaudeCapturesMessageID(t *testing.T) {
+	res := Parse(readFixture(t, "claude_real.jsonl"), defaultRefConfig())
+	u := firstUsage(t, res.Candidates)
+	if got, want := u.MessageID, "msg_011Ccrx5emXPdkC9TA2qi7eP"; got != want {
+		t.Fatalf("usage message_id = %q, want %q (from the assistant message.id)", got, want)
+	}
+}
+
+// TestParseClaudeUsageWithoutMessageIDStaysAbsent proves an assistant record that omits message.id
+// yields a USAGE with no message_id — the id is never fabricated, so the atom is exact-lane-ineligible
+// and falls back to the heuristic lane.
+func TestParseClaudeUsageWithoutMessageIDStaysAbsent(t *testing.T) {
+	line := `{"type":"assistant","sessionId":"s-1","timestamp":"2026-07-17T10:00:00Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5}}}`
+	res := Parse([]byte(line+"\n"), defaultRefConfig())
+	u := firstUsage(t, res.Candidates)
+	if u.MessageID != "" {
+		t.Fatalf("usage message_id = %q, want empty when the record has no id", u.MessageID)
+	}
+}
+
+// TestParseRolloutThreadsResponseIDToUsage proves an assistant response_item's provider response id
+// (resp_…) is latched and attached to the NEXT token_count USAGE, and consumed so it is never fanned
+// across multiple usage atoms. A token_count with no preceding assistant id stays absent.
+func TestParseRolloutThreadsResponseIDToUsage(t *testing.T) {
+	buf := "" +
+		`{"type":"session_meta","timestamp":"2026-07-17T10:00:00Z","payload":{"id":"019cfdea-e7bc-73a1-9871-aae32d212349"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-07-17T10:00:01Z","payload":{"type":"message","role":"assistant","id":"resp_abc123"}}` + "\n" +
+		`{"type":"event_msg","timestamp":"2026-07-17T10:00:02Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}` + "\n" +
+		`{"type":"event_msg","timestamp":"2026-07-17T10:00:03Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":10,"total_tokens":60}}}}` + "\n"
+	res := Parse([]byte(buf), defaultRefConfig())
+
+	var usages []*evidence.UsageCandidate
+	for _, c := range res.Candidates {
+		if c.Kind == KindUsage {
+			usages = append(usages, c.Usage)
+		}
+	}
+	if len(usages) != 2 {
+		t.Fatalf("USAGE count = %d, want 2", len(usages))
+	}
+	if got, want := usages[0].MessageID, "resp_abc123"; got != want {
+		t.Fatalf("first usage message_id = %q, want %q (latched from the assistant response_item)", got, want)
+	}
+	if usages[1].MessageID != "" {
+		t.Fatalf("second usage message_id = %q, want empty (the id is consumed, never fanned out)", usages[1].MessageID)
+	}
+}
+
+// TestParseRealRolloutHasNoMessageID pins the honest default: the real rollout fixture records no
+// per-turn response id, so every USAGE stays exact-lane-ineligible (heuristic fallback), unchanged
+// from the pre-join behaviour.
+func TestParseRealRolloutHasNoMessageID(t *testing.T) {
+	res := Parse(readFixture(t, "rollout_real.jsonl"), defaultRefConfig())
+	for _, c := range res.Candidates {
+		if c.Kind == KindUsage && c.Usage.MessageID != "" {
+			t.Fatalf("real rollout usage carried message_id %q; the fixture has no ids", c.Usage.MessageID)
+		}
+	}
+}
+
 // TestParseSessionEmittedBeforeUsage guards the ordering the sink depends on: within any buffer the
 // SESSION_LIFECYCLE (which carries the native session id) is delivered before the USAGE records
 // that must inherit it, for BOTH native dialects. A usage that preceded its session would be

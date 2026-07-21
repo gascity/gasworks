@@ -1482,6 +1482,12 @@
             "maxLength": 64,
             "description": "Present only when quality is ESTIMATED (a server-validated coupling, not a wire-schema one).",
             "minLength": 1
+          },
+          "message_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "description": "Provider message/response id (msg_…/resp_…/chatcmpl-…) carried unchanged from the transcript. Read-time join key against the metered spend row's message_id; correlation evidence only — the endpoint does not attest to it, and it never affects pricing or run membership. Absent when the transcript had no id."
           }
         },
         "additionalProperties": false

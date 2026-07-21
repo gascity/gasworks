@@ -2306,7 +2306,10 @@ type UsagePayload struct {
 	CacheCreationTokens *int64 `json:"cache_creation_tokens,omitempty"`
 	CacheReadTokens     *int64 `json:"cache_read_tokens,omitempty"`
 	InputTokens         *int64 `json:"input_tokens,omitempty"`
-	OutputTokens        *int64 `json:"output_tokens,omitempty"`
+
+	// MessageId Provider message/response id (msg_…/resp_…/chatcmpl-…) carried unchanged from the transcript. Read-time join key against the metered spend row's message_id; correlation evidence only — the endpoint does not attest to it, and it never affects pricing or run membership. Absent when the transcript had no id.
+	MessageId    *string `json:"message_id,omitempty"`
+	OutputTokens *int64  `json:"output_tokens,omitempty"`
 
 	// PriceTableVersion Present only when quality is ESTIMATED (a server-validated coupling, not a wire-schema one).
 	PriceTableVersion *string             `json:"price_table_version,omitempty"`

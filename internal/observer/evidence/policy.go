@@ -305,6 +305,10 @@ type UsageCandidate struct {
 	CacheReadTokens     *int64
 	ProviderSource      string
 	PriceTableVersion   string
+	// MessageID is the provider message/response id parsed from the transcript (msg_…/resp_…),
+	// carried through unchanged as the exact-lane join key against the metered spend row. Empty
+	// when the transcript record had no id — the endpoint never fabricates one.
+	MessageID string
 }
 
 // TransformUsage projects a USAGE candidate to a clean observation.
@@ -321,6 +325,7 @@ func (p Policy) TransformUsage(env PolicyEnvelope, raw UsageCandidate) Transform
 		CacheReadTokens:     raw.CacheReadTokens,
 		ProviderSource:      raw.ProviderSource,
 		PriceTableVersion:   raw.PriceTableVersion,
+		MessageID:           raw.MessageID,
 	})
 	if err != nil {
 		return p.failClosed(env, "USAGE", err)

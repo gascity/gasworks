@@ -1,7 +1,7 @@
 {
   "description": "Canonical Observer contract fixture manifest. openapi_spec_test.go re-checks every sha256, validates each fixture against its named component schema (expect=valid must conform; expect=invalid must be rejected), and fails on any fixture file absent from this list. semantic_violation entries are schema-well-formed but violate a server-validated wire-contract rule not expressible in OpenAPI 3.0 (contiguity, drain-pair, ESTIMATED price-table, cross-batch idempotency); they are negative inputs for the P0.4/S2.4 Go validators.",
   "spec": "docs/reference/schema/observer.openapi.json",
-  "spec_sha256": "1befe74b3ddfa3fd6768547a3a0502569298d66c55c209ddc4987ff69831919e",
+  "spec_sha256": "f12e80f57cc7f23c04936eaa189029778fdface006903cd3f9b37753a49c6a35",
   "fixtures": [
     {
       "path": "fixtures/auth/forbidden.json",

@@ -170,6 +170,44 @@ func TestUsageEstimatedRequiresPriceTable(t *testing.T) {
 	}
 }
 
+// TestUsageMessageIDRoundTrips proves an optional provider message_id is carried through NewUsage
+// onto the sealed USAGE payload verbatim, and that an over-length id fails closed at construction.
+func TestUsageMessageIDRoundTrips(t *testing.T) {
+	p, err := NewUsage(testCommon(), UsageInput{
+		Quality:     wire.UsagePayloadQualityPROVIDERREPORTED,
+		MessageID:   "msg_011Ccrx5emXPdkC9TA2qi7eP",
+		InputTokens: func() *int64 { v := int64(10); return &v }(),
+	})
+	if err != nil {
+		t.Fatalf("build usage with message_id: %v", err)
+	}
+	u, err := sealOne(t, p, 1, "obs_1").AsUsageObservation()
+	if err != nil {
+		t.Fatalf("as usage observation: %v", err)
+	}
+	if u.Usage.MessageId == nil || *u.Usage.MessageId != "msg_011Ccrx5emXPdkC9TA2qi7eP" {
+		t.Fatalf("sealed message_id = %v, want msg_011Ccrx5emXPdkC9TA2qi7eP", u.Usage.MessageId)
+	}
+
+	// Absent id stays absent (never coerced to an empty string on the wire).
+	pNoID, err := NewUsage(testCommon(), UsageInput{Quality: wire.UsagePayloadQualityPROVIDERREPORTED})
+	if err != nil {
+		t.Fatalf("build usage without message_id: %v", err)
+	}
+	uNoID, _ := sealOne(t, pNoID, 2, "obs_2").AsUsageObservation()
+	if uNoID.Usage.MessageId != nil {
+		t.Fatalf("absent message_id must stay nil, got %v", *uNoID.Usage.MessageId)
+	}
+
+	// Over-length id fails closed.
+	if _, err := NewUsage(testCommon(), UsageInput{
+		Quality:   wire.UsagePayloadQualityPROVIDERREPORTED,
+		MessageID: strings.Repeat("m", maxMessageID+1),
+	}); err == nil {
+		t.Fatal("message_id over maxMessageID must fail to build")
+	}
+}
+
 // TestExtractedWorkReferenceResolution proves the project-resolution rule: stamped context
 // or configured default resolves and builds an EXTRACTED reference; neither yields a
 // content-free drop diagnostic (never a partial reference).

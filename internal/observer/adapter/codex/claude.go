@@ -71,10 +71,11 @@ func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int) []*Candidat
 	}
 	if len(probe.Message) > 0 {
 		var m struct {
+			ID    string       `json:"id"`
 			Usage *claudeUsage `json:"usage"`
 		}
 		if json.Unmarshal(probe.Message, &m) == nil && m.Usage != nil && m.Usage.hasTokens() {
-			out = append(out, m.Usage.candidate(ts, lineNo))
+			out = append(out, m.Usage.candidate(ts, lineNo, m.ID))
 		}
 	}
 	return out
@@ -96,8 +97,11 @@ func (u *claudeUsage) hasTokens() bool {
 		nonZero(u.CacheCreationInputTokens) || nonZero(u.CacheReadInputTokens)
 }
 
-// candidate projects the block to a PROVIDER_REPORTED USAGE candidate.
-func (u *claudeUsage) candidate(ts time.Time, lineNo int) *Candidate {
+// candidate projects the block to a PROVIDER_REPORTED USAGE candidate. messageID is the assistant
+// record's provider message.id (msg_…), carried through as the exact-lane spend-join key; it is
+// empty when the record omitted an id (a tail-only or non-standard record), and an empty id stays
+// absent on the observation rather than being fabricated.
+func (u *claudeUsage) candidate(ts time.Time, lineNo int, messageID string) *Candidate {
 	return &Candidate{
 		Kind:       KindUsage,
 		OccurredAt: ts,
@@ -109,6 +113,7 @@ func (u *claudeUsage) candidate(ts time.Time, lineNo int) *Candidate {
 			CacheCreationTokens: u.CacheCreationInputTokens,
 			CacheReadTokens:     u.CacheReadInputTokens,
 			ProviderSource:      claudeProvider,
+			MessageID:           messageID,
 		},
 	}
 }

@@ -34,9 +34,10 @@ const rolloutProvider = "codex"
 // recognized-but-uninteresting line that is skipped silently rather than emitting a diagnostic —
 // a rollout is dense with such records and a per-line diagnostic would drown the real signal.
 const (
-	rolloutSessionMeta = "session_meta"
-	rolloutTurnContext = "turn_context"
-	rolloutEventMsg    = "event_msg"
+	rolloutSessionMeta  = "session_meta"
+	rolloutTurnContext  = "turn_context"
+	rolloutEventMsg     = "event_msg"
+	rolloutResponseItem = "response_item"
 )
 
 // parseState carries the cross-line context a single Parse call needs to project a rollout or
@@ -47,6 +48,12 @@ const (
 type parseState struct {
 	rolloutModel          string
 	rolloutSessionEmitted bool
+	// rolloutTurnMessageID holds the provider response id (resp_…) of the most recent assistant
+	// response_item, threaded onto the token_count USAGE that reports that turn's tokens as the
+	// exact-lane spend-join key. It is consumed (cleared) when attached so one response id is never
+	// fanned across multiple usage atoms. Empty for the common rollout versions that record no id —
+	// those atoms stay exact-lane-ineligible and fall back to the heuristic lane, unchanged.
+	rolloutTurnMessageID string
 
 	claudeModel          string
 	claudeSessionEmitted bool
@@ -108,6 +115,18 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int) []*Candida
 		}
 		st.rolloutSessionEmitted = true
 		return []*Candidate{sessionLifecycleCandidate(meta.ID, rolloutProvider, st.rolloutModel, ts, lineNo)}
+	case rolloutResponseItem:
+		// Latch the assistant turn's provider response id (resp_…) when the rollout records one, so the
+		// following token_count USAGE can carry it as the exact-lane spend-join key. Most rollout
+		// versions leave the id null (user/developer items never carry one), so this is usually a no-op.
+		var pl struct {
+			Role string `json:"role"`
+			ID   string `json:"id"`
+		}
+		if json.Unmarshal(probe.Payload, &pl) == nil && pl.Role == "assistant" && pl.ID != "" {
+			st.rolloutTurnMessageID = pl.ID
+		}
+		return nil
 	case rolloutEventMsg:
 		var pl struct {
 			Type string `json:"type"`
@@ -121,7 +140,9 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int) []*Candida
 		if pl.Type != "token_count" || pl.Info.Last == nil {
 			return nil
 		}
-		return pl.Info.Last.candidates(ts, lineNo)
+		messageID := st.rolloutTurnMessageID
+		st.rolloutTurnMessageID = ""
+		return pl.Info.Last.candidates(ts, lineNo, messageID)
 	default:
 		return nil
 	}
@@ -138,8 +159,9 @@ type rolloutTokenUsage struct {
 }
 
 // candidates projects a per-turn usage delta to a USAGE candidate, dropping a zero-work turn (a
-// token_count whose delta is empty) so a run's usage_totals is not padded with empties.
-func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int) []*Candidate {
+// token_count whose delta is empty) so a run's usage_totals is not padded with empties. messageID is
+// the latched assistant response id (resp_…) when the rollout recorded one, empty otherwise.
+func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int, messageID string) []*Candidate {
 	if u.total() == 0 {
 		return nil
 	}
@@ -153,6 +175,7 @@ func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int) []*Candidate {
 			OutputTokens:    u.OutputTokens,
 			CacheReadTokens: u.CachedInputTokens,
 			ProviderSource:  rolloutProvider,
+			MessageID:       messageID,
 		},
 	}}
 }

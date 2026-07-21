@@ -79,6 +79,7 @@ const (
 	maxBootID            = 128
 	maxPriceTableVersion = 64
 	maxProviderSource    = 64
+	maxMessageID         = 128
 )
 
 // BuildError is a typed construction failure. It names the offending field and reason so a
@@ -760,6 +761,7 @@ type UsageInput struct {
 	CacheReadTokens     *int64
 	ProviderSource      string // optional
 	PriceTableVersion   string // required iff ESTIMATED; otherwise optional/absent
+	MessageID           string // optional provider message/response id; the read-time spend-join key
 }
 
 // NewUsage builds a pre-sequence USAGE observation, enforcing the ESTIMATED price-table
@@ -780,6 +782,10 @@ func NewUsage(c Common, in UsageInput) (PendingObservation, error) {
 		return PendingObservation{}, buildErr("usage.price_table_version", "ESTIMATED usage requires a non-empty price_table_version")
 	}
 	providerSource, err := optionalString("usage.provider_source", in.ProviderSource, maxProviderSource)
+	if err != nil {
+		return PendingObservation{}, err
+	}
+	messageID, err := optionalString("usage.message_id", in.MessageID, maxMessageID)
 	if err != nil {
 		return PendingObservation{}, err
 	}
@@ -807,6 +813,7 @@ func NewUsage(c Common, in UsageInput) (PendingObservation, error) {
 		CacheReadTokens:     cacheReadTokens,
 		ProviderSource:      providerSource,
 		PriceTableVersion:   priceTable,
+		MessageId:           messageID,
 	}
 	return PendingObservation{
 		kind:       string(wire.ObservationEnvelopeKindUSAGE),

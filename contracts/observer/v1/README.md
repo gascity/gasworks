@@ -10,12 +10,12 @@ contract travels with the binary and drift is caught by CI.
 | Item | Value |
 | --- | --- |
 | Upstream repo | `gasworks-platform` |
-| Upstream commit | `6b24350bace8abb5a5a10ddc01296842d8b195b4` (P0.4) |
+| Upstream commit | `6b24350bace8abb5a5a10ddc01296842d8b195b4` (P0.4) + additive `UsagePayload.message_id` (observer real-spend join, coordinated with the gasworks-platform PR that adds the same optional property to `docs/reference/schema/observer.openapi.json`) |
 | Upstream artifact | `docs/reference/schema/observer.openapi.json` |
 | Upstream corpus | `internal/observercontract/testdata/` (`fixtures/` + `manifest.json`) |
 | Upstream canonical hashes | `internal/observercontract/apigen/testdata/canonical_golden.json` |
-| Artifact SHA-256 | `1befe74b3ddfa3fd6768547a3a0502569298d66c55c209ddc4987ff69831919e` |
-| Manifest SHA-256 | `3ca8c9c0c65550b1a3cbe52c9cf75cc168e528c097bb525c534a44d95df550fc` |
+| Artifact SHA-256 | `f12e80f57cc7f23c04936eaa189029778fdface006903cd3f9b37753a49c6a35` |
+| Manifest SHA-256 | `c860ec9e32c2d1ab7da3844d2cc69894db28e68c159f19adb3269581f8d53421` |
 
 The upstream artifact is the hand-authored source of truth. It is **OpenAPI
 3.0.3 with zero 2020-12-only keywords** (the Checkpoint-0 dialect ruling):
