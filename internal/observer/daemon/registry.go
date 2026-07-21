@@ -58,6 +58,13 @@ type Registry struct {
 	workspace  string
 	registered map[wire.ProcessIdentity]string
 	boundaries map[string]runBoundary
+	// sessionRuns maps a child's native session id to the explicit run a wrapper opened for it, so
+	// the candidate sink can stamp run_context onto that session's watcher-captured USAGE/SESSION
+	// observations — binding the session's real cost to the run's own bead. It is set by
+	// BindSession (the wrapper's session→run association verb), not folded from the WAL: the
+	// binding is only consulted at capture time to stamp an already-durable observation, so it is
+	// in-memory and not rebuilt on restart (a residual documented on BindSession).
+	sessionRuns map[string]string
 }
 
 // runBoundary is one run's folded boundary record: its open/closed state plus the workspace and
@@ -73,11 +80,43 @@ type runBoundary struct {
 // caller's workspace against.
 func NewRegistry(source, workspace string) *Registry {
 	return &Registry{
-		source:     source,
-		workspace:  workspace,
-		registered: make(map[wire.ProcessIdentity]string),
-		boundaries: make(map[string]runBoundary),
+		source:      source,
+		workspace:   workspace,
+		registered:  make(map[wire.ProcessIdentity]string),
+		boundaries:  make(map[string]runBoundary),
+		sessionRuns: make(map[string]string),
 	}
+}
+
+// BindSession associates a child's native session id with the explicit run a wrapper opened for it.
+// The candidate sink consults this index at capture time (LookupSessionRun) to stamp run_context
+// onto the session's watcher-captured observations, so an explicit `run -work-item <bead>` carries
+// its child agent session's real usage on the bead's run without a manual attach step. An empty
+// native session id or run id is ignored. A rebind of the same session id to a different run
+// overwrites — the most recent wrapper association for a native session wins.
+//
+// The binding is in-memory only: it is consulted to stamp an observation the spool makes durable,
+// so the run_context it produces survives a restart even though the index itself does not. RESIDUAL:
+// a daemon restart between the bind and a later USAGE capture for the same live session loses the
+// binding, so post-restart usage for that session would miss run_context (its synthetic run still
+// captures the tokens). This is acceptable for the pilot; a WAL-durable binding is future work.
+func (r *Registry) BindSession(nativeSessionID, runID string) {
+	if nativeSessionID == "" || runID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.sessionRuns[nativeSessionID] = runID
+	r.mu.Unlock()
+}
+
+// LookupSessionRun reports the explicit run a native session was bound to, or found=false when the
+// session has no wrapper binding (the ordinary passive-session case). It is a total lookup with no
+// error, mirroring LookupRegistered.
+func (r *Registry) LookupSessionRun(nativeSessionID string) (runID string, found bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	runID, found = r.sessionRuns[nativeSessionID]
+	return runID, found
 }
 
 // Fold projects one observation into the two indexes. It recognizes exactly

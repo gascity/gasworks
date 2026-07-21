@@ -73,6 +73,9 @@ type Registry interface {
 	// ResolveInherited classifies how runID resolves against this source's boundary index, using
 	// workspace for the same-workspace comparison.
 	ResolveInherited(runID, workspace string) InheritedRunStatus
+	// BindSession records that a child's native session id belongs to the run a wrapper opened, so
+	// the candidate sink can stamp run_context onto that session's watcher-captured observations.
+	BindSession(nativeSessionID, runID string)
 }
 
 // ServerConfig configures the daemon socket server.
@@ -365,6 +368,12 @@ func (s *Server) dispatch(req Request) Response {
 		}
 		status := s.registry.ResolveInherited(req.ResolveInherited.RunID, req.ResolveInherited.Workspace)
 		return Response{Status: StatusOK, ResolveInherited: &ResolveInheritedRunAck{Status: status}}
+	case KindBindSession:
+		if s.registry == nil {
+			return errorResponse(CodeBindFailed, "registry unavailable")
+		}
+		s.registry.BindSession(req.BindSession.NativeSessionID, req.BindSession.RunID)
+		return Response{Status: StatusOK, BindSession: &BindSessionAck{Bound: true}}
 	default:
 		return errorResponse(CodeBadRequest, "unknown request kind")
 	}

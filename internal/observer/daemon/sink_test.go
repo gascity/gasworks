@@ -57,6 +57,98 @@ func messageCandidate(body string) *codex.Candidate {
 	}
 }
 
+// sessionCandidate is a SESSION_LIFECYCLE record carrying its own native session id, provider, and
+// model — the transcript record the sink threads onto the session-free records that follow it.
+func sessionCandidate(nativeID, model string) *codex.Candidate {
+	return &codex.Candidate{
+		Kind:       codex.KindSessionLifecycle,
+		OccurredAt: testBase,
+		SessionLifecycle: &evidence.SessionLifecycleCandidate{
+			NativeSessionID: nativeID,
+			Provider:        "codex",
+			StartSource:     wire.SessionLifecyclePayloadStartSourceSTARTUP,
+			Transition:      wire.SessionLifecyclePayloadTransitionSTARTED,
+			Model:           model,
+		},
+	}
+}
+
+// usageCandidate is a PROVIDER_REPORTED USAGE record. It carries NO session id of its own — exactly
+// the codex transcript shape that regressed to an empty provenance.native_session_id before the fix.
+func usageCandidate(input, output int64) *codex.Candidate {
+	return &codex.Candidate{
+		Kind:       codex.KindUsage,
+		OccurredAt: testBase,
+		Usage: &evidence.UsageCandidate{
+			Quality:        wire.UsagePayloadQualityPROVIDERREPORTED,
+			InputTokens:    &input,
+			OutputTokens:   &output,
+			ProviderSource: "codex",
+		},
+	}
+}
+
+// TestSinkThreadsNativeSessionOntoUsage is the load-bearing regression guard for the orphaned-cost
+// defect: a USAGE record has no session id of its own, so once a transcript's SESSION_LIFECYCLE
+// record is seen the sink must stamp that native session id onto the following USAGE observation's
+// provenance. Without it the USAGE observation carries an empty provenance.native_session_id and the
+// platform run-builder cannot derive its SyntheticRunID(source, provider, native) to sum the tokens
+// into a run's usage_totals. The session and usage records arrive in SEPARATE DeliverCandidates
+// calls (the partial sink delivers one candidate per call), so the sink must remember the id across
+// calls keyed by transcript identity — this test drives exactly that split.
+func TestSinkThreadsNativeSessionOntoUsage(t *testing.T) {
+	dir := t.TempDir()
+	w := newSpoolWriter(t, dir)
+	srv := startDaemonServer(t, dir, w, NewRegistry("src_test", "ws_main"))
+	client := local.NewClient(srv.SocketPath())
+	sink := newSink(t, client)
+
+	const nativeID = "019f8229-42ff-72c1-8c28-45f6936bf0d2"
+	ref := codex.TranscriptRef{Locator: "sessions/2026/rollout.jsonl", Device: 66, Inode: 4242}
+
+	// Session record first (one call), then the usage record (a separate call) — the real split.
+	if err := sink.DeliverCandidates(context.Background(), ref, []*codex.Candidate{sessionCandidate(nativeID, "gpt-5.6-sol")}); err != nil {
+		t.Fatalf("DeliverCandidates(session): %v", err)
+	}
+	if err := sink.DeliverCandidates(context.Background(), ref, []*codex.Candidate{usageCandidate(1200, 340)}); err != nil {
+		t.Fatalf("DeliverCandidates(usage): %v", err)
+	}
+
+	frames := readWAL(t, dir)
+	if len(frames) != 2 {
+		t.Fatalf("WAL has %d frames, want 2 (session + usage)", len(frames))
+	}
+
+	var sawUsage bool
+	for _, fr := range frames {
+		var obs wire.Observation
+		if err := obs.UnmarshalJSON(fr.Payload); err != nil {
+			t.Fatalf("decode appended observation: %v", err)
+		}
+		kind, err := obs.Discriminator()
+		if err != nil {
+			t.Fatalf("discriminator: %v", err)
+		}
+		if kind != string(wire.ObservationEnvelopeKindUSAGE) {
+			continue
+		}
+		sawUsage = true
+		usage, err := obs.AsUsageObservation()
+		if err != nil {
+			t.Fatalf("AsUsageObservation: %v", err)
+		}
+		if usage.Provenance.NativeSessionId == nil {
+			t.Fatalf("USAGE observation provenance.native_session_id is absent; run-builder cannot bind its tokens to a run")
+		}
+		if got := *usage.Provenance.NativeSessionId; got != nativeID {
+			t.Fatalf("USAGE provenance.native_session_id = %q, want %q (the transcript's session id)", got, nativeID)
+		}
+	}
+	if !sawUsage {
+		t.Fatalf("no USAGE observation found in the WAL")
+	}
+}
+
 // TestSinkDeliversTransformedObservationDurably proves the sink runs each candidate through the
 // committed Policy transform (stripping content) and durably appends the result through the daemon.
 func TestSinkDeliversTransformedObservationDurably(t *testing.T) {

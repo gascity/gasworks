@@ -65,6 +65,12 @@ const (
 	// durable boundary index, comparing the caller's workspace against the run's recorded scope —
 	// the boundary-resolve seam the hook (E1.7) uses to validate an inherited GASWORKS_RUN_ID.
 	KindResolveInheritedRun RequestKind = "RESOLVE_INHERITED_RUN"
+	// KindBindSession associates a child's native session id with the run a wrapper opened, so the
+	// daemon's candidate sink stamps run_context onto that session's watcher-captured observations.
+	// It is the explicit-run usage-binding seam (E1.6 wrapper -> daemon): the wrapper learns its
+	// child's native session id and binds it to GASWORKS_RUN_ID so the session's real cost lands on
+	// the run's own bead without a manual attach step.
+	KindBindSession RequestKind = "BIND_SESSION"
 )
 
 // InheritedRunStatus is the closed classification KindResolveInheritedRun returns for an
@@ -120,6 +126,7 @@ const (
 	CodeHealthFailed       = "HEALTH_FAILED"
 	CodeLookupFailed       = "LOOKUP_FAILED"
 	CodeResolveFailed      = "RESOLVE_FAILED"
+	CodeBindFailed         = "BIND_FAILED"
 )
 
 // Protocol errors. All are matchable with errors.Is.
@@ -162,6 +169,14 @@ type ResolveInheritedRunRequest struct {
 	Workspace string `json:"workspace"`
 }
 
+// BindSessionRequest associates a child's native session id with the run the wrapper opened. Both
+// are required and bounded; the daemon records the mapping so the sink can stamp run_context onto
+// the session's observations.
+type BindSessionRequest struct {
+	NativeSessionID string `json:"native_session_id"`
+	RunID           string `json:"run_id"`
+}
+
 // Request is the single typed envelope for every local request. Exactly one body pointer is
 // set, selected by Kind; Status carries no body.
 type Request struct {
@@ -171,6 +186,7 @@ type Request struct {
 	ReleaseRun       *RunReserveRequest              `json:"release_run,omitempty"`
 	LookupRegistered *LookupRegisteredProcessRequest `json:"lookup_registered,omitempty"`
 	ResolveInherited *ResolveInheritedRunRequest     `json:"resolve_inherited,omitempty"`
+	BindSession      *BindSessionRequest             `json:"bind_session,omitempty"`
 }
 
 // AppendAck is the durable acknowledgement for an appended observation: the daemon-assigned
@@ -215,6 +231,12 @@ type ResolveInheritedRunAck struct {
 	Status InheritedRunStatus `json:"status"`
 }
 
+// BindSessionAck confirms the session→run association was recorded. Bound is always true on OK; it
+// keeps the response envelope's "one typed body per OK kind" invariant.
+type BindSessionAck struct {
+	Bound bool `json:"bound"`
+}
+
 // ErrorBody is the content-free typed error a failed request returns.
 type ErrorBody struct {
 	Code    string `json:"code"`
@@ -231,6 +253,7 @@ type Response struct {
 	Health           *HealthSnapshot             `json:"health,omitempty"`
 	LookupRegistered *LookupRegisteredProcessAck `json:"lookup_registered,omitempty"`
 	ResolveInherited *ResolveInheritedRunAck     `json:"resolve_inherited,omitempty"`
+	BindSession      *BindSessionAck             `json:"bind_session,omitempty"`
 }
 
 // validate rejects an unknown discriminator and a body that does not match its kind, so a
@@ -261,6 +284,10 @@ func (r Request) validate() error {
 	case KindResolveInheritedRun:
 		if r.ResolveInherited == nil || r.ResolveInherited.RunID == "" {
 			return fmt.Errorf("%w: resolve_inherited body missing or empty run_id", ErrMalformedRequest)
+		}
+	case KindBindSession:
+		if r.BindSession == nil || r.BindSession.NativeSessionID == "" || r.BindSession.RunID == "" {
+			return fmt.Errorf("%w: bind_session body missing or empty native_session_id/run_id", ErrMalformedRequest)
 		}
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownRequestKind, r.Kind)

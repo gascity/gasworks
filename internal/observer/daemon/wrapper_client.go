@@ -71,3 +71,10 @@ func (a *WrapperDaemonClient) ReleaseTerminal(ctx context.Context, runID string)
 	}
 	return nil
 }
+
+// BindSession associates the child's native session id with runID so the daemon's sink stamps
+// run_context onto that session's watcher-captured observations. It maps straight onto the local
+// bind-session round-trip.
+func (a *WrapperDaemonClient) BindSession(ctx context.Context, nativeSessionID, runID string) error {
+	return a.client.BindSession(ctx, nativeSessionID, runID)
+}

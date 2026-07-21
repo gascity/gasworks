@@ -152,6 +152,7 @@ func (r ParseResult) Diagnostics() []*Candidate {
 // consumed but produce no candidate; every non-blank complete line produces at least one
 // candidate (a real record, or a diagnostic when the record is unrecognized).
 func Parse(data []byte, cfg ReferenceConfig) ParseResult {
+	st := newParseState(data)
 	var cands []*Candidate
 	consumed := 0
 	lineNo := 0
@@ -169,7 +170,7 @@ func Parse(data []byte, cfg ReferenceConfig) ParseResult {
 		if len(trimmed) == 0 {
 			continue
 		}
-		cands = append(cands, parseLine(trimmed, lineNo, cfg)...)
+		cands = append(cands, st.parseLine(trimmed, lineNo, cfg)...)
 	}
 	return ParseResult{Candidates: cands, Consumed: consumed}
 }
@@ -224,7 +225,73 @@ type rawRecord struct {
 	Model       string `json:"model"`
 }
 
-func parseLine(line []byte, lineNo int, cfg ReferenceConfig) []*Candidate {
+// formatProbe reads only the discriminating fields shared across the three real transcript
+// dialects this adapter now recognizes natively, so one Unmarshal can route a line without
+// coercing it into the wrong grammar:
+//
+//   - normalized codex-transcript-v1 (Type in the recognized normalized set; parsed by rawRecord);
+//   - raw Codex rollout-*.jsonl (every record carries a "payload"; SESSION_LIFECYCLE + USAGE are
+//     projected from session_meta / event_msg{token_count} natively — no external translate step);
+//   - Claude Code transcripts (per-message envelopes carrying "sessionId" and a "message" block
+//     with the provider "usage" and "model").
+//
+// The three are structurally disjoint — normalized uses a closed "type" set, rollout uniquely
+// carries "payload", and Claude uniquely carries the camelCase "sessionId"/"message" — so the
+// route is unambiguous and a line that matches none degrades to an UNSUPPORTED_FORMAT diagnostic.
+type formatProbe struct {
+	Type           string          `json:"type"`
+	Payload        json.RawMessage `json:"payload"`   // rollout
+	SessionIDCamel string          `json:"sessionId"` // Claude envelope
+	Message        json.RawMessage `json:"message"`   // Claude message block
+	TS             *time.Time      `json:"ts"`        // normalized / Claude-absent
+	Timestamp      *time.Time      `json:"timestamp"` // rollout / Claude
+}
+
+// probeTime resolves the record's provider event time from whichever timestamp key the dialect
+// uses ("ts" for normalized, "timestamp" for rollout and Claude), zero when absent.
+func (p formatProbe) probeTime() time.Time {
+	if p.TS != nil {
+		return *p.TS
+	}
+	if p.Timestamp != nil {
+		return *p.Timestamp
+	}
+	return time.Time{}
+}
+
+// isNormalizedType reports whether a top-level type names a normalized codex-transcript-v1 record.
+func isNormalizedType(t string) bool {
+	switch t {
+	case recMessage, recToolCall, recToolResult, recUsage, recSession:
+		return true
+	default:
+		return false
+	}
+}
+
+// parseLine routes one transcript line to the dialect-specific parser. It is a method on
+// parseState because the rollout and Claude dialects thread a one-per-buffer SESSION_LIFECYCLE
+// (the session id and model live on different records than the usage that must inherit them).
+func (st *parseState) parseLine(line []byte, lineNo int, cfg ReferenceConfig) []*Candidate {
+	var probe formatProbe
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return []*Candidate{diagnosticCandidate(time.Time{}, lineNo, "malformed transcript line: not valid JSON")}
+	}
+	switch {
+	case isNormalizedType(probe.Type):
+		return parseNormalizedLine(line, lineNo, cfg)
+	case len(probe.Payload) > 0:
+		return st.parseRolloutLine(probe, lineNo)
+	case probe.SessionIDCamel != "" || len(probe.Message) > 0:
+		return st.parseClaudeLine(probe, lineNo)
+	default:
+		return []*Candidate{diagnosticCandidate(probe.probeTime(), lineNo, "unsupported transcript record type")}
+	}
+}
+
+// parseNormalizedLine parses one normalized codex-transcript-v1 record (the schema this adapter
+// was born reading). It is unchanged from the original single-grammar parser.
+func parseNormalizedLine(line []byte, lineNo int, cfg ReferenceConfig) []*Candidate {
 	var rec rawRecord
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return []*Candidate{diagnosticCandidate(time.Time{}, lineNo, "malformed transcript line: not valid JSON")}

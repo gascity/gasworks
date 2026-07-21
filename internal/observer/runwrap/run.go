@@ -125,6 +125,12 @@ type DaemonClient interface {
 	// terminal RUN_ENDED is durable, so an interrupted terminal sequence never strands the
 	// run without its terminal capacity.
 	ReleaseTerminal(ctx context.Context, runID string) error
+
+	// BindSession associates a child's native session id with runID, so the daemon's candidate sink
+	// stamps run_context onto that session's watcher-captured USAGE/SESSION observations — binding
+	// the child agent session's real cost to this run's own bead. It is best-effort: a failure never
+	// affects the run result. The wrapper calls it as it discovers the child's native session id(s).
+	BindSession(ctx context.Context, nativeSessionID, runID string) error
 }
 
 // ShimSpec describes how to spawn the same-PID identity shim. The zero value re-execs the
@@ -174,6 +180,16 @@ type Config struct {
 	// the default is clamped down to it (configurable only downward).
 	DrainTimeout time.Duration
 
+	// DrainSettle is a bounded wait inserted after PROCESS_EXITED and before RUN_ENDED so the
+	// always-running transcript watcher can capture the just-completed session's tail (its final
+	// USAGE) BEFORE the closing boundary is sequenced. Without it the watcher appends the session's
+	// USAGE at a higher sequence than RUN_ENDED and the platform quarantines it as an
+	// "association after RUN_ENDED", leaving the run's usage_totals empty. It matters only when
+	// session binding is active (SessionRoots set); 0 disables it (the pilot's original behavior).
+	// This is the pilot's approximation of the spec's synchronous post-exit drain; a daemon-driven
+	// drain-through-watermark verb is the robust follow-up.
+	DrainSettle time.Duration
+
 	// Shim controls how the same-PID identity shim is spawned (see ShimSpec).
 	Shim ShimSpec
 
@@ -189,9 +205,23 @@ type Config struct {
 	// only RunIDEnvVar; it never inspects the rest.
 	Env []string
 
+	// SessionRoots are the provider transcript roots the wrapper scans for the child's native
+	// session file so it can bind that session to this run (explicit-run usage binding). Empty
+	// disables binding. The scan reads only the file NAME, never content, and only to derive the
+	// pseudonymous native session id — the wrapper's judgment-free-transport rule is preserved.
+	SessionRoots []string
+
+	// NativeSessionID extracts a native session id from a discovered transcript path. It is injected
+	// (provider-specific), so runwrap stays provider-agnostic: the `run` adapter supplies the codex
+	// rollout / Claude filename shapes. nil disables session binding.
+	NativeSessionID func(path string) (string, bool)
+
 	// now / newRunID are test seams. Nil selects time.Now / a crypto/rand opaque id.
 	now      func() time.Time
 	newRunID func() (string, error)
+
+	// bindPoll overrides the session-discovery poll cadence (test seam). 0 selects the default.
+	bindPoll time.Duration
 }
 
 func (c Config) clock() func() time.Time {
@@ -308,6 +338,10 @@ func Run(ctx context.Context, d DaemonClient, cfg Config) (Result, error) {
 		return Result{}, fmt.Errorf("%w: %v", ErrBoundaryNotDurable, err)
 	}
 
+	// Snapshot the session files that already exist BEFORE the child launches, so the discovery
+	// goroutine binds only the NEW transcript the child itself creates, not a co-resident session.
+	preLaunch := preLaunchSessions(cfg)
+
 	// Build the child environment: the base env with the minted run id exported (overwriting
 	// any inherited outer id — the nearest registered ancestor is authoritative).
 	childEnv := withRunID(cfg.baseEnv(), runID)
@@ -328,8 +362,16 @@ func Run(ctx context.Context, d DaemonClient, cfg Config) (Result, error) {
 		return res, lerr.err
 	}
 
+	// Child is running. Start best-effort discovery of the child's native session id(s) so the
+	// daemon binds that session's usage to THIS run, then wait for the child. The discovery goroutine
+	// is bounded by the child's lifetime (bindCtx is cancelled the moment wait returns) and never
+	// affects the run result — a bind failure is swallowed.
+	bindCtx, cancelBind := context.WithCancel(ctx)
+	r.startSessionBinding(bindCtx, preLaunch)
+
 	// Child is running. Wait for it, then run the normative terminal sequence.
 	exitCode, signaled, signal := proc.wait()
+	cancelBind()
 	drainStatus, err := r.terminalExit(ctx, proc.identity, exitCode, signaled, signal)
 	res := Result{
 		RunID:          runID,

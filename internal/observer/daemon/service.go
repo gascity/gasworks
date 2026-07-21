@@ -314,6 +314,9 @@ func (s *Service) buildWatcher(cfg *WatchLoopConfig, socketPath string) (*codex.
 		ParserVersion:    parserVersion,
 		TransformVersion: cfg.TransformVersion,
 		Now:              s.now,
+		// The sink stamps run_context by reading the daemon's own session→run index in-process, so a
+		// wrapper-bound explicit run carries its child agent session's usage natively.
+		RunResolver: s.registry,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build candidate sink: %w", err)

@@ -16,9 +16,10 @@ import (
 // fakeRegistry is a deterministic in-test Registry so the local layer's two new query kinds can be
 // exercised without the daemon package (which imports local).
 type fakeRegistry struct {
-	registered map[wire.ProcessIdentity]string
-	statuses   map[string]InheritedRunStatus
-	folded     []wire.Observation
+	registered  map[wire.ProcessIdentity]string
+	statuses    map[string]InheritedRunStatus
+	folded      []wire.Observation
+	sessionRuns map[string]string
 }
 
 func (f *fakeRegistry) Fold(obs wire.Observation) error {
@@ -36,6 +37,13 @@ func (f *fakeRegistry) ResolveInherited(runID, _ string) InheritedRunStatus {
 		return s
 	}
 	return InheritedRunUnknown
+}
+
+func (f *fakeRegistry) BindSession(nativeSessionID, runID string) {
+	if f.sessionRuns == nil {
+		f.sessionRuns = map[string]string{}
+	}
+	f.sessionRuns[nativeSessionID] = runID
 }
 
 // TestLookupResolveRoundTripWithRegistry proves the two new client methods round-trip through the
@@ -86,8 +94,31 @@ func TestLookupResolveRoundTripWithRegistry(t *testing.T) {
 	}
 }
 
-// TestNewKindsRegistryUnavailableContentFree proves the two new kinds return a content-free error
-// code when no registry is wired in, and the surfaced error leaks no filesystem path.
+// TestBindSessionRoundTrip proves the wrapper's bind-session verb round-trips through the server
+// into the registry: the client's BindSession records a native-session→run mapping the daemon's
+// sink later reads to stamp run_context. This is the explicit-run usage-binding seam.
+func TestBindSessionRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	w := newWriter(t, dir, nil)
+	reg := &fakeRegistry{}
+	srv := startServer(t, ServerConfig{
+		Dir:      dir,
+		Spool:    w,
+		Registry: reg,
+		PeerUID:  func(*net.UnixConn) (uint32, error) { return uint32(os.Geteuid()), nil },
+	})
+	client := NewClient(srv.SocketPath())
+
+	if err := client.BindSession(context.Background(), "sess-native-01", "run_bead01"); err != nil {
+		t.Fatalf("BindSession: %v", err)
+	}
+	if got := reg.sessionRuns["sess-native-01"]; got != "run_bead01" {
+		t.Fatalf("registry recorded run %q for the session, want run_bead01", got)
+	}
+}
+
+// TestNewKindsRegistryUnavailableContentFree proves the three registry-backed kinds return a
+// content-free error code when no registry is wired in, and the surfaced error leaks no path.
 func TestNewKindsRegistryUnavailableContentFree(t *testing.T) {
 	dir := t.TempDir()
 	w := newWriter(t, dir, nil)
@@ -104,6 +135,9 @@ func TestNewKindsRegistryUnavailableContentFree(t *testing.T) {
 
 	_, err = client.ResolveInheritedRun(ctx, "run_1", "ws")
 	assertServerCode(t, err, CodeResolveFailed, dir)
+
+	err = client.BindSession(ctx, "sess", "run_1")
+	assertServerCode(t, err, CodeBindFailed, dir)
 }
 
 // TestNewKindDecodeFailsClosed proves a malformed body for each new kind is rejected fail-closed by
@@ -126,6 +160,16 @@ func TestNewKindDecodeFailsClosed(t *testing.T) {
 	// An unknown field on a new body is rejected (strict decode).
 	if _, err := DecodeRequest([]byte(`{"kind":"RESOLVE_INHERITED_RUN","resolve_inherited":{"run_id":"r","workspace":"w","extra":1}}`)); err == nil {
 		t.Errorf("resolve with unknown field: want a strict-decode error, got nil")
+	}
+	// BIND with no body / empty native_session_id / empty run_id.
+	if _, err := DecodeRequest([]byte(`{"kind":"BIND_SESSION"}`)); !errors.Is(err, ErrMalformedRequest) {
+		t.Errorf("bind without body: err = %v, want ErrMalformedRequest", err)
+	}
+	if _, err := DecodeRequest([]byte(`{"kind":"BIND_SESSION","bind_session":{"native_session_id":"","run_id":"r"}}`)); !errors.Is(err, ErrMalformedRequest) {
+		t.Errorf("bind with empty native_session_id: err = %v, want ErrMalformedRequest", err)
+	}
+	if _, err := DecodeRequest([]byte(`{"kind":"BIND_SESSION","bind_session":{"native_session_id":"s","run_id":""}}`)); !errors.Is(err, ErrMalformedRequest) {
+		t.Errorf("bind with empty run_id: err = %v, want ErrMalformedRequest", err)
 	}
 }
 

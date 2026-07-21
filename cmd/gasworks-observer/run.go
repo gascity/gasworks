@@ -8,11 +8,31 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
+	"time"
 
 	"github.com/gascity/gasworks/internal/observer/daemon"
 	"github.com/gascity/gasworks/internal/observer/local"
 	"github.com/gascity/gasworks/internal/observer/runwrap"
 )
+
+// sessionUUIDPattern matches the trailing native-session UUID of a provider transcript filename —
+// both the Codex rollout shape (rollout-<ts>-<uuid>.jsonl) and the Claude shape (<uuid>.jsonl). It
+// is how the wrapper derives the child's native session id from the file NAME alone (no content
+// read), to bind that session to the run.
+var sessionUUIDPattern = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
+
+// nativeSessionIDFromPath extracts a native session id from a transcript path, recognizing the
+// Codex rollout and Claude transcript filename shapes. It is the provider-specific extractor the
+// `run` adapter injects into runwrap so the wrapper itself stays provider-agnostic.
+func nativeSessionIDFromPath(path string) (string, bool) {
+	m := sessionUUIDPattern.FindStringSubmatch(filepath.Base(path))
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
 
 // runRun wraps a child command as an observed explicit run. It dials the daemon socket, hands
 // runwrap the WrapperDaemonClient seam, and lets the wrapper own the durable boundary, the same-PID
@@ -28,6 +48,8 @@ func runRun(args []string) int {
 	allowUnobserved := fs.Bool("allow-unobserved", false, "run the child WITHOUT observation (emergency bypass)")
 	beadsProject := fs.String("beads-project", "", "beads project id (with -work-item)")
 	workItem := fs.String("work-item", "", "work item bead id (with -beads-project)")
+	var sessionRoots multiFlag
+	fs.Var(&sessionRoots, "session-root", "a provider transcript root to scan for the child's native session id and bind it to this run (repeatable); enables explicit-run usage binding")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -46,6 +68,16 @@ func runRun(args []string) int {
 		// shim strips before exec-ing the child. The empty PrefixArgs keeps the shim argv pristine
 		// ([self, "--", CMD...]); main's shim guard dispatches it before any flag parsing.
 		Shim: runwrap.ShimSpec{PrefixArgs: []string{}, ExtraEnv: []string{shimEnvVar + "=1"}},
+		// Explicit-run usage binding: scan these provider transcript roots for the child's native
+		// session file and bind that session to this run so its real usage lands on the bead's run.
+		SessionRoots:    sessionRoots,
+		NativeSessionID: nativeSessionIDFromPath,
+	}
+	if len(sessionRoots) > 0 {
+		// With binding active, let the always-running watcher capture the finished session's final
+		// USAGE before RUN_ENDED is sequenced, so the platform does not quarantine it as an
+		// association after RUN_ENDED (which would leave the run's usage_totals empty).
+		cfg.DrainSettle = 3 * time.Second
 	}
 
 	var dc runwrap.DaemonClient

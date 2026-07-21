@@ -86,8 +86,9 @@ type recordingDaemon struct {
 	seq         int64
 	events      []string
 	appends     []recordedObs
-	reserveErr  error
-	reserved    bool
+	reserveErr    error
+	boundSessions map[string]string
+	reserved      bool
 	released    bool
 	drainFn     func(ctx context.Context, d *recordingDaemon, runID string) (DrainOutcome, error)
 	appendErrOn map[string]error
@@ -150,6 +151,23 @@ func (d *recordingDaemon) ReleaseTerminal(_ context.Context, _ string) error {
 	d.released = true
 	d.events = append(d.events, "RELEASE")
 	return nil
+}
+
+func (d *recordingDaemon) BindSession(_ context.Context, nativeSessionID, runID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.boundSessions == nil {
+		d.boundSessions = map[string]string{}
+	}
+	d.boundSessions[nativeSessionID] = runID
+	return nil
+}
+
+func (d *recordingDaemon) binding(nativeSessionID string) (string, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	runID, ok := d.boundSessions[nativeSessionID]
+	return runID, ok
 }
 
 // appendTranscript simulates a daemon-side drained provider record (parser catch-up), so the
@@ -310,6 +328,8 @@ func (d *spoolDaemon) ReleaseTerminal(_ context.Context, runID string) error {
 	return d.reserves.Release(runID)
 }
 
+func (d *spoolDaemon) BindSession(_ context.Context, _, _ string) error { return nil }
+
 func (d *spoolDaemon) isOpen(runID string) bool { return d.reserves.IsOpen(runID) }
 
 func (d *spoolDaemon) openReserveBytes() int64 { return d.reserves.OpenReserveBytes() }
@@ -382,6 +402,8 @@ func (d *fileDaemon) ReleaseTerminal(_ context.Context, runID string) error {
 	defer d.mu.Unlock()
 	return d.reserves.Release(runID)
 }
+
+func (d *fileDaemon) BindSession(_ context.Context, _, _ string) error { return nil }
 
 // runWrapperHelper is the "wrapper" re-exec role: it builds a config from the environment and
 // runs the full wrapper, then exits with the child's exit code. The crash test SIGKILLs it

@@ -201,6 +201,27 @@ func (c *Client) ResolveInheritedRun(ctx context.Context, runID, workspace strin
 	return resp.ResolveInherited.Status, nil
 }
 
+// BindSession records that a child's native session id belongs to runID, so the daemon's candidate
+// sink stamps run_context onto that session's watcher-captured observations. It is best-effort from
+// the caller's perspective — a transport/query failure returns a path-free error the wrapper logs
+// and moves past — but a nil error means the binding is recorded.
+func (c *Client) BindSession(ctx context.Context, nativeSessionID, runID string) error {
+	resp, err := c.roundTrip(ctx, Request{
+		Kind:        KindBindSession,
+		BindSession: &BindSessionRequest{NativeSessionID: nativeSessionID, RunID: runID},
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Status != StatusOK {
+		return responseError(resp)
+	}
+	if resp.BindSession == nil || !resp.BindSession.Bound {
+		return ErrMalformedResponse
+	}
+	return nil
+}
+
 // roundTrip dials the socket, writes the request, and reads the typed response under a bounded
 // deadline. It opens and closes a fresh connection per call.
 func (c *Client) roundTrip(ctx context.Context, req Request) (Response, error) {

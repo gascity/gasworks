@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -27,6 +28,11 @@ func (r *runner) terminalExit(ctx context.Context, id wire.ProcessIdentity, exit
 	if err := r.d.Append(ctx, exited); err != nil {
 		return "", fmt.Errorf("observer runwrap: append PROCESS_EXITED: %w", err)
 	}
+
+	// Let the always-running watcher capture the just-completed transcript's tail (its final USAGE)
+	// before the closing boundary is sequenced, so the platform does not quarantine that usage as an
+	// association after RUN_ENDED. Bounded and ctx-aware; a no-op when DrainSettle is unset.
+	r.settleForDrain(ctx)
 
 	// Bounded drain through a stable watermark. A drain error is not fatal: the run still
 	// closes, marked FAILED with a partial-capture diagnostic.
@@ -69,6 +75,20 @@ func (r *runner) terminalExit(ctx context.Context, id wire.ProcessIdentity, exit
 		return outcome.Status, fmt.Errorf("observer runwrap: release terminal reserve: %w", err)
 	}
 	return outcome.Status, nil
+}
+
+// settleForDrain waits DrainSettle (a no-op when unset) so the async transcript watcher can capture
+// the finished session's tail before RUN_ENDED is sequenced. It returns early if ctx is cancelled.
+func (r *runner) settleForDrain(ctx context.Context) {
+	if r.cfg.DrainSettle <= 0 {
+		return
+	}
+	t := time.NewTimer(r.cfg.DrainSettle)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
 }
 
 // terminalLaunchFailure runs the launch-failure terminal sequence and MUST reach RUN_ENDED +
