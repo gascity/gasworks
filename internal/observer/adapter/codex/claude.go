@@ -24,11 +24,21 @@ import (
 // a co-resident Codex session.
 const claudeProvider = "claude"
 
-// peekClaudeModel scans the buffer for the first assistant record's message.model, so the
-// synthesized SESSION_LIFECYCLE (emitted at the first sessionId-bearing envelope, which may be a
-// non-assistant record like a user turn) carries the model without a second parser pass over the
-// data. Absent when the buffer holds no assistant record yet — the model then fills in on no
-// session record, matching the optional model field.
+// peekClaudeModel scans the WHOLE buffer for the first assistant record's message.model — not just
+// the first line — so the synthesized SESSION_LIFECYCLE (emitted at the first sessionId-bearing
+// envelope, which may be a non-assistant record like a user turn) carries the model without a second
+// parser pass over the data.
+//
+// KNOWN tail-only artifact (model=None mid-session): when capture resumes tail-only-new part-way
+// through a session, the first ingested buffer runs from the seed offset to EOF. If that buffer holds
+// no assistant record at all (every remaining line is a user/tool turn), the model is absent on the
+// synthesized session — the optional model field already tolerates this. It is NOT fixable cheaply:
+// the SESSION_LIFECYCLE is emitted and shipped the instant the session is first seen, so backfilling
+// a model from a LATER buffer would mean deferring that emission or mutating an already-durable
+// observation. The whole-buffer look-ahead here is the cheap win (it catches every model-bearing line
+// already in the resume buffer); the residual is inherent to tail-only-new resumption. The
+// newline-boundary seed reduces it further by not dropping the in-flight (often model-bearing)
+// assistant line at the resume point.
 func peekClaudeModel(data []byte) string {
 	for _, line := range splitJSONLines(data) {
 		var probe formatProbe

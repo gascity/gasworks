@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/daemon"
@@ -39,6 +41,12 @@ func runDaemon(args []string) int {
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
 	cursorDir := fs.String("cursor-dir", "", "transcript cursor state dir (required with -approved-root)")
+	// The watcher re-walks and stats every file under the approved roots on each poll (change
+	// detection is a bounded poll, not fsnotify), so its steady-state CPU is O(files under the roots)
+	// × poll frequency — independent of how many files match the transcript filter. On a host with
+	// tens of thousands of transcripts, the default 500ms cadence pins a core; this flag trades tail
+	// latency for CPU. 0 keeps the watcher default.
+	pollInterval := fs.Duration("poll-interval", 0, "transcript watcher poll cadence (e.g. 2s); 0 uses the watcher default")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -75,11 +83,7 @@ func runDaemon(args []string) int {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
 			return 2
 		}
-		cfg.Watch = &daemon.WatchLoopConfig{
-			ApprovedRoots: approvedRoots,
-			StateDir:      *cursorDir,
-			Policy:        watcherPolicy(),
-		}
+		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval)
 	}
 
 	svc, err := daemon.NewService(cfg)
@@ -118,6 +122,40 @@ func buildUploadConfig(endpoint, sourceID, tokenFile string, allowLoopbackHTTP b
 		return nil, fmt.Errorf("build collector client: %w", err)
 	}
 	return &daemon.UploadLoopConfig{Sender: client}, nil
+}
+
+// newWatchLoopConfig builds the transcript watcher config from the approved roots, the durable
+// cursor directory, and the poll cadence. It always installs transcriptNameMatch so the watcher only
+// ever PARSES real session transcripts and never turns the non-transcript sidecars (tool-results,
+// meta, source files) that share the roots into observations — the filter that stops the diagnostic
+// flood. interval<=0 leaves the watcher default cadence.
+//
+// Note the filter bounds what is parsed, not what is walked: the poll still re-walks and stats the
+// whole tree to detect changes and to keep a renamed-past-filter file tracked, so steady-state poll
+// CPU scales with total files under the roots. poll-interval is the lever for that cost.
+func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration) *daemon.WatchLoopConfig {
+	return &daemon.WatchLoopConfig{
+		ApprovedRoots: roots,
+		StateDir:      cursorDir,
+		Policy:        watcherPolicy(),
+		Match:         transcriptNameMatch,
+		Interval:      interval,
+	}
+}
+
+// transcriptNameMatch reports whether a regular-file basename under an approved root is a real
+// session transcript the watcher should tail. Both providers write their transcripts as JSON Lines
+// and NOTHING else under their roots is .jsonl: a Claude session is <uuid>.jsonl under
+// ~/.claude/projects and a Codex rollout is rollout-*.jsonl under ~/.codex/sessions, while every
+// non-transcript sidecar is a different extension — tool-results *.txt, *.meta.json /
+// sessions-index.json, source *.js, *.md, *.pdf. Matching on the .jsonl suffix is therefore the
+// exact, provider-agnostic predicate: it admits every real transcript under either root and refuses
+// all the junk that otherwise floods capture with "malformed transcript line" diagnostics, sets
+// has_partial_capture on real runs, and burns a core polling tens of thousands of files. The
+// watcher passes the basename only (a rooted glob is not available at this seam), so the predicate
+// is deliberately name-based.
+func transcriptNameMatch(name string) bool {
+	return strings.HasSuffix(name, ".jsonl")
 }
 
 // watcherPolicy is the daemon-constant METADATA_ONLY transform policy every parsed candidate is

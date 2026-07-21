@@ -31,6 +31,37 @@ var (
 	errRefusedResolve   = errors.New("codex watcher: transcript path resolution crossed a symlink")
 )
 
+// KNOWN mc-SCALE CAPTURE GAP — symlinked transcripts are refused, so aimux-multiplexed sessions are
+// not captured. aimux exposes each agent/workflow's transcript as a SYMLINK into the real
+// rollout/session file; this watcher refuses a symlinked final path component at BOTH layers — at
+// discovery (canonicalizeTranscript -> refusalSymlink, via os.Lstat) and at read
+// (openValidatedTranscript's openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH, and the O_NOFOLLOW
+// fallback). At mc scale, where most agent transcripts are aimux symlinks, this is a systematic
+// capture gap: a symlinked transcript emits a one-shot refusal diagnostic and is never tailed.
+//
+// This is deliberately NOT relaxed inline, because following symlinks safely is a change to the
+// security core, not a flag flip:
+//   - Both refusal layers must change in lockstep, and the race-free-open guarantee (openat2 under a
+//     fixed root fd with no path re-resolution between validate and read) is the property reworked.
+//   - RESOLVE_BENEATH rejects absolute symlink targets, which aimux links typically are; only
+//     RESOLVE_IN_ROOT (treat the approved root as "/") both follows the link AND contains it, which
+//     changes the containment model (an absolute link resolves relative to the root).
+//   - Identity keys on (device,inode); a followed symlink tracks the TARGET's identity, so the
+//     locator/cursor bookkeeping and the state-dir disjointness proof need re-derivation.
+//
+// RECOMMENDED APPROACH (behind a -follow-contained-symlinks flag, default off):
+//  1. Discovery: replace the refusalSymlink refusal with EvalSymlinks(path), then verify the fully
+//     resolved real path is beneath a fully resolved approved root (reject any escape). Track the
+//     resolved TARGET's (device,inode) and a locator relative to the root.
+//  2. Read: open the resolved real path with openat2 RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS relative to
+//     the root fd (containment preserved; no symlink followed at read time because the path is
+//     already resolved), then fstat-validate the tracked identity exactly as today.
+//  3. Tests: a contained symlink IS captured; a symlink whose target escapes the root is refused; a
+//     target swapped after discovery is caught by the identity fstat (skipped, never misread).
+//
+// Until that lands, capture aimux-multiplexed sessions by pointing an approved root at the REAL
+// transcript directory (the symlink targets), not at the aimux symlink view.
+
 // The watcher is the file-tailing mechanic that feeds the committed Parse. Codex does not publish
 // a transcript-append hook, and fsnotify is not vendored, so change detection is a bounded poll:
 // on each tick the watcher re-scans the approved root(s) (stat only — never a content rehash),
@@ -283,11 +314,25 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				return nil
 			}
 			key := identityKey{dev: dev, ino: ino}
-			_, isTracked := w.tracked[key]
+			tf, isTracked := w.tracked[key]
 			// Match gates DISCOVERY only. An already-tracked file whose name stops matching after a
 			// rename must stay tracked so its unread tail is still drained — dropping it by name
 			// would silently lose that tail. New (untracked) non-matching files are skipped.
 			if !isTracked && w.cfg.Match != nil && !w.cfg.Match(name) {
+				return nil
+			}
+			// Fast path: a file already tracked at this EXACT path needs no re-canonicalization. The
+			// discovery-time symlink/escape check (an Lstat plus an EvalSymlinks over every parent
+			// component) is the dominant per-poll cost at scale — with tens of thousands of tracked
+			// transcripts it runs on every one, every poll — yet it is redundant for a stable tracked
+			// file: the path and locator are unchanged, and drain re-validates the open on every read
+			// with openat2 (RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) plus an fstat identity check, so a
+			// parent-symlink swap or inode replacement after discovery is still refused at read time.
+			// Only NEW or MOVED (renamed) files pay the canonicalize cost, making steady-state
+			// discovery O(new/moved matched files) rather than O(all tracked files) per poll.
+			if isTracked && tf.path == path {
+				tf.root = root
+				present[key] = struct{}{}
 				return nil
 			}
 			// Refuse a symlinked final component, a non-regular file, or a parent-symlink escape
@@ -300,8 +345,9 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			}
 			delete(w.refused, path)
 			present[key] = struct{}{}
-			if tf := w.tracked[key]; tf != nil {
-				tf.root = root // a rename keeps the identity and the cursor; only path/root/locator move
+			if isTracked {
+				// A rename kept the identity and the cursor; only path/root/locator move.
+				tf.root = root
 				tf.path = path
 				tf.locator = locator
 				return nil
