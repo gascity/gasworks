@@ -1,0 +1,185 @@
+//go:build linux
+
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/daemon"
+	"github.com/gascity/gasworks/internal/observer/evidence"
+	"github.com/gascity/gasworks/internal/observer/spool"
+	"github.com/gascity/gasworks/internal/observer/upload"
+	"github.com/gascity/gasworks/internal/observer/wire"
+)
+
+// defaultCeilingBytes is the default spool byte ceiling (1 GiB) when unset. It must comfortably
+// exceed one max segment plus scratch so the capacity model has usable headroom.
+const defaultCeilingBytes int64 = 1 << 30
+
+// runDaemon builds and runs the assembled endpoint until it receives SIGINT/SIGTERM, then drains
+// gracefully. The uploader is enabled by -collector; the watcher is enabled by -approved-root.
+func runDaemon(args []string) int {
+	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
+	dir := fs.String("dir", "", "observer state directory (socket + WAL); default XDG state dir")
+	sourceID := fs.String("source-id", "", "durable spool source id (required)")
+	workspace := fs.String("workspace", "", "registry workspace scope")
+	ceiling := fs.Int64("ceiling-bytes", defaultCeilingBytes, "spool byte ceiling")
+
+	collector := fs.String("collector", "", "Collector base URL; enables the uploader")
+	tokenFile := fs.String("token-file", "", "bearer token file (rotating), required with -collector")
+	allowLoopbackHTTP := fs.Bool("allow-loopback-http", false, "permit a plain-http loopback collector (dev only)")
+
+	var approvedRoots multiFlag
+	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
+	cursorDir := fs.String("cursor-dir", "", "transcript cursor state dir (required with -approved-root)")
+	// The watcher re-walks and stats every file under the approved roots on each poll (change
+	// detection is a bounded poll, not fsnotify), so its steady-state CPU is O(files under the roots)
+	// × poll frequency — independent of how many files match the transcript filter. On a host with
+	// tens of thousands of transcripts, the default 500ms cadence pins a core; this flag trades tail
+	// latency for CPU. 0 keeps the watcher default.
+	pollInterval := fs.Duration("poll-interval", 0, "transcript watcher poll cadence (e.g. 2s); 0 uses the watcher default")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *sourceID == "" {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -source-id is required")
+		return 2
+	}
+	stateDir, err := observerDir(*dir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		return 1
+	}
+
+	cfg := daemon.ServiceConfig{
+		Dir:               stateDir,
+		SourceID:          *sourceID,
+		Capacity:          defaultCapacity(*ceiling),
+		RegistrySource:    *sourceID,
+		RegistryWorkspace: *workspace,
+		Log:               func(s string) { fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", s) },
+	}
+
+	if *collector != "" {
+		up, err := buildUploadConfig(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+			return 2
+		}
+		cfg.Upload = up
+	}
+	if len(approvedRoots) > 0 {
+		if *cursorDir == "" {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
+			return 2
+		}
+		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval)
+	}
+
+	svc, err := daemon.NewService(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	fmt.Fprintf(os.Stderr, "gasworks-observer daemon: serving at %s\n", svc.SocketPath())
+	if err := svc.Run(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		return 1
+	}
+	return 0
+}
+
+// buildUploadConfig constructs the uploader loop config from the collector endpoint and a rotating
+// token file. The credential is read fresh per attempt by the E1.9 client.
+func buildUploadConfig(endpoint, sourceID, tokenFile string, allowLoopbackHTTP bool) (*daemon.UploadLoopConfig, error) {
+	if tokenFile == "" {
+		return nil, fmt.Errorf("-token-file is required with -collector")
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("parse -collector: %w", err)
+	}
+	client, err := upload.NewClient(upload.Config{
+		Endpoint:          u,
+		SourceID:          sourceID,
+		Credential:        upload.TokenFileSource{Path: tokenFile},
+		AllowLoopbackHTTP: allowLoopbackHTTP,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build collector client: %w", err)
+	}
+	return &daemon.UploadLoopConfig{Sender: client}, nil
+}
+
+// newWatchLoopConfig builds the transcript watcher config from the approved roots, the durable
+// cursor directory, and the poll cadence. It always installs transcriptNameMatch so the watcher only
+// ever PARSES real session transcripts and never turns the non-transcript sidecars (tool-results,
+// meta, source files) that share the roots into observations — the filter that stops the diagnostic
+// flood. interval<=0 leaves the watcher default cadence.
+//
+// Note the filter bounds what is parsed, not what is walked: the poll still re-walks and stats the
+// whole tree to detect changes and to keep a renamed-past-filter file tracked, so steady-state poll
+// CPU scales with total files under the roots. poll-interval is the lever for that cost.
+func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration) *daemon.WatchLoopConfig {
+	return &daemon.WatchLoopConfig{
+		ApprovedRoots: roots,
+		StateDir:      cursorDir,
+		Policy:        watcherPolicy(),
+		Match:         transcriptNameMatch,
+		Interval:      interval,
+	}
+}
+
+// transcriptNameMatch reports whether a regular-file basename under an approved root is a real
+// session transcript the watcher should tail. Both providers write their transcripts as JSON Lines
+// and NOTHING else under their roots is .jsonl: a Claude session is <uuid>.jsonl under
+// ~/.claude/projects and a Codex rollout is rollout-*.jsonl under ~/.codex/sessions, while every
+// non-transcript sidecar is a different extension — tool-results *.txt, *.meta.json /
+// sessions-index.json, source *.js, *.md, *.pdf. Matching on the .jsonl suffix is therefore the
+// exact, provider-agnostic predicate: it admits every real transcript under either root and refuses
+// all the junk that otherwise floods capture with "malformed transcript line" diagnostics, sets
+// has_partial_capture on real runs, and burns a core polling tens of thousands of files. The
+// watcher passes the basename only (a rooted glob is not available at this seam), so the predicate
+// is deliberately name-based.
+func transcriptNameMatch(name string) bool {
+	return strings.HasSuffix(name, ".jsonl")
+}
+
+// watcherPolicy is the daemon-constant METADATA_ONLY transform policy every parsed candidate is
+// stripped through before it becomes a durable observation.
+func watcherPolicy() evidence.Policy {
+	return evidence.Policy{
+		Adapter:        codex.AdapterName,
+		AdapterVersion: codex.AdapterVersion,
+		ContentPolicy:  wire.ProvenanceContentPolicyMETADATAONLY,
+		Extraction:     evidence.DefaultExtractionConfig(),
+	}
+}
+
+// defaultCapacity derives a spool capacity config from a byte ceiling, leaving the reserve/scratch
+// geometry at conservative defaults the capacity model validates.
+func defaultCapacity(ceiling int64) spool.CapacityConfig {
+	if ceiling <= 0 {
+		ceiling = defaultCeilingBytes
+	}
+	return spool.CapacityConfig{
+		CeilingBytes:         ceiling,
+		TerminalReserveBytes: 1 << 20,
+		MaxSegmentBytes:      spool.DefaultSegmentCeiling,
+		ScratchBytes:         1 << 20,
+		SafetyMarginRatio:    spool.MinSafetyMarginRatio,
+	}
+}

@@ -1,0 +1,3494 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Gasworks Observer \u2014 Ingest and Run API",
+    "version": "0.1.0",
+    "description": "Hand-authored (spec-first) OpenAPI for the Gasworks Observer metadata-only pilot: the machine ingest/capabilities/source-lifecycle plane and the viewer-authorized Run/work-run read plane. Strictly OpenAPI 3.0.3 \u2014 no 2020-12-only keywords (no if/then/else, const, or dependentRequired). Every observation payload is a closed, discriminated type (discriminator: kind); VCS references and run boundaries are themselves closed discriminated sub-unions. There are no free-form objects, untyped maps, or additionalProperties:true anywhere. The artifact is the source of truth; platform/endpoint/UI types and the fixture corpus are derived from it (see docs/design/gasworks-observer-mvp.md and the implementation plan).",
+    "x-gc-source": {
+      "repo": "gascity/gasworks-platform",
+      "commit": "d6e4335",
+      "generator": "hand-authored",
+      "direction": "spec-first"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://works.gascity.com",
+      "description": "identity plane; the customer gateway fronts ingest, source-lifecycle, and viewer routes"
+    }
+  ],
+  "security": [
+    {
+      "observerMachineKey": []
+    }
+  ],
+  "paths": {
+    "/v1/observer-capabilities": {
+      "get": {
+        "operationId": "getObserverCapabilities",
+        "summary": "Get ingest capabilities",
+        "description": "Non-mutating capabilities/validation route used by setup and doctor. Returns supported schema versions, limits, the authenticated source binding, and server time. Accepts no client-supplied authoritative tenant/workspace.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "machine",
+        "x-gc-required-scopes": [
+          "observer:ingest"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "observerMachineKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/observation-batches": {
+      "post": {
+        "operationId": "postObservationBatch",
+        "summary": "Ingest an observation batch",
+        "description": "Accept one contiguous immutable source range. Returns success only after the durability boundary accepts the complete range. Idempotent replay reports duplicates; conflicting content is quarantined, not last-write-wins.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "machine",
+        "x-gc-required-scopes": [
+          "observer:ingest"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "observerMachineKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObservationBatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestAck"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/observer-sources": {
+      "post": {
+        "operationId": "enrollObserverSource",
+        "summary": "Enroll a source",
+        "description": "Bind a predeclared endpoint source ID to the verified operator's workspace/workload subject. Ingest cannot self-enroll or take over a binding.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "machine",
+        "x-gc-required-scopes": [
+          "observer:sources.enroll"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "observerOperatorKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceEnrollRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDescriptor"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/observer-sources/{source_id}/decommission": {
+      "post": {
+        "operationId": "decommissionObserverSource",
+        "summary": "Decommission a source",
+        "description": "Permanently revoke a source binding. Irreversible: a replacement uses a new source ID. Restored backups must reapply the revocation ledger before serving or ingesting.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "machine",
+        "x-gc-required-scopes": [
+          "observer:sources.decommission"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "observerOperatorKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "description": "The predeclared source ID.",
+            "schema": {
+              "type": "string",
+              "maxLength": 68
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceDecommissionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Decommissioned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceDescriptor"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/observer-sources/{source_id}/rotations": {
+      "post": {
+        "operationId": "rotateObserverSource",
+        "summary": "Rotate a corrupt source",
+        "description": "Atomically decommission a corrupt namespace and enroll its predeclared replacement with a content-free loss-range audit record. Requires both source-lifecycle permissions.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "machine",
+        "x-gc-required-scopes": [
+          "observer:sources.enroll",
+          "observer:sources.decommission"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "observerOperatorKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "source_id",
+            "in": "path",
+            "required": true,
+            "description": "The predeclared source ID.",
+            "schema": {
+              "type": "string",
+              "maxLength": 68
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceRotationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rotated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceRotationResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/forge/api/v1/runs": {
+      "get": {
+        "operationId": "listObserverRuns",
+        "summary": "List runs",
+        "description": "Initial page or updates_after incremental page for the viewer's workspace, with work-reference/origin filters. Authorization is at the datastore boundary, never post-query filtering.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "viewer",
+        "x-gc-required-scopes": [
+          "forge:observer.runs.read"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "forgeViewerKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "description": "Rows per page; default 50, clamped to [1,200].",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "required": false,
+            "description": "Opaque keyset continuation token from a prior page.",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          {
+            "name": "updates_after",
+            "in": "query",
+            "required": false,
+            "description": "Incremental-poll cursor (updates_cursor from a prior read); returns only newer run revisions.",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          },
+          {
+            "name": "work_ref_project",
+            "in": "query",
+            "required": false,
+            "description": "Filter to runs referencing this Team Server project (bound into the page cursor).",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "work_ref_bead",
+            "in": "query",
+            "required": false,
+            "description": "Filter to runs referencing this bead (bound into the page cursor).",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "origin",
+            "in": "query",
+            "required": false,
+            "description": "Work-reference origin filter; default DECLARED. EXTRACTED never authorizes composition.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "DECLARED",
+                "EXTRACTED"
+              ],
+              "default": "DECLARED"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/forge/api/v1/runs/{run_id}": {
+      "get": {
+        "operationId": "getObserverRun",
+        "summary": "Get a run",
+        "description": "One run's projection detail with an ETag over (projection_version, projection_revision). A foreign or unauthorized run id is indistinguishable from a nonexistent one (404).",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "viewer",
+        "x-gc-required-scopes": [
+          "forge:observer.runs.read"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "forgeViewerKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "description": "The opaque run id.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunDetail"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "description": "Entity tag over (projection_version, projection_revision) and, for work runs, the BTS evaluation watermark; drives conditional polling.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not Modified; no body (conditional poll matched the current ETag)."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/forge/api/v1/runs/{run_id}/evidence": {
+      "get": {
+        "operationId": "getObserverRunEvidence",
+        "summary": "Get run evidence",
+        "description": "Keyset-paginated typed evidence for a run, pinned to one projection revision. Content fields are absent under metadata-only policy. Responses use Cache-Control: private, no-store. The stricter forge:observer.content.read gates any future content field.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "viewer",
+        "x-gc-required-scopes": [
+          "forge:observer.evidence.read"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "forgeViewerKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "description": "The opaque run id.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "description": "Evidence rows per page; default 100, clamped to [1,500].",
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "required": false,
+            "description": "Opaque keyset continuation token pinning the projection revision.",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEvidencePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
+    "/forge/api/v1/work-runs/{project}/{bead}": {
+      "get": {
+        "operationId": "getObserverWorkRun",
+        "summary": "Get a work run",
+        "description": "Group-bead work-run composition over current BTS structure and declared references, with member/run caps, truncation markers, paged continuation, and an ETag. Non-group, foreign, and missing beads return the uniform 404. Partial BTS failure returns the Observer half with work_axis_available=false, never a cached substitute.",
+        "x-gc-enforcement": "verified-scope",
+        "x-gc-plane": "viewer",
+        "x-gc-required-scopes": [
+          "forge:observer.runs.read"
+        ],
+        "x-experimental": true,
+        "security": [
+          {
+            "forgeViewerKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "project",
+            "in": "path",
+            "required": true,
+            "description": "Opaque Team Server project id.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "bead",
+            "in": "path",
+            "required": true,
+            "description": "Opaque group-bead id.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "required": false,
+            "description": "Opaque continuation token binding (project, bead), viewer, permissions, filters, and version.",
+            "schema": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkRunDetail"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "description": "Entity tag over (projection_version, projection_revision) and, for work runs, the BTS evaluation watermark; drives conditional polling.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "Not Modified; no body."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "observerMachineKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "observer source-bound",
+        "description": "Source-bound machine credential (scope observer:ingest). The gateway resolves it to a verified typed RequestIdentity; the ingest credential cannot call source-lifecycle routes and never carries operator authority."
+      },
+      "observerOperatorKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "observer operator",
+        "description": "Operator credential for the source-lifecycle plane (scopes observer:sources.enroll / observer:sources.decommission). Never written into daemon config/WAL or inherited by Codex."
+      },
+      "forgeViewerKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "forge audience",
+        "description": "Forge-audience viewer credential for the Run API (scopes forge:observer.runs.read / forge:observer.evidence.read / the stricter forge:observer.content.read). Edge-injected; X-Gc-Identity is never client-supplied."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request, unsupported schema version, or invalid page token.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid transport identity.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Identity is not authorized for this route, tenant/workspace, or source.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Foreign, unauthorized, or missing resource (uniform 404).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "Sequence gap, source-binding, or immutable-observation conflict established synchronously.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "Published request/record size exceeded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "Typed payload invalid or batch range not contiguous.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Tenant/source rate limit; retry with backoff and Retry-After.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "Durable sink unavailable; retry without advancing.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ObserverError"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ByteRange": {
+        "description": "Half-open provider-relative byte range [start, end).",
+        "type": "object",
+        "required": [
+          "start",
+          "end"
+        ],
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "end": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        },
+        "additionalProperties": false
+      },
+      "Watermark": {
+        "description": "A stable provider-file drain watermark. Carries no absolute path.",
+        "type": "object",
+        "required": [
+          "byte_offset"
+        ],
+        "properties": {
+          "source_locator": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "Provider-relative locator; never an absolute path.",
+            "minLength": 1
+          },
+          "byte_offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Bytes drained through this stable provider-file watermark."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProcessIdentity": {
+        "description": "Exact OS process identity used for causal launch-lineage proof.",
+        "type": "object",
+        "required": [
+          "boot_id",
+          "pid",
+          "process_start_time"
+        ],
+        "properties": {
+          "boot_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque host boot identifier.",
+            "minLength": 1
+          },
+          "pid": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "process_start_time": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Kernel process start time (clock ticks); proves exact launch lineage."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SequenceRange": {
+        "description": "An inclusive one-based source-sequence range.",
+        "type": "object",
+        "required": [
+          "first_sequence",
+          "last_sequence"
+        ],
+        "properties": {
+          "first_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "last_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkReference": {
+        "description": "An opaque link from a run to a Beads Team Server work item, with its origin discipline.",
+        "type": "object",
+        "required": [
+          "team_server_project_id",
+          "bead_id",
+          "origin"
+        ],
+        "properties": {
+          "team_server_project_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque canonical Beads Team Server project ID; never a display name; never parsed for policy.",
+            "minLength": 1
+          },
+          "bead_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Opaque bead identifier; never parsed for policy.",
+            "minLength": 1
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "DECLARED",
+              "EXTRACTED"
+            ],
+            "description": "DECLARED links come from the wrapper/lifecycle API and enter aggregates. EXTRACTED links are pattern-captured correlation evidence and never enter composition or totals. For EXTRACTED, team_server_project_id derives only from the daemon-stamped run context or a single configured default project; otherwise the reference is dropped with a diagnostic."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ExtractionProvenance": {
+        "description": "Deterministic extraction provenance for a VCS reference.",
+        "type": "object",
+        "required": [
+          "surface",
+          "pattern_id",
+          "extractor_version"
+        ],
+        "properties": {
+          "surface": {
+            "type": "string",
+            "enum": [
+              "TOOL_CALL",
+              "TOOL_RESULT"
+            ],
+            "description": "The recognized record shape the reference was captured from."
+          },
+          "pattern_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Fixture-proven output-format pattern the extractor matched.",
+            "minLength": 1
+          },
+          "extractor_version": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Versioned deterministic extractor identity.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "ContentReference": {
+        "description": "Independently verifiable CASS content reference. Reserved for the follow-on FULL track; never present under METADATA_ONLY. This shape is INTENTIONALLY PARTIAL: the immutable snapshot_id and the covered normalized-observation/byte range (spec line 351) join additively at the FULL follow-on gate, alongside the CASS receipt-lookup contract; do not treat the absence of those fields as a v1 omission.",
+        "type": "object",
+        "required": [
+          "cass_source_id",
+          "receipt_id",
+          "snapshot_observation_id",
+          "blake3",
+          "sha256",
+          "bytes"
+        ],
+        "properties": {
+          "cass_source_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "receipt_id": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "snapshot_observation_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "transcript_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "blake3": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex BLAKE3 over the exact transformed bytes.",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 over the exact transformed bytes.",
+            "minLength": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Exact transformed byte count."
+          },
+          "covered_byte_range": {
+            "$ref": "#/components/schemas/ByteRange"
+          },
+          "content_policy_version": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "TransformedContent": {
+        "description": "Typed transformed-content payload. Reserved for FULL; absent (never empty) under METADATA_ONLY.",
+        "type": "object",
+        "required": [
+          "representation"
+        ],
+        "properties": {
+          "representation": {
+            "type": "string",
+            "enum": [
+              "TRANSFORMED_BODY",
+              "TRANSFORMED_TYPED_PAYLOAD"
+            ],
+            "description": "Approved transform representation."
+          },
+          "byte_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "content_reference": {
+            "$ref": "#/components/schemas/ContentReference"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Provenance": {
+        "description": "Provenance carried by every observation. Metadata-only omits source_hash and content locators that would reveal captured bytes.",
+        "type": "object",
+        "required": [
+          "adapter",
+          "adapter_version",
+          "content_policy"
+        ],
+        "properties": {
+          "adapter": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Capturing adapter name, e.g. codex-hook.",
+            "minLength": 1
+          },
+          "adapter_version": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "parser_version": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "content_policy": {
+            "type": "string",
+            "enum": [
+              "METADATA_ONLY",
+              "FULL"
+            ]
+          },
+          "provider": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Provider name when present, e.g. codex.",
+            "minLength": 1
+          },
+          "native_session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Typed pseudonymous provider/native session id.",
+            "minLength": 1
+          },
+          "source_locator": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "Provider-relative locator; an absolute path never leaves the endpoint.",
+            "minLength": 1
+          },
+          "byte_range": {
+            "$ref": "#/components/schemas/ByteRange"
+          },
+          "source_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Representation hash, present only when the active content policy permits it.",
+            "minLength": 1
+          },
+          "transform_version": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "completeness": {
+            "type": "string",
+            "enum": [
+              "COMPLETE",
+              "PARTIAL",
+              "UNKNOWN"
+            ]
+          },
+          "capture_quality": {
+            "type": "string",
+            "enum": [
+              "OK",
+              "DEGRADED",
+              "UNSUPPORTED_FORMAT"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunContext": {
+        "description": "Present exactly when the daemon stamped a declared, inherited, or lineage-proven attachment; absent for passive-session evidence.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "membership_evidence"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "membership_evidence": {
+            "type": "string",
+            "enum": [
+              "DECLARED_BOUNDARY",
+              "INHERITED_RUN_ID",
+              "PROVEN_PROCESS_LINEAGE"
+            ],
+            "description": "The evidence that authorized this attachment."
+          },
+          "work_item_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkReference"
+            },
+            "maxItems": 32,
+            "description": "Work references declared on the boundary; at most 32."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunStartedBoundary": {
+        "description": "RUN_STARTED opens an explicit run. No drain fields exist on this shape.",
+        "type": "object",
+        "required": [
+          "transition",
+          "boundary_source",
+          "run_id"
+        ],
+        "properties": {
+          "transition": {
+            "type": "string",
+            "enum": [
+              "RUN_STARTED"
+            ]
+          },
+          "boundary_source": {
+            "type": "string",
+            "enum": [
+              "EXPLICIT_WRAPPER",
+              "LIFECYCLE_API"
+            ]
+          },
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "work_item_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkReference"
+            },
+            "maxItems": 32
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunEndedBoundary": {
+        "description": "RUN_ENDED closes an explicit run. No outcome field exists on a wrapper boundary.",
+        "type": "object",
+        "required": [
+          "transition",
+          "boundary_source",
+          "run_id"
+        ],
+        "properties": {
+          "transition": {
+            "type": "string",
+            "enum": [
+              "RUN_ENDED"
+            ]
+          },
+          "boundary_source": {
+            "type": "string",
+            "enum": [
+              "EXPLICIT_WRAPPER",
+              "LIFECYCLE_API"
+            ]
+          },
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "drain_status": {
+            "type": "string",
+            "enum": [
+              "COMPLETE",
+              "PARTIAL_TIMEOUT",
+              "FAILED"
+            ],
+            "description": "Present on a normal RUN_ENDED; absent on a launch-failure RUN_ENDED. Travels together with covered_watermark (a server-validated coupling, not a wire-schema one)."
+          },
+          "covered_watermark": {
+            "$ref": "#/components/schemas/Watermark"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunBoundaryPayload": {
+        "description": "A run boundary, discriminated on transition.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RunStartedBoundary"
+          },
+          {
+            "$ref": "#/components/schemas/RunEndedBoundary"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "transition",
+          "mapping": {
+            "RUN_STARTED": "#/components/schemas/RunStartedBoundary",
+            "RUN_ENDED": "#/components/schemas/RunEndedBoundary"
+          }
+        }
+      },
+      "ProcessLifecyclePayload": {
+        "description": "Wrapper child process lifecycle. Exit status is process evidence; there is no outcome field.",
+        "type": "object",
+        "required": [
+          "transition",
+          "process_identity"
+        ],
+        "properties": {
+          "transition": {
+            "type": "string",
+            "enum": [
+              "REGISTERED",
+              "PROCESS_EXITED",
+              "PROCESS_LAUNCH_FAILED"
+            ]
+          },
+          "process_identity": {
+            "$ref": "#/components/schemas/ProcessIdentity"
+          },
+          "exit_code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Process exit code; recorded as evidence, never converted to run success."
+          },
+          "signal": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Terminating signal number when the process was signalled."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SessionLifecyclePayload": {
+        "description": "Native provider session lifecycle evidence. Carries its own native_session_id and provider, plus an optional bounded model identifier.",
+        "type": "object",
+        "required": [
+          "transition",
+          "start_source",
+          "native_session_id",
+          "provider"
+        ],
+        "properties": {
+          "transition": {
+            "type": "string",
+            "enum": [
+              "STARTED",
+              "RESUMED",
+              "CLEARED",
+              "COMPACTED"
+            ]
+          },
+          "start_source": {
+            "type": "string",
+            "enum": [
+              "STARTUP",
+              "RESUME",
+              "CLEAR",
+              "COMPACT"
+            ]
+          },
+          "native_session_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "The provider/native session id this evidence belongs to; bounded and non-empty."
+          },
+          "provider": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Provider name, e.g. codex; bounded and non-empty."
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Optional bounded provider-reported model identifier; absent (never empty) when unknown."
+          }
+        },
+        "additionalProperties": false
+      },
+      "MessagePayload": {
+        "description": "Message metadata. Under METADATA_ONLY only role/timing/bounded counts are present; content is absent (never an empty body).",
+        "type": "object",
+        "required": [
+          "role"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "USER",
+              "ASSISTANT",
+              "SYSTEM",
+              "TOOL"
+            ]
+          },
+          "byte_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "token_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "content": {
+            "$ref": "#/components/schemas/TransformedContent"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ToolCallPayload": {
+        "description": "Tool call metadata. No command text, arguments, environment, url, or MCP name under METADATA_ONLY.",
+        "type": "object",
+        "required": [
+          "category"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "SHELL",
+              "FILE",
+              "SEARCH",
+              "NETWORK",
+              "MCP",
+              "OTHER"
+            ],
+            "description": "Normalized tool category; never a command, argument, url, or MCP name."
+          },
+          "argument_byte_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "content": {
+            "$ref": "#/components/schemas/TransformedContent"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ToolResultPayload": {
+        "description": "Tool result metadata. No result body under METADATA_ONLY.",
+        "type": "object",
+        "required": [
+          "category",
+          "status"
+        ],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "SHELL",
+              "FILE",
+              "SEARCH",
+              "NETWORK",
+              "MCP",
+              "OTHER"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "OK",
+              "ERROR",
+              "TIMEOUT",
+              "DENIED"
+            ]
+          },
+          "result_byte_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "content": {
+            "$ref": "#/components/schemas/TransformedContent"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UsagePayload": {
+        "description": "A usage observation. Missing values stay absent; absence is never coerced to zero. Estimated values carry a price-table version (enforced by the server validator).",
+        "type": "object",
+        "required": [
+          "quality"
+        ],
+        "properties": {
+          "quality": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "PROVIDER_REPORTED",
+              "ESTIMATED"
+            ]
+          },
+          "provider_source": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "price_table_version": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Present only when quality is ESTIMATED (a server-validated coupling, not a wire-schema one).",
+            "minLength": 1
+          },
+          "message_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "description": "Provider message/response id (msg_…/resp_…/chatcmpl-…) carried unchanged from the transcript. Read-time join key against the metered spend row's message_id; correlation evidence only — the endpoint does not attest to it, and it never affects pricing or run membership. Absent when the transcript had no id."
+          }
+        },
+        "additionalProperties": false
+      },
+      "VcsReferencePayload": {
+        "description": "A deterministically extracted commit or pull-request reference, discriminated on ref_kind. Correlation evidence only: it never affects run membership and never authorizes composition into totals.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/CommitVcsReference"
+          },
+          {
+            "$ref": "#/components/schemas/PullRequestVcsReference"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "ref_kind",
+          "mapping": {
+            "COMMIT": "#/components/schemas/CommitVcsReference",
+            "PULL_REQUEST": "#/components/schemas/PullRequestVcsReference"
+          }
+        }
+      },
+      "CommitVcsReference": {
+        "description": "A COMMIT VCS reference with a full-length-hex identifier.",
+        "type": "object",
+        "required": [
+          "ref_kind",
+          "identifier",
+          "extraction"
+        ],
+        "properties": {
+          "ref_kind": {
+            "type": "string",
+            "enum": [
+              "COMMIT"
+            ]
+          },
+          "identifier": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$",
+            "maxLength": 64,
+            "description": "A full 40- or 64-hex commit identifier. Abbreviated hashes are excluded from v1 (bare short hex is indistinguishable from hex-encoded secrets).",
+            "minLength": 1
+          },
+          "repo_slug": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._/-]{1,140}$",
+            "maxLength": 140,
+            "description": "Bounded slug, captured only when URL/remote-anchored.",
+            "minLength": 1
+          },
+          "extraction": {
+            "$ref": "#/components/schemas/ExtractionProvenance"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PullRequestVcsReference": {
+        "description": "A PULL_REQUEST VCS reference with an anchored #N or URL identifier.",
+        "type": "object",
+        "required": [
+          "ref_kind",
+          "identifier",
+          "extraction"
+        ],
+        "properties": {
+          "ref_kind": {
+            "type": "string",
+            "enum": [
+              "PULL_REQUEST"
+            ]
+          },
+          "identifier": {
+            "type": "string",
+            "pattern": "^(#[0-9]{1,20}|https://[^ ]{1,240})$",
+            "maxLength": 256,
+            "description": "An anchored pull-request reference: a #N form or a PR URL. Unanchored numbers and prose are excluded from v1.",
+            "minLength": 1
+          },
+          "repo_slug": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._/-]{1,140}$",
+            "maxLength": 140,
+            "description": "Bounded slug, captured only when URL/remote-anchored.",
+            "minLength": 1
+          },
+          "extraction": {
+            "$ref": "#/components/schemas/ExtractionProvenance"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CaptureDiagnosticPayload": {
+        "description": "A content-free capture diagnostic. Carries no raw provider record.",
+        "type": "object",
+        "required": [
+          "code",
+          "severity",
+          "completeness_effect"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "PARTIAL_CAPTURE",
+              "REFERENCE_OVERFLOW",
+              "UNSUPPORTED_FORMAT",
+              "CAPACITY_RECLAMATION",
+              "CAPTURE_LOSS",
+              "MISSING_BOUNDARY",
+              "COMPATIBILITY"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "INFO",
+              "WARNING",
+              "ERROR"
+            ]
+          },
+          "completeness_effect": {
+            "type": "string",
+            "enum": [
+              "NONE",
+              "PARTIAL",
+              "LOST"
+            ]
+          },
+          "context": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Bounded sanitized context; never a raw provider record, path, or secret.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "ObservationEnvelope": {
+        "description": "Fields carried by every observation regardless of kind. run_context is present exactly for stamped attachments and absent for passive sessions.",
+        "type": "object",
+        "required": [
+          "sequence",
+          "observation_id",
+          "kind",
+          "occurred_at",
+          "captured_at",
+          "provenance"
+        ],
+        "properties": {
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "description": "One-based monotonic source sequence."
+          },
+          "observation_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Immutable observation identity; permanently binds to one sequence and payload hash.",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "RUN_BOUNDARY",
+              "SESSION_LIFECYCLE",
+              "MESSAGE",
+              "TOOL_CALL",
+              "TOOL_RESULT",
+              "USAGE",
+              "WORK_REFERENCE",
+              "VCS_REFERENCE",
+              "PROCESS_LIFECYCLE",
+              "CAPTURE_DIAGNOSTIC"
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "captured_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "run_context": {
+            "$ref": "#/components/schemas/RunContext"
+          }
+        }
+      },
+      "RunBoundaryObservation": {
+        "description": "RUN_BOUNDARY observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "run_boundary"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "RUN_BOUNDARY"
+                ]
+              },
+              "run_boundary": {
+                "$ref": "#/components/schemas/RunBoundaryPayload"
+              }
+            }
+          }
+        ]
+      },
+      "SessionLifecycleObservation": {
+        "description": "SESSION_LIFECYCLE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "session_lifecycle"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "SESSION_LIFECYCLE"
+                ]
+              },
+              "session_lifecycle": {
+                "$ref": "#/components/schemas/SessionLifecyclePayload"
+              }
+            }
+          }
+        ]
+      },
+      "MessageObservation": {
+        "description": "MESSAGE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "message"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "MESSAGE"
+                ]
+              },
+              "message": {
+                "$ref": "#/components/schemas/MessagePayload"
+              }
+            }
+          }
+        ]
+      },
+      "ToolCallObservation": {
+        "description": "TOOL_CALL observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "tool_call"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "TOOL_CALL"
+                ]
+              },
+              "tool_call": {
+                "$ref": "#/components/schemas/ToolCallPayload"
+              }
+            }
+          }
+        ]
+      },
+      "ToolResultObservation": {
+        "description": "TOOL_RESULT observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "tool_result"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "TOOL_RESULT"
+                ]
+              },
+              "tool_result": {
+                "$ref": "#/components/schemas/ToolResultPayload"
+              }
+            }
+          }
+        ]
+      },
+      "UsageObservation": {
+        "description": "USAGE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "usage"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "USAGE"
+                ]
+              },
+              "usage": {
+                "$ref": "#/components/schemas/UsagePayload"
+              }
+            }
+          }
+        ]
+      },
+      "WorkReferenceObservation": {
+        "description": "WORK_REFERENCE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "work_reference"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "WORK_REFERENCE"
+                ]
+              },
+              "work_reference": {
+                "$ref": "#/components/schemas/WorkReference"
+              }
+            }
+          }
+        ]
+      },
+      "VcsReferenceObservation": {
+        "description": "VCS_REFERENCE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "vcs_reference"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "VCS_REFERENCE"
+                ]
+              },
+              "vcs_reference": {
+                "$ref": "#/components/schemas/VcsReferencePayload"
+              }
+            }
+          }
+        ]
+      },
+      "ProcessLifecycleObservation": {
+        "description": "PROCESS_LIFECYCLE observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "process_lifecycle"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "PROCESS_LIFECYCLE"
+                ]
+              },
+              "process_lifecycle": {
+                "$ref": "#/components/schemas/ProcessLifecyclePayload"
+              }
+            }
+          }
+        ]
+      },
+      "CaptureDiagnosticObservation": {
+        "description": "CAPTURE_DIAGNOSTIC observation.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ObservationEnvelope"
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "capture_diagnostic"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "CAPTURE_DIAGNOSTIC"
+                ]
+              },
+              "capture_diagnostic": {
+                "$ref": "#/components/schemas/CaptureDiagnosticPayload"
+              }
+            }
+          }
+        ]
+      },
+      "Observation": {
+        "description": "A single closed, discriminated observation. The discriminator is kind; exactly one variant matches.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RunBoundaryObservation"
+          },
+          {
+            "$ref": "#/components/schemas/SessionLifecycleObservation"
+          },
+          {
+            "$ref": "#/components/schemas/MessageObservation"
+          },
+          {
+            "$ref": "#/components/schemas/ToolCallObservation"
+          },
+          {
+            "$ref": "#/components/schemas/ToolResultObservation"
+          },
+          {
+            "$ref": "#/components/schemas/UsageObservation"
+          },
+          {
+            "$ref": "#/components/schemas/WorkReferenceObservation"
+          },
+          {
+            "$ref": "#/components/schemas/VcsReferenceObservation"
+          },
+          {
+            "$ref": "#/components/schemas/ProcessLifecycleObservation"
+          },
+          {
+            "$ref": "#/components/schemas/CaptureDiagnosticObservation"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "RUN_BOUNDARY": "#/components/schemas/RunBoundaryObservation",
+            "SESSION_LIFECYCLE": "#/components/schemas/SessionLifecycleObservation",
+            "MESSAGE": "#/components/schemas/MessageObservation",
+            "TOOL_CALL": "#/components/schemas/ToolCallObservation",
+            "TOOL_RESULT": "#/components/schemas/ToolResultObservation",
+            "USAGE": "#/components/schemas/UsageObservation",
+            "WORK_REFERENCE": "#/components/schemas/WorkReferenceObservation",
+            "VCS_REFERENCE": "#/components/schemas/VcsReferenceObservation",
+            "PROCESS_LIFECYCLE": "#/components/schemas/ProcessLifecycleObservation",
+            "CAPTURE_DIAGNOSTIC": "#/components/schemas/CaptureDiagnosticObservation"
+          }
+        }
+      },
+      "ObservationBatch": {
+        "description": "One contiguous immutable source range. Contiguity (first_sequence + len - 1 == last_sequence, and each observation.sequence == first_sequence + index) and the byte ceilings are wire-contract invariants enforced by the server, not by JSON Schema; see x-limits and the 413/422 responses.",
+        "type": "object",
+        "required": [
+          "schema_version",
+          "source_id",
+          "first_sequence",
+          "last_sequence",
+          "observations"
+        ],
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1
+            ],
+            "description": "v1 wire schema version."
+          },
+          "source_id": {
+            "type": "string",
+            "pattern": "^src_[0-9a-zA-Z]{1,64}$",
+            "maxLength": 68,
+            "minLength": 1
+          },
+          "first_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "last_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "observations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Observation"
+            },
+            "minItems": 1,
+            "maxItems": 1000
+          }
+        },
+        "additionalProperties": false,
+        "x-limits": {
+          "max_observations_per_batch": 1000,
+          "max_batch_bytes": 4194304,
+          "max_record_bytes": 1048576,
+          "max_references_per_observation": 32,
+          "sequence_min": 1,
+          "sequence_max": 9223372036854775807
+        }
+      },
+      "IngestAck": {
+        "description": "Success acknowledgement for one ingest batch.",
+        "type": "object",
+        "required": [
+          "source_id",
+          "acknowledged_through_sequence",
+          "accepted",
+          "duplicates"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 68,
+            "minLength": 1
+          },
+          "acknowledged_through_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Never advances past the request's last_sequence."
+          },
+          "accepted": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Newly durable records."
+          },
+          "duplicates": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "Already-bound records on replay; accepted + duplicates == request length on success."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceBinding": {
+        "description": "The authenticated source binding as resolved server-side; carries no client-supplied tenant/workspace.",
+        "type": "object",
+        "required": [
+          "source_id",
+          "state"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 68,
+            "minLength": 1
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ENROLLED",
+              "DECOMMISSIONED",
+              "ROTATING"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "CapabilitiesResponse": {
+        "description": "Non-mutating capabilities/validation response for setup and doctor. Discloses only the authenticated binding and limits; never accepts a client-supplied authoritative tenant/workspace.",
+        "type": "object",
+        "required": [
+          "schema_versions",
+          "max_observations_per_batch",
+          "max_batch_bytes",
+          "max_record_bytes",
+          "max_references_per_observation",
+          "acknowledgement_mode",
+          "source_binding",
+          "server_time"
+        ],
+        "properties": {
+          "schema_versions": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1
+            },
+            "description": "Supported wire schema versions."
+          },
+          "max_observations_per_batch": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "max_batch_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "max_record_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "description": "Maximum encoded bytes for a single observation record (413 boundary)."
+          },
+          "max_references_per_observation": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "acknowledgement_mode": {
+            "type": "string",
+            "enum": [
+              "CONTIGUOUS"
+            ]
+          },
+          "source_binding": {
+            "$ref": "#/components/schemas/SourceBinding"
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceDescriptor": {
+        "description": "Server-authored source binding state. Tenant/workspace and operator subject come only from verified identity.",
+        "type": "object",
+        "required": [
+          "source_id",
+          "state"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 68,
+            "minLength": 1
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "ENROLLED",
+              "DECOMMISSIONED",
+              "ROTATING"
+            ]
+          },
+          "workload_subject_fingerprint": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Bound credential subject/workload-key fingerprint; never the raw credential.",
+            "minLength": 1
+          },
+          "acknowledged_through_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "enrolled_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "last_ingest_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "decommissioned_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceEnrollRequest": {
+        "description": "Enroll a predeclared source. Body never supplies authoritative tenancy or source authorization.",
+        "type": "object",
+        "required": [
+          "source_id"
+        ],
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "pattern": "^src_[0-9a-zA-Z]{1,64}$",
+            "maxLength": 68,
+            "description": "The predeclared endpoint source ID to bind. Tenant/workspace/subject come from verified operator identity, never the body.",
+            "minLength": 1
+          },
+          "workload_subject_fingerprint": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "display_label": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceDecommissionRequest": {
+        "description": "Permanently revoke a source binding. Irreversible. Decommission revokes ingest; it does not lose already-acknowledged evidence, so it carries NO evidence-loss acknowledgment field (unlike rotation).",
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceRotationRequest": {
+        "description": "Atomically decommission a corrupt namespace and enroll its predeclared replacement.",
+        "type": "object",
+        "required": [
+          "new_source_id",
+          "acknowledge_evidence_loss"
+        ],
+        "properties": {
+          "new_source_id": {
+            "type": "string",
+            "pattern": "^src_[0-9a-zA-Z]{1,64}$",
+            "maxLength": 68,
+            "description": "The predeclared replacement source ID; enrolled at sequence one.",
+            "minLength": 1
+          },
+          "loss_range": {
+            "$ref": "#/components/schemas/SequenceRange"
+          },
+          "acknowledge_evidence_loss": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Must be true: rotation abandons the corrupt namespace's unacknowledged range, so the operator explicitly acknowledges evidence loss."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SourceRotationResult": {
+        "description": "The result of an atomic source rotation.",
+        "type": "object",
+        "required": [
+          "decommissioned",
+          "enrolled"
+        ],
+        "properties": {
+          "decommissioned": {
+            "$ref": "#/components/schemas/SourceDescriptor"
+          },
+          "enrolled": {
+            "$ref": "#/components/schemas/SourceDescriptor"
+          }
+        },
+        "additionalProperties": false
+      },
+      "QuiescenceRule": {
+        "description": "Versioned client-side quiescence rule. Quiescence is computed by the client from last_evidence_ingested_at; no server path returns a QUIESCENT lifecycle.",
+        "type": "object",
+        "required": [
+          "version",
+          "threshold_seconds"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "threshold_seconds": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProvenanceValue": {
+        "description": "A typed interpreted field value with its confidence and bounded direct provenance.",
+        "type": "object",
+        "required": [
+          "value",
+          "confidence",
+          "evidence_ids"
+        ],
+        "properties": {
+          "value": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "evidence_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "maxItems": 16,
+            "description": "Bounded direct evidence IDs; the full set is paged via the evidence endpoint."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UsageByQuality": {
+        "description": "Usage totals for one quality class. Absent token fields stay absent (never zero).",
+        "type": "object",
+        "required": [
+          "quality"
+        ],
+        "properties": {
+          "quality": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "PROVIDER_REPORTED",
+              "ESTIMATED"
+            ]
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "price_table_version": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Present only for ESTIMATED quality (a server-validated coupling).",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "UsageByQualityOrigin": {
+        "description": "Usage totals segmented by origin AND quality so the wire cannot express an origin-blind total.",
+        "type": "object",
+        "required": [
+          "origin",
+          "quality"
+        ],
+        "properties": {
+          "origin": {
+            "type": "string",
+            "enum": [
+              "DECLARED",
+              "EXTRACTED"
+            ]
+          },
+          "quality": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "PROVIDER_REPORTED",
+              "ESTIMATED"
+            ]
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_read_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "cache_creation_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "price_table_version": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "VcsChip": {
+        "description": "A commit/PR chip scoped under one associated run, carrying its per-edge origin.",
+        "type": "object",
+        "required": [
+          "ref_kind",
+          "identifier",
+          "origin",
+          "via_run_id"
+        ],
+        "properties": {
+          "ref_kind": {
+            "type": "string",
+            "enum": [
+              "COMMIT",
+              "PULL_REQUEST"
+            ]
+          },
+          "identifier": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1
+          },
+          "repo_slug": {
+            "type": "string",
+            "maxLength": 140,
+            "minLength": 1
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "DECLARED",
+              "EXTRACTED"
+            ]
+          },
+          "via_run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "The observing execution run the chip is scoped under; chips are never unscoped bead-level attributes.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "AttachmentIntervalSummary": {
+        "description": "A half-open source-sequence attachment interval [start_sequence, end_sequence_exclusive) with its exact start/end evidence anchors and native start source.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "start_sequence",
+          "start_source",
+          "confidence",
+          "membership_evidence",
+          "interval_ordinal",
+          "start_evidence_id",
+          "started_at"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "start_sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "end_sequence_exclusive": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807,
+            "description": "Absent while the interval is open."
+          },
+          "start_source": {
+            "type": "string",
+            "enum": [
+              "STARTUP",
+              "RESUME",
+              "CLEAR",
+              "COMPACT"
+            ],
+            "description": "The native start source that opened this interval."
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "membership_evidence": {
+            "type": "string",
+            "enum": [
+              "DECLARED_BOUNDARY",
+              "INHERITED_RUN_ID",
+              "PROVEN_PROCESS_LINEAGE",
+              "SYNTHETIC_INFERRED"
+            ]
+          },
+          "interval_ordinal": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "start_evidence_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "The observation ID whose durable append opened this interval; anchors the provenance drawer.",
+            "minLength": 1
+          },
+          "end_evidence_id": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "The observation ID that closed this interval; absent while the interval is open.",
+            "minLength": 1
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Occurred-at of the start evidence (display).",
+            "minLength": 1
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Occurred-at of the end evidence; absent while the interval is open.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SessionSummary": {
+        "description": "A native session and its immutable attachment intervals.",
+        "type": "object",
+        "required": [
+          "native_session_id",
+          "adapter",
+          "intervals"
+        ],
+        "properties": {
+          "native_session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "adapter": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Present only when the optional SESSION_LIFECYCLE model field was reported.",
+            "minLength": 1
+          },
+          "intervals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentIntervalSummary"
+            },
+            "maxItems": 64
+          }
+        },
+        "additionalProperties": false
+      },
+      "TimelineSummary": {
+        "description": "Bounded counts for a run's chronological evidence timeline; the full timeline is paged via the evidence endpoint.",
+        "type": "object",
+        "required": [
+          "observation_count"
+        ],
+        "properties": {
+          "observation_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "message_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "tool_call_count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          },
+          "first_occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "last_occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "Diagnostic": {
+        "description": "A projection-level completeness/capture diagnostic.",
+        "type": "object",
+        "required": [
+          "code",
+          "severity"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "PARTIAL_CAPTURE",
+              "LATE_CAPTURE",
+              "UNSUPPORTED_FORMAT",
+              "MISSING_BOUNDARY",
+              "QUARANTINED_ASSOCIATION",
+              "COMPATIBILITY"
+            ]
+          },
+          "severity": {
+            "type": "string",
+            "enum": [
+              "INFO",
+              "WARNING",
+              "ERROR"
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Bounded sanitized detail; hostile input, rendered as text by consumers.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunFieldProvenance": {
+        "description": "Bounded direct field provenance for the interpreted run fields.",
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "$ref": "#/components/schemas/ProvenanceValue"
+          },
+          "boundary_authority": {
+            "$ref": "#/components/schemas/ProvenanceValue"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunListItem": {
+        "description": "One compact run-list row.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "projection_version",
+          "projection_revision",
+          "boundary_authority",
+          "lifecycle",
+          "outcome",
+          "updated_at",
+          "last_evidence_ingested_at",
+          "has_partial_capture"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "projection_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "projection_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "boundary_authority": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "CLOSED"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "UNKNOWN"
+            ],
+            "description": "v1 always projects UNKNOWN. SUCCEEDED/FAILED/CANCELLED are reserved for a later contract version and are not valid v1 wire values."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "last_evidence_ingested_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Trusted server clock; the client computes quiescence from it and the quiescence_rule.",
+            "minLength": 1
+          },
+          "work_item_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkReference"
+            },
+            "maxItems": 32
+          },
+          "has_partial_capture": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "x-reserved-outcome-values": [
+          "SUCCEEDED",
+          "FAILED",
+          "CANCELLED"
+        ]
+      },
+      "RunListResponse": {
+        "description": "A run-list page (initial or updates_after incremental).",
+        "type": "object",
+        "required": [
+          "runs",
+          "quiescence_rule",
+          "updates_cursor",
+          "next_page_token"
+        ],
+        "properties": {
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunListItem"
+            },
+            "maxItems": 200
+          },
+          "quiescence_rule": {
+            "$ref": "#/components/schemas/QuiescenceRule"
+          },
+          "updates_cursor": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Opaque workspace projection watermark for updates_after polling."
+          },
+          "next_page_token": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Opaque keyset continuation token; empty string when there is no next page."
+          }
+        },
+        "additionalProperties": false,
+        "x-limits": {
+          "page_size_default": 50,
+          "page_size_max": 200,
+          "response_bytes_max": 2097152
+        }
+      },
+      "RunDetail": {
+        "description": "A run projection detail response. Carries an ETag over (projection_version, projection_revision).",
+        "type": "object",
+        "required": [
+          "run_id",
+          "projection_version",
+          "projection_revision",
+          "boundary_authority",
+          "lifecycle",
+          "outcome",
+          "updated_at",
+          "last_evidence_ingested_at",
+          "sessions",
+          "usage_totals",
+          "timeline_summary",
+          "has_partial_capture"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "projection_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "projection_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "boundary_authority": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "CLOSED"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "UNKNOWN"
+            ],
+            "description": "Always UNKNOWN in v1; other values reserved."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "last_evidence_ingested_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSummary"
+            },
+            "maxItems": 200
+          },
+          "work_item_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkReference"
+            },
+            "maxItems": 64
+          },
+          "vcs_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VcsChip"
+            },
+            "maxItems": 64
+          },
+          "usage_totals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageByQuality"
+            },
+            "maxItems": 3
+          },
+          "timeline_summary": {
+            "$ref": "#/components/schemas/TimelineSummary"
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "maxItems": 64
+          },
+          "field_provenance": {
+            "$ref": "#/components/schemas/RunFieldProvenance"
+          },
+          "has_partial_capture": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "x-reserved-outcome-values": [
+          "SUCCEEDED",
+          "FAILED",
+          "CANCELLED"
+        ]
+      },
+      "EvidenceSummary": {
+        "description": "A typed evidence-timeline summary. Content fields are absent under metadata-only policy (never empty strings).",
+        "type": "object",
+        "required": [
+          "observation_id",
+          "sequence",
+          "kind",
+          "occurred_at",
+          "source_id"
+        ],
+        "properties": {
+          "observation_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "sequence": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "RUN_BOUNDARY",
+              "SESSION_LIFECYCLE",
+              "MESSAGE",
+              "TOOL_CALL",
+              "TOOL_RESULT",
+              "USAGE",
+              "WORK_REFERENCE",
+              "VCS_REFERENCE",
+              "PROCESS_LIFECYCLE",
+              "CAPTURE_DIAGNOSTIC"
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "captured_at": {
+            "type": "string",
+            "format": "date-time",
+            "minLength": 1
+          },
+          "source_id": {
+            "type": "string",
+            "maxLength": 68,
+            "minLength": 1
+          },
+          "native_session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Bounded typed summary label (e.g. transition or category); hostile input, rendered as text. No captured content under METADATA_ONLY.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "RunEvidencePage": {
+        "description": "A keyset-paginated evidence page pinned to one projection revision.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "projection_version",
+          "projection_revision",
+          "evidence",
+          "next_page_token"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "projection_version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "projection_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EvidenceSummary"
+            },
+            "maxItems": 500
+          },
+          "next_page_token": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "additionalProperties": false,
+        "x-limits": {
+          "page_size_default": 100,
+          "page_size_max": 500
+        }
+      },
+      "WorkRunIdentity": {
+        "description": "A work run's identity. Never minted; exists exactly when the referenced group bead exists.",
+        "type": "object",
+        "required": [
+          "team_server_project_id",
+          "group_bead_id",
+          "group_bead_type"
+        ],
+        "properties": {
+          "team_server_project_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "group_bead_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "group_bead_type": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "The BTS issue_type of the group bead (deployment-configured; default convoy/epic).",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "TruncationMarker": {
+        "description": "A hard-cap truncation marker; totals render as 'incomplete (N of M)' when truncated.",
+        "type": "object",
+        "required": [
+          "truncated",
+          "returned",
+          "total"
+        ],
+        "properties": {
+          "truncated": {
+            "type": "boolean"
+          },
+          "returned": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "BoundedSessionSummary": {
+        "description": "A bounded session summary for a work-run run entry.",
+        "type": "object",
+        "required": [
+          "native_session_id",
+          "adapter"
+        ],
+        "properties": {
+          "native_session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "adapter": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Only when the optional SESSION_LIFECYCLE model field is present.",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkRunRunSummary": {
+        "description": "The closed embedded summary of one execution run associated with a work-run member.",
+        "type": "object",
+        "required": [
+          "run_id",
+          "boundary_authority",
+          "lifecycle",
+          "outcome",
+          "work_ref_origin"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "boundary_authority": {
+            "type": "string",
+            "enum": [
+              "AUTHORITATIVE",
+              "HIGH",
+              "INFERRED"
+            ]
+          },
+          "lifecycle": {
+            "type": "string",
+            "enum": [
+              "OPEN",
+              "CLOSED"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "UNKNOWN"
+            ]
+          },
+          "session": {
+            "$ref": "#/components/schemas/BoundedSessionSummary"
+          },
+          "usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageByQualityOrigin"
+            },
+            "maxItems": 6,
+            "description": "Usage totals by quality, segmented by origin."
+          },
+          "vcs_chips": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VcsChip"
+            },
+            "maxItems": 32
+          },
+          "work_ref_origin": {
+            "type": "string",
+            "enum": [
+              "DECLARED",
+              "EXTRACTED"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "BtsMemberSummary": {
+        "description": "A BTS-sourced member summary, composed server-side from the viewer-authorized R2 group graph (frozen beads-api-v1 rev 2 member DTO).",
+        "type": "object",
+        "required": [
+          "bead_id",
+          "issue_type",
+          "title",
+          "status",
+          "updated_at"
+        ],
+        "properties": {
+          "bead_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "issue_type": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "BTS-sourced; hostile input, rendered as text by consumers.",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "BTS status vocabulary, e.g. open/in_progress/blocked/hooked/closed/deferred/pinned.",
+            "minLength": 1
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "BTS-sourced last-update time (frozen beads-api-v1 rev 2 member DTO).",
+            "minLength": 1
+          },
+          "closed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "BTS-sourced close time; present only for closed members.",
+            "minLength": 1
+          },
+          "priority": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1
+          },
+          "assignee": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1
+          },
+          "blocked": {
+            "type": "boolean",
+            "description": "Precomputed column hint from the member's direct blocks edges (R2), so board columns derive without per-member BTS calls."
+          },
+          "blocks_bead_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "maxItems": 20,
+            "description": "Opaque IDs of beads this member is blocked by (R2 direct blocks edges); capped, with blocks_truncation when exceeded."
+          },
+          "blocks_truncation": {
+            "$ref": "#/components/schemas/TruncationMarker"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkRunMember": {
+        "description": "One work-run member bead and its associated execution runs.",
+        "type": "object",
+        "required": [
+          "bead",
+          "is_group_bead",
+          "associated_runs",
+          "run_truncation"
+        ],
+        "properties": {
+          "bead": {
+            "$ref": "#/components/schemas/BtsMemberSummary"
+          },
+          "is_group_bead": {
+            "type": "boolean",
+            "description": "True when the member is itself a group bead; its members are excluded from this composition and totals."
+          },
+          "sub_work_run": {
+            "$ref": "#/components/schemas/WorkRunIdentity"
+          },
+          "associated_runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkRunRunSummary"
+            },
+            "maxItems": 100
+          },
+          "run_truncation": {
+            "$ref": "#/components/schemas/TruncationMarker"
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkRunAggregates": {
+        "description": "Origin-segmented work-run aggregates. The wire type cannot express an origin-blind total.",
+        "type": "object",
+        "required": [
+          "declared_usage",
+          "extracted_usage",
+          "declared_run_count",
+          "extracted_run_count"
+        ],
+        "properties": {
+          "declared_usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageByQuality"
+            },
+            "maxItems": 3,
+            "description": "DECLARED-only usage totals; the only figures that enter composition."
+          },
+          "extracted_usage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageByQuality"
+            },
+            "maxItems": 3,
+            "description": "Structurally segmented EXTRACTED-band totals; never included in composition."
+          },
+          "declared_run_count": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "extracted_run_count": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "WorkRunDetail": {
+        "description": "A work-run (convoy-as-run) composition detail response. Carries an ETag over the contributing projection revisions and the BTS evaluation watermark.",
+        "type": "object",
+        "required": [
+          "work_run",
+          "evaluated_at",
+          "work_axis_available",
+          "members",
+          "member_truncation",
+          "aggregates",
+          "next_page_token"
+        ],
+        "properties": {
+          "work_run": {
+            "$ref": "#/components/schemas/WorkRunIdentity"
+          },
+          "evaluated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Composition is over current BTS structure as of this time.",
+            "minLength": 1
+          },
+          "work_axis_available": {
+            "type": "boolean",
+            "description": "False when the viewer-authorized BTS leg is unavailable; the Observer half is returned with the work axis marked unavailable, never a cached substitute."
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkRunMember"
+            },
+            "maxItems": 200
+          },
+          "member_truncation": {
+            "$ref": "#/components/schemas/TruncationMarker"
+          },
+          "aggregates": {
+            "$ref": "#/components/schemas/WorkRunAggregates"
+          },
+          "next_page_token": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "additionalProperties": false,
+        "x-limits": {
+          "members_max": 200,
+          "runs_per_member_max": 100,
+          "response_bytes_max": 2097152
+        }
+      },
+      "ObserverErrorBody": {
+        "description": "The typed body of an Observer error.",
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "MALFORMED_REQUEST",
+              "UNSUPPORTED_SCHEMA_VERSION",
+              "UNAUTHENTICATED",
+              "FORBIDDEN",
+              "NOT_FOUND",
+              "SEQUENCE_CONFLICT",
+              "SOURCE_BINDING_CONFLICT",
+              "OBSERVATION_CONFLICT",
+              "PAYLOAD_TOO_LARGE",
+              "RANGE_NOT_CONTIGUOUS",
+              "UNPROCESSABLE",
+              "RATE_LIMITED",
+              "SINK_UNAVAILABLE",
+              "INVALID_PAGE_TOKEN"
+            ],
+            "description": "Machine-readable, closed code shared across ingest and read APIs."
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 1024,
+            "description": "Human-readable, content-free message.",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ObserverError": {
+        "description": "The single typed error envelope shared by every Observer ingest and read endpoint (application/json).",
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ObserverErrorBody"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

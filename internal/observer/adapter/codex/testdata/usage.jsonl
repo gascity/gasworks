@@ -1,0 +1,2 @@
+{"type":"usage","quality":"PROVIDER_REPORTED","input_tokens":1200,"output_tokens":345,"cache_read_tokens":900,"provider_source":"codex","ts":"2026-07-17T10:03:00Z"}
+{"type":"usage","quality":"ESTIMATED","input_tokens":10,"output_tokens":20,"price_table_version":"pt-2026-07","ts":"2026-07-17T10:03:01Z"}

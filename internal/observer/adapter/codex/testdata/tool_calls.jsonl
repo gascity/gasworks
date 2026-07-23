@@ -1,0 +1,2 @@
+{"type":"tool_call","tool":"git","category":"SHELL","command":"git log --oneline -5","argument_bytes":20,"ts":"2026-07-17T10:01:00Z"}
+{"type":"tool_call","tool":"editor","category":"FILE","command":"open main.go","ts":"2026-07-17T10:01:01Z"}

@@ -1,0 +1,1 @@
+{"acknowledgement_mode":"CONTIGUOUS","max_batch_bytes":4194304,"max_observations_per_batch":1000,"max_record_bytes":1048576,"max_references_per_observation":32,"schema_versions":[1],"server_time":"2026-07-16T10:00:00Z","source_binding":{"source_id":"src_019f7a1000observerpilot0001","state":"ENROLLED"}}

@@ -1,0 +1,15 @@
+{
+  "schema_versions": [
+    1
+  ],
+  "max_observations_per_batch": 1000,
+  "max_batch_bytes": 4194304,
+  "max_record_bytes": 1048576,
+  "max_references_per_observation": 32,
+  "acknowledgement_mode": "CONTIGUOUS",
+  "source_binding": {
+    "source_id": "src_019f7a1000observerpilot0001",
+    "state": "ENROLLED"
+  },
+  "server_time": "2026-07-16T10:00:00.000Z"
+}

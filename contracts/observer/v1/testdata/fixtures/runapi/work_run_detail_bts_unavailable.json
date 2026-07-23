@@ -1,0 +1,22 @@
+{
+  "work_run": {
+    "team_server_project_id": "btsproj_019f0011",
+    "group_bead_id": "bd-convoy-1",
+    "group_bead_type": "convoy"
+  },
+  "evaluated_at": "2026-07-16T10:04:00.000Z",
+  "work_axis_available": false,
+  "members": [],
+  "member_truncation": {
+    "truncated": false,
+    "returned": 0,
+    "total": 0
+  },
+  "aggregates": {
+    "declared_usage": [],
+    "extracted_usage": [],
+    "declared_run_count": 0,
+    "extracted_run_count": 0
+  },
+  "next_page_token": ""
+}

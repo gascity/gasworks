@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "source_id": "src_019f7a1000observerpilot0001",
+  "first_sequence": 7,
+  "last_sequence": 8,
+  "observations": [
+    {
+      "sequence": 7,
+      "observation_id": "obs_0000000000000007",
+      "kind": "SESSION_LIFECYCLE",
+      "occurred_at": "2026-07-16T10:07:00.100Z",
+      "captured_at": "2026-07-16T10:07:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f5500-passive-7a",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "session_lifecycle": {
+        "transition": "STARTED",
+        "start_source": "STARTUP",
+        "native_session_id": "019f5500-passive-7a",
+        "provider": "codex"
+      }
+    },
+    {
+      "sequence": 8,
+      "observation_id": "obs_0000000000000008",
+      "kind": "MESSAGE",
+      "occurred_at": "2026-07-16T10:08:00.100Z",
+      "captured_at": "2026-07-16T10:08:00.180Z",
+      "provenance": {
+        "adapter": "codex-hook",
+        "adapter_version": "1.0.0",
+        "content_policy": "METADATA_ONLY",
+        "provider": "codex",
+        "native_session_id": "019f5500-passive-7a",
+        "source_locator": "codex/2026/07/16/rollout-a1b2.jsonl",
+        "completeness": "COMPLETE"
+      },
+      "message": {
+        "role": "ASSISTANT",
+        "byte_count": 512,
+        "token_count": 128
+      }
+    }
+  ]
+}

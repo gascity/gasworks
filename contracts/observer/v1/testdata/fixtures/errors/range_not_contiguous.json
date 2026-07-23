@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "RANGE_NOT_CONTIGUOUS",
+    "message": "batch range is not contiguous",
+    "retryable": false
+  }
+}

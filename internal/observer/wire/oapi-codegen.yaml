@@ -1,0 +1,18 @@
+# oapi-codegen configuration for the vendored Observer wire contract (P0.5).
+#
+# Spec-first: the source of truth is the vendored artifact
+# contracts/observer/v1/openapi.json (a byte-exact copy of gasworks-platform's
+# Observer contract). These options mirror the platform P0.4 config exactly so the
+# endpoint DTOs are the same shape as the server's, and so regeneration is
+# byte-for-byte deterministic:
+#   - generate types (models) only — no server/client scaffolding;
+#   - always-prefix-enum-values so enum constant names stay stable when future
+#     enum members are added (the Checkpoint-0 red-team requirement); a bare
+#     constant name like "COMPLETE" would silently collide/re-map if another enum
+#     later introduced the same member.
+package: wire
+output: observer.gen.go
+generate:
+  models: true
+compatibility:
+  always-prefix-enum-values: true
