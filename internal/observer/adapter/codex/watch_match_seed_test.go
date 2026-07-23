@@ -128,8 +128,8 @@ func seedTailCursor(t *testing.T, stateDir, path string, consumed int64) {
 func TestNewlineBoundarySeedCapturesInFlightLine(t *testing.T) {
 	ctx := context.Background()
 	line1 := msgLine("first") + "\n"
-	partial := `{"type":"message","role":"user","text":"second`   // an in-flight record: no newline yet
-	completion := `","ts":"2026-07-17T10:00:00Z"}` + "\n"          // completes line2 to valid JSON
+	partial := `{"type":"message","role":"user","text":"second` // an in-flight record: no newline yet
+	completion := `","ts":"2026-07-17T10:00:00Z"}` + "\n"       // completes line2 to valid JSON
 
 	t.Run("newline-boundary seed keeps the completed record", func(t *testing.T) {
 		root, state := t.TempDir(), t.TempDir()

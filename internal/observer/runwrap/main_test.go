@@ -82,16 +82,16 @@ type recordedObs struct {
 // (the spool's single-writer role in production), records an ordered event/label log, and
 // exposes hooks to script capacity refusal, non-durable appends, and drain behavior.
 type recordingDaemon struct {
-	mu          sync.Mutex
-	seq         int64
-	events      []string
-	appends     []recordedObs
+	mu            sync.Mutex
+	seq           int64
+	events        []string
+	appends       []recordedObs
 	reserveErr    error
 	boundSessions map[string]string
 	reserved      bool
-	released    bool
-	drainFn     func(ctx context.Context, d *recordingDaemon, runID string) (DrainOutcome, error)
-	appendErrOn map[string]error
+	released      bool
+	drainFn       func(ctx context.Context, d *recordingDaemon, runID string) (DrainOutcome, error)
+	appendErrOn   map[string]error
 }
 
 func newRecordingDaemon() *recordingDaemon {

@@ -13,7 +13,7 @@ import (
 // yields ~962 "malformed transcript line" diagnostics and trips has_partial_capture on real runs.
 func TestTranscriptNameMatch(t *testing.T) {
 	tracked := []string{
-		"48bc659f-6656-4f39-b424-864992f96c2c.jsonl",                            // Claude session
+		"48bc659f-6656-4f39-b424-864992f96c2c.jsonl",                             // Claude session
 		"rollout-2026-07-14T23-46-58-019f6306-cdf3-7813-ae8e-a90bb1799c99.jsonl", // Codex rollout
 	}
 	for _, name := range tracked {
@@ -23,14 +23,14 @@ func TestTranscriptNameMatch(t *testing.T) {
 	}
 
 	rejected := []string{
-		"a1b2c3d4.meta.json",    // Claude per-message metadata sidecar
-		"sessions-index.json",   // Claude session index
-		"tool-result-0007.txt",  // Claude tool-results payload (the flood source)
-		"bundle.js",             // source artifact under a project root
-		"README.md",             // markdown under a project root
-		"report.pdf",            // binary sidecar
-		"session.jsonl.tmp",     // an in-progress rename, not yet a transcript
-		"session.jsonl.bak",     // a backup, not the live transcript
+		"a1b2c3d4.meta.json",   // Claude per-message metadata sidecar
+		"sessions-index.json",  // Claude session index
+		"tool-result-0007.txt", // Claude tool-results payload (the flood source)
+		"bundle.js",            // source artifact under a project root
+		"README.md",            // markdown under a project root
+		"report.pdf",           // binary sidecar
+		"session.jsonl.tmp",    // an in-progress rename, not yet a transcript
+		"session.jsonl.bak",    // a backup, not the live transcript
 	}
 	for _, name := range rejected {
 		if transcriptNameMatch(name) {

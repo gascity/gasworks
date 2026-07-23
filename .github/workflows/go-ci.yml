@@ -30,7 +30,12 @@ jobs:
       - name: gofmt (fail on unformatted)
         run: |
           # gofmt -l lists files that need formatting; any output means the tree is dirty.
-          unformatted="$(gofmt -l .)"
+          # vendor/ is excluded: third-party vendored code is verified byte-for-byte against
+          # upstream by the "Verify vendored dependencies" step below, so its formatting is
+          # fixed by the pinned dependency version and is not ours to reformat (some deps
+          # still ship pre-//go:build tag syntax that a newer gofmt would rewrite, which would
+          # then be reverted by `go mod vendor` — an unresolvable gofmt/vendor-verify conflict).
+          unformatted="$(gofmt -l . | grep -v '^vendor/')"
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt found unformatted files:"
             echo "$unformatted"

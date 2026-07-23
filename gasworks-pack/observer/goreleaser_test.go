@@ -89,7 +89,7 @@ func globOne(t *testing.T, pattern string) string {
 // TestSnapshotObserverArchiveInventory does a real snapshot build and asserts (O4.1):
 //   - the independent observer archive contains ONLY the observer binary + LICENSE, and
 //   - the existing CLI/forwarder "default" archive is unchanged (gasworks + gasworks-forwarder
-//     + README.md, with NO observer bytes and NO leaked license) — the no-regression proof.
+//   - README.md, with NO observer bytes and NO leaked license) — the no-regression proof.
 func TestSnapshotObserverArchiveInventory(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping goreleaser snapshot build in -short mode")

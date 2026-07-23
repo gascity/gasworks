@@ -33,7 +33,7 @@ func TestServiceUnitIsUserScoped(t *testing.T) {
 	}
 	unit := string(data)
 	mustContain := []string{
-		"WantedBy=default.target",             // user session target, not multi-user.target
+		"WantedBy=default.target", // user session target, not multi-user.target
 		"ExecStart=%h/.local/bin/gasworks-observer",
 		"NoNewPrivileges=true",
 		"EnvironmentFile=%h/.config/gasworks-observer/observer.env",
