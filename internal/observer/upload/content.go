@@ -71,7 +71,7 @@ func (c *Client) PostContent(ctx context.Context, r ContentRequest) (*ContentRes
 	req.Header.Set(headerProvider, strings.ToLower(r.Provider))
 	req.Header.Set(headerSourcePath, r.SourcePath)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.content.Do(req)
 	if err != nil {
 		return nil, classifyDo(err)
 	}

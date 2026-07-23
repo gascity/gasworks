@@ -57,6 +57,45 @@ func TestHTTPSMandatory(t *testing.T) {
 	}
 }
 
+// TestContentClientUsesGenerousTimeout proves whole-transcript content uploads ride a separate HTTP
+// client with a much larger whole-request timeout than the small observation-batch client, so a large
+// body over a slow link is not cut at 30 s and re-sent in a loop.
+func TestContentClientUsesGenerousTimeout(t *testing.T) {
+	c, err := NewClient(Config{
+		Endpoint:   mustURL(t, "https://collector.example.com"),
+		SourceID:   testSourceID,
+		Credential: staticToken("t"),
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if c.http.Timeout != DefaultAttemptTimeout {
+		t.Fatalf("batch client timeout = %s, want %s", c.http.Timeout, DefaultAttemptTimeout)
+	}
+	if c.content.Timeout != DefaultContentTimeout {
+		t.Fatalf("content client timeout = %s, want %s", c.content.Timeout, DefaultContentTimeout)
+	}
+	if c.content.Timeout <= c.http.Timeout {
+		t.Fatalf("content timeout %s must exceed batch timeout %s", c.content.Timeout, c.http.Timeout)
+	}
+	if c.content == c.http {
+		t.Fatal("content upload must not reuse the 30s batch client")
+	}
+	// An explicit override is honored.
+	c2, err := NewClient(Config{
+		Endpoint:       mustURL(t, "https://collector.example.com"),
+		SourceID:       testSourceID,
+		Credential:     staticToken("t"),
+		ContentTimeout: 3 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient override: %v", err)
+	}
+	if c2.content.Timeout != 3*time.Minute {
+		t.Fatalf("override content timeout = %s, want 3m", c2.content.Timeout)
+	}
+}
+
 func TestRedirectRefusedNoCredentialLeak(t *testing.T) {
 	// Server B is the redirect target; it must never receive the request or the credential.
 	bHandler := &recordingHandler{}

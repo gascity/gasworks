@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +34,45 @@ const (
 	// contentTransientHold is the global back-off applied after a transport/5xx failure or a 429 with
 	// no Retry-After, so a persistent server problem does not hot-loop the content POST.
 	contentTransientHold = 15 * time.Second
+	// maxContentHold caps how long a single server-supplied Retry-After can shed content upload, so a
+	// malformed or absurd value cannot silently disable content upload for the whole process lifetime.
+	maxContentHold = 5 * time.Minute
 	// contentMarkerVersion is the on-disk last-uploaded marker schema version.
 	contentMarkerVersion = 1
+	// maxNativeSessionIDLen / maxSourcePathLen mirror the Phase 1a server header-validation limits,
+	// enforced client-side so a structurally invalid transcript never triggers a server 422 loop.
+	maxNativeSessionIDLen = 256
+	maxSourcePathLen      = 1024
 )
+
+// nativeSessionIDPattern mirrors the Phase 1a server's X-Observer-Native-Session-Id contract.
+var nativeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+
+// validContentHeaders reports whether the resolved provenance values satisfy the server's Phase 1a
+// header contract. A transcript that fails this can never produce an accepted upload, so the caller
+// skips it (logging once) instead of POSTing bytes the server will reject with 422.
+func validContentHeaders(nativeID, provider, sourcePath string) bool {
+	if nativeID == "" || len(nativeID) > maxNativeSessionIDLen || !nativeSessionIDPattern.MatchString(nativeID) {
+		return false
+	}
+	if provider != "claude" && provider != "codex" {
+		return false
+	}
+	if len(sourcePath) > maxSourcePathLen || !isPrintableASCII(sourcePath) {
+		return false
+	}
+	return true
+}
+
+// isPrintableASCII reports whether s is entirely printable ASCII (a safe, header-legal value).
+func isPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // ContentSender POSTs one whole-transcript snapshot to the collector's content route. *upload.Client
 // satisfies it; tests substitute a scripted double. It is the ONLY collector seam the content side
@@ -49,6 +87,9 @@ type ContentSender interface {
 // the same native session id the metadata pipeline stamps, without re-parsing the transcript.
 type sessionLookup interface {
 	SessionFor(device, inode uint64) (nativeID, provider string, ok bool)
+	// Forget drops any threaded session state for a transcript identity, so a reused (device,inode)
+	// cannot inherit the previous transcript's native session id.
+	Forget(device, inode uint64)
 }
 
 // transcriptReader reads a whole validated transcript snapshot, refusing an oversize file with
@@ -105,20 +146,29 @@ type contentState struct {
 	observed    bool
 
 	// marker* mirror the persisted last-uploaded marker (loaded lazily). markerHash=="" means nothing
-	// has been uploaded for this identity yet.
-	markerLoaded bool
-	markerHash   string
-	markerSize   int64
-	markerMod    int64
+	// has been uploaded for this identity yet. markerNative/markerProvider carry the native session id
+	// and provider of the last upload so a transcript uploaded at least once can still be keyed after a
+	// daemon restart, when the sink's in-memory session threading is empty (the codex head
+	// SESSION_LIFECYCLE line sits behind the durable cursor and is never re-parsed).
+	markerLoaded   bool
+	markerHash     string
+	markerSize     int64
+	markerMod      int64
+	markerNative   string
+	markerProvider string
 
 	// eval* is the (size,modNanos) of the snapshot last EVALUATED to a non-upload-needed outcome
-	// (uploaded, unchanged, or oversize). A file whose current stat equals eval* is skipped without a
-	// re-read. It is seeded from the marker on load so an unchanged file is not re-read after restart.
+	// (uploaded, unchanged, oversize, invalid, or permanently-rejected). A file whose current stat
+	// equals eval* is skipped without a re-read. It is seeded from the marker on load so an unchanged
+	// file is not re-read after restart.
 	evalSize int64
 	evalMod  int64
 	evalSet  bool
 
-	oversizeLogged bool
+	oversizeLogged  bool
+	invalidLogged   bool
+	readErrLogged   bool
+	permanentLogged bool
 }
 
 // newContentUploader validates cfg and returns a ready uploader.
@@ -148,6 +198,10 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 	if debounce <= 0 {
 		debounce = DefaultContentDebounce
 	}
+	// Sweep any orphaned marker temp files left by a crash mid-persist, so they cannot accumulate
+	// across restarts. The state dir is shared with the watcher's cursor files; we only touch our
+	// own distinctly-prefixed temp files.
+	sweepOrphanContentTemps(cfg.stateDir)
 	return &contentUploader{
 		sender:   cfg.sender,
 		sessions: cfg.sessions,
@@ -199,6 +253,7 @@ func (u *contentUploader) tick(ctx context.Context) {
 	type job struct {
 		id                  transcriptIdentity
 		root, locator, path string
+		native, provider    string
 	}
 	var jobs []job
 	for id, st := range u.files {
@@ -209,7 +264,27 @@ func (u *contentUploader) tick(ctx context.Context) {
 		if st.evalSet && st.size == st.evalSize && st.modNanos == st.evalMod {
 			continue // unchanged since the last snapshot we handled
 		}
-		jobs = append(jobs, job{id: id, root: st.root, locator: st.locator, path: st.path})
+		// Resolve the native session id BEFORE any whole-file read/hash. Prefer the live sink; fall
+		// back to the marker's persisted id so a transcript uploaded at least once still keys after a
+		// restart. Unknown → skip cheaply (no read, no hash); a later tick retries once the session is
+		// threaded or the marker lands. This is the guard that stops an unknown-session transcript from
+		// being fully re-read and re-hashed on every tick.
+		native, provider, ok := u.resolveSessionLocked(id, st)
+		if !ok {
+			continue
+		}
+		// Enforce the server's header contract client-side. A structurally invalid value can never be
+		// accepted, so record the current stat as evaluated (skip future re-reads) and log once instead
+		// of POSTing bytes the server would reject with 422.
+		if !validContentHeaders(native, provider, st.path) {
+			if !st.invalidLogged {
+				u.logf("content upload: skipping %s: invalid provenance (session=%q provider=%q path-bytes=%d)", st.locator, native, provider, len(st.path))
+				st.invalidLogged = true
+			}
+			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
+			continue
+		}
+		jobs = append(jobs, job{id: id, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider})
 	}
 	u.mu.Unlock()
 
@@ -217,13 +292,36 @@ func (u *contentUploader) tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		u.processOne(ctx, j.id, j.root, j.locator, j.path)
+		// A shed (429) or provision/auth latch (401/403/404/501) recorded while processing an earlier
+		// job in this same tick must stop the rest — re-check before each POST, not only at tick entry.
+		u.mu.Lock()
+		stop := u.disabled || (!u.holdUntil.IsZero() && u.now().Before(u.holdUntil))
+		u.mu.Unlock()
+		if stop {
+			return
+		}
+		u.processOne(ctx, j.id, j.root, j.locator, j.path, j.native, j.provider)
 	}
 }
 
+// resolveSessionLocked resolves the native session id + provider for a transcript, preferring the
+// live sink threading and falling back to the last-uploaded marker's persisted identity (which
+// survives a restart). Called under u.mu.
+func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *contentState) (native, provider string, ok bool) {
+	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
+		return n, p, true
+	}
+	if st.markerNative != "" {
+		return st.markerNative, st.markerProvider, true
+	}
+	return "", "", false
+}
+
 // processOne reads, hashes, and (if changed) uploads one transcript's whole content, then records
-// the outcome. All slow work (file read, network POST) runs without u.mu held.
-func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity, root, locator, path string) {
+// the outcome. The native session id + provider are already resolved and validated by the caller, so
+// no whole-file read happens for a transcript whose session id is unknown or structurally invalid.
+// All slow work (file read, network POST) runs without u.mu held.
+func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity, root, locator, path, native, provider string) {
 	content, rsize, rmod, err := u.read(root, locator, id.device, id.inode, u.maxBytes)
 	if errors.Is(err, codex.ErrTranscriptTooLarge) {
 		u.mu.Lock()
@@ -239,8 +337,19 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	}
 	if err != nil {
 		// Vanished / rotated / transient read error: best-effort, retry on a later tick. Do not
-		// advance eval so the next stable observation re-reads.
-		u.logf("content upload: read %s: %v", locator, err)
+		// advance eval so the next stable observation re-reads. Log at most once per error streak so a
+		// transcript deleted between the poll that observed it and the reconcile that GCs it does not
+		// spam a log line every tick in that window.
+		u.mu.Lock()
+		logIt := true
+		if st := u.files[id]; st != nil {
+			logIt = !st.readErrLogged
+			st.readErrLogged = true
+		}
+		u.mu.Unlock()
+		if logIt {
+			u.logf("content upload: read %s: %v", locator, err)
+		}
 		return
 	}
 
@@ -253,10 +362,13 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.mu.Unlock()
 		return
 	}
+	st.readErrLogged = false
 	if st.markerHash != "" && hash == st.markerHash {
 		// Content identical to the last upload (e.g. only the mtime moved): idempotent no-op. Advance
-		// the marker's stat so future ticks skip the re-read; do not re-POST.
+		// the marker's stat so future ticks skip the re-read; do not re-POST. Refresh the persisted
+		// session identity so a later restart can still key this transcript.
 		st.markerSize, st.markerMod = rsize, rmod
+		st.markerNative, st.markerProvider = native, provider
 		st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
 		marker := st.markerRecord(id, u.now())
 		u.mu.Unlock()
@@ -264,13 +376,6 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		return
 	}
 	u.mu.Unlock()
-
-	native, provider, ok := u.sessions.SessionFor(id.device, id.inode)
-	if !ok {
-		// The transcript's session record has not been parsed yet, so we cannot key the snapshot.
-		// Skip without advancing; a later tick retries once the session id is known.
-		return
-	}
 
 	res, err := u.sender.PostContent(ctx, upload.ContentRequest{
 		NativeSessionID: native,
@@ -292,7 +397,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	case res.StatusCode == 200 || res.StatusCode == 201:
 		var marker contentMarker
 		if st != nil {
-			st.setUploaded(hash, rsize, rmod)
+			st.setUploaded(hash, rsize, rmod, native, provider)
 			marker = st.markerRecord(id, now)
 		}
 		u.mu.Unlock()
@@ -305,7 +410,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.
 		var marker contentMarker
 		if st != nil {
-			st.setUploaded(hash, rsize, rmod)
+			st.setUploaded(hash, rsize, rmod, native, provider)
 			marker = st.markerRecord(id, now)
 		}
 		u.mu.Unlock()
@@ -314,17 +419,40 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		}
 		u.logf("content upload: 409 content mismatch for session %s; advancing", native)
 	case res.StatusCode == 429:
+		// Shed: honor Retry-After, but cap it so an absurd value cannot disable upload for the run.
 		hold := res.RetryAfter
 		if hold <= 0 {
 			hold = contentTransientHold
 		}
+		if hold > maxContentHold {
+			hold = maxContentHold
+		}
 		u.holdUntil = now.Add(hold)
 		u.mu.Unlock()
 		u.logf("content upload: 429 shed; backing off %s", hold)
-	case res.StatusCode == 501:
+	case res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 404 || res.StatusCode == 501:
+		// Provisioning / authorization / route failure: content upload cannot work for this run at
+		// all (the credential, tenant provisioning, or route will not change), so latch off rather
+		// than retry every transcript forever. A restart re-probes.
 		u.disabled = true
 		u.mu.Unlock()
-		u.logf("content upload: 501 not provisioned; disabling content upload for this run")
+		u.logf("content upload: status %d; disabling content upload for this run", res.StatusCode)
+	case res.StatusCode == 400 || res.StatusCode == 413 || res.StatusCode == 422:
+		// Permanent for THESE bytes (malformed / too large / contract violation the client guard
+		// missed): record the hash in memory so identical bytes are not re-POSTed, advance eval so the
+		// file is not re-read, but do NOT persist (a restart re-probes) and do NOT arm the global hold
+		// (other transcripts may upload fine). A genuine content change produces a new hash and is
+		// retried once.
+		if st != nil {
+			st.markerHash = hash
+			st.markerNative, st.markerProvider = native, provider
+			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+			if !st.permanentLogged {
+				u.logf("content upload: permanent status %d for session %s; not retrying identical bytes", res.StatusCode, native)
+				st.permanentLogged = true
+			}
+		}
+		u.mu.Unlock()
 	default:
 		u.holdUntil = now.Add(contentTransientHold)
 		u.mu.Unlock()
@@ -333,11 +461,13 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 }
 
 // setUploaded records a successful (or advanced) upload of the given snapshot, so future ticks
-// dedup against it in memory.
-func (st *contentState) setUploaded(hash string, size, mod int64) {
+// dedup against it in memory and a restart can re-key the transcript from the persisted identity.
+func (st *contentState) setUploaded(hash string, size, mod int64, native, provider string) {
 	st.markerHash = hash
 	st.markerSize = size
 	st.markerMod = mod
+	st.markerNative = native
+	st.markerProvider = provider
 	st.markerLoaded = true
 	st.evalSize = size
 	st.evalMod = mod
@@ -359,6 +489,8 @@ func (u *contentUploader) ensureMarkerLoadedLocked(id transcriptIdentity, st *co
 	st.markerHash = m.ContentSHA256
 	st.markerSize = m.Size
 	st.markerMod = m.ModNanos
+	st.markerNative = m.NativeSessionID
+	st.markerProvider = m.Provider
 	st.evalSize = m.Size
 	st.evalMod = m.ModNanos
 	st.evalSet = true
@@ -367,25 +499,29 @@ func (u *contentUploader) ensureMarkerLoadedLocked(id transcriptIdentity, st *co
 // contentMarker is the atomic on-disk record of the last content snapshot uploaded for a transcript
 // identity. It survives a restart so the daemon does not re-ship every transcript on boot.
 type contentMarker struct {
-	Version       int    `json:"version"`
-	Device        uint64 `json:"device"`
-	Inode         uint64 `json:"inode"`
-	ContentSHA256 string `json:"content_sha256"`
-	Size          int64  `json:"size"`
-	ModNanos      int64  `json:"observed_mtime_nanos"`
-	UploadedAt    string `json:"uploaded_at"`
+	Version         int    `json:"version"`
+	Device          uint64 `json:"device"`
+	Inode           uint64 `json:"inode"`
+	ContentSHA256   string `json:"content_sha256"`
+	Size            int64  `json:"size"`
+	ModNanos        int64  `json:"observed_mtime_nanos"`
+	NativeSessionID string `json:"native_session_id,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	UploadedAt      string `json:"uploaded_at"`
 }
 
 // markerRecord projects the in-memory upload state into a persistable marker.
 func (st *contentState) markerRecord(id transcriptIdentity, now time.Time) contentMarker {
 	return contentMarker{
-		Version:       contentMarkerVersion,
-		Device:        id.device,
-		Inode:         id.inode,
-		ContentSHA256: st.markerHash,
-		Size:          st.markerSize,
-		ModNanos:      st.markerMod,
-		UploadedAt:    now.UTC().Format(time.RFC3339Nano),
+		Version:         contentMarkerVersion,
+		Device:          id.device,
+		Inode:           id.inode,
+		ContentSHA256:   st.markerHash,
+		Size:            st.markerSize,
+		ModNanos:        st.markerMod,
+		NativeSessionID: st.markerNative,
+		Provider:        st.markerProvider,
+		UploadedAt:      now.UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -453,6 +589,40 @@ func (u *contentUploader) persistMarker(id transcriptIdentity, m contentMarker) 
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		u.logf("content upload: rename marker: %v", err)
+	}
+}
+
+// ForgetContent releases all state for a transcript identity the watcher has dropped (fully rotated
+// away / deleted): the in-memory bookkeeping, the durable marker file, and the sink's threaded
+// session id. Mirroring the cursor GC, this bounds memory + on-disk markers for a long-lived daemon
+// and stops a vanished transcript from being re-read every tick, and it ensures a later file that
+// reuses the same (device,inode) starts fresh rather than resurrecting a stale marker or session id.
+func (u *contentUploader) ForgetContent(device, inode uint64) {
+	id := transcriptIdentity{device: device, inode: inode}
+	u.mu.Lock()
+	delete(u.files, id)
+	u.mu.Unlock()
+	_ = os.Remove(contentMarkerPath(u.stateDir, device, inode))
+	if u.sessions != nil {
+		u.sessions.Forget(device, inode)
+	}
+}
+
+// sweepOrphanContentTemps removes marker temp files left by a crash between CreateTemp and rename, so
+// they cannot accumulate across restarts. It only removes our own distinctly-prefixed temp files and
+// silently tolerates an absent state dir (nothing has been written yet).
+func sweepOrphanContentTemps(stateDir string) {
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), ".tmp-content-marker-") {
+			_ = os.Remove(filepath.Join(stateDir, e.Name()))
+		}
 	}
 }
 
