@@ -4,6 +4,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -810,5 +811,78 @@ func TestContentUploadCapsRetryAfter(t *testing.T) {
 	h.u.mu.Unlock()
 	if !got.Equal(want) {
 		t.Fatalf("holdUntil = %v, want capped at %v", got, want)
+	}
+}
+
+// Theme B residual: a permanent-4xx rejection is never durably persisted, even when a later
+// mtime-only bump routes the identical bytes through the idempotent no-op path — so a restart still
+// re-probes the transcript.
+func TestContentUploadPermanent422NeverPersistedViaNoOp(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 422}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 111, 112
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background()) // POST → 422: in-memory dedup only, no marker persisted
+	markerPath := contentMarkerPath(h.stateDir, dev, ino)
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("422 rejection persisted a marker: %v", err)
+	}
+
+	// mtime-only bump, identical content: the no-op path must NOT promote the rejected hash to disk.
+	h.reader.set(dev, ino, "body", 2)
+	h.observe(dev, ino, "/p", 4, 2)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("mtime-bump no-op durably persisted 422-rejected bytes: %v", err)
+	}
+	if sender.count() != 1 {
+		t.Fatalf("re-POSTed rejected bytes: %d", sender.count())
+	}
+}
+
+// Theme F residual: a snapshot that keeps failing to POST (e.g. too slow to finish within the
+// content timeout) is given up on after a bounded number of attempts instead of being re-read +
+// re-hashed + re-POSTed forever; a content change re-arms retries.
+func TestContentUploadGivesUpAfterRepeatedPostFailures(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return nil, errors.New("transport timeout")
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 121, 122
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+
+	for i := 0; i < 10; i++ {
+		h.clock.advance(31 * time.Second) // past the transient hold each time
+		h.u.tick(context.Background())
+	}
+	if got := h.reader.readCount(); got > maxContentPostAttempts {
+		t.Fatalf("kept re-reading a doomed snapshot: %d reads, want <= %d", got, maxContentPostAttempts)
+	}
+	n := 0
+	for _, l := range h.logLines() {
+		if strings.Contains(l, "giving up on") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("give-up logged %d times, want 1", n)
+	}
+
+	// A content change is a new snapshot: retries re-arm.
+	before := h.reader.readCount()
+	h.reader.set(dev, ino, "body-grown-more", 2)
+	h.observe(dev, ino, "/p", 15, 2)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.reader.readCount() <= before {
+		t.Fatalf("content change did not re-arm retry: reads stayed at %d", before)
 	}
 }

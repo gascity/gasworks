@@ -37,6 +37,11 @@ const (
 	// maxContentHold caps how long a single server-supplied Retry-After can shed content upload, so a
 	// malformed or absurd value cannot silently disable content upload for the whole process lifetime.
 	maxContentHold = 5 * time.Minute
+	// maxContentPostAttempts bounds how many times a single stable snapshot is re-read + re-hashed +
+	// re-POSTed after transport/retryable failures before the uploader gives up on THAT snapshot (until
+	// its content changes). Without it, a within-cap transcript that cannot finish within the content
+	// timeout (a slow link) would re-read+re-hash the whole file every backoff forever.
+	maxContentPostAttempts = 5
 	// contentMarkerVersion is the on-disk last-uploaded marker schema version.
 	contentMarkerVersion = 1
 	// maxNativeSessionIDLen / maxSourcePathLen mirror the Phase 1a server header-validation limits,
@@ -165,10 +170,23 @@ type contentState struct {
 	evalMod  int64
 	evalSet  bool
 
+	// uploaded records whether markerHash came from a real acceptance (2xx / 409) rather than a
+	// permanent-4xx rejection. Only a real acceptance may be durably persisted; a rejected hash is kept
+	// as in-memory dedup only, so a restart re-probes it (the 400/413/422 intent).
+	uploaded bool
+
+	// postFail* count consecutive failed POSTs against a single (size,mod) snapshot so a snapshot that
+	// keeps failing (e.g. a file too slow to finish within the content timeout) is eventually given up
+	// on instead of re-read/re-hashed/re-POSTed forever; a stat change or a success resets them.
+	postFailSize  int64
+	postFailMod   int64
+	postFailCount int
+
 	oversizeLogged  bool
 	invalidLogged   bool
 	readErrLogged   bool
 	permanentLogged bool
+	giveUpLogged    bool
 }
 
 // newContentUploader validates cfg and returns a ready uploader.
@@ -364,15 +382,20 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	}
 	st.readErrLogged = false
 	if st.markerHash != "" && hash == st.markerHash {
-		// Content identical to the last upload (e.g. only the mtime moved): idempotent no-op. Advance
-		// the marker's stat so future ticks skip the re-read; do not re-POST. Refresh the persisted
-		// session identity so a later restart can still key this transcript.
-		st.markerSize, st.markerMod = rsize, rmod
-		st.markerNative, st.markerProvider = native, provider
+		// Content identical to the last handled snapshot (e.g. only the mtime moved): idempotent no-op.
+		// Advance eval so future ticks skip the re-read and do not re-POST. Only refresh + persist the
+		// durable marker when the hash came from a REAL acceptance; a hash recorded from a permanent-4xx
+		// rejection stays in-memory-only so a restart still re-probes it (the 400/413/422 intent).
 		st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
-		marker := st.markerRecord(id, u.now())
+		if st.uploaded {
+			st.markerSize, st.markerMod = rsize, rmod
+			st.markerNative, st.markerProvider = native, provider
+			marker := st.markerRecord(id, u.now())
+			u.mu.Unlock()
+			u.persistMarker(id, marker)
+			return
+		}
 		u.mu.Unlock()
-		u.persistMarker(id, marker)
 		return
 	}
 	u.mu.Unlock()
@@ -389,8 +412,15 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	st = u.files[id]
 	if err != nil {
 		u.holdUntil = now.Add(contentTransientHold)
+		gaveUp := false
+		if st != nil {
+			gaveUp = st.recordPostFailureLocked(rsize, rmod)
+		}
 		u.mu.Unlock()
 		u.logf("content upload: POST %s: %v", locator, err)
+		if gaveUp {
+			u.logf("content upload: giving up on %s after %d failed attempts on this snapshot; will retry when it changes", locator, maxContentPostAttempts)
+		}
 		return
 	}
 	switch {
@@ -445,6 +475,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// retried once.
 		if st != nil {
 			st.markerHash = hash
+			st.uploaded = false // in-memory dedup only; a restart re-probes (do not persist)
 			st.markerNative, st.markerProvider = native, provider
 			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
 			if !st.permanentLogged {
@@ -455,9 +486,33 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.mu.Unlock()
 	default:
 		u.holdUntil = now.Add(contentTransientHold)
+		gaveUp := false
+		if st != nil {
+			gaveUp = st.recordPostFailureLocked(rsize, rmod)
+		}
 		u.mu.Unlock()
 		u.logf("content upload: unexpected status %d for session %s", res.StatusCode, native)
+		if gaveUp {
+			u.logf("content upload: giving up on %s after %d failed attempts on this snapshot; will retry when it changes", locator, maxContentPostAttempts)
+		}
 	}
+}
+
+// recordPostFailureLocked bumps the consecutive-failure counter for the current (size,mod) snapshot
+// and reports whether the uploader should give up on it. Once a single snapshot has failed
+// maxContentPostAttempts times it advances eval so the file is not re-read/re-hashed/re-POSTed until
+// its content changes (a new stat resets the counter and re-arms retries). Called under u.mu.
+func (st *contentState) recordPostFailureLocked(rsize, rmod int64) (gaveUp bool) {
+	if st.postFailSize != rsize || st.postFailMod != rmod {
+		st.postFailSize, st.postFailMod, st.postFailCount, st.giveUpLogged = rsize, rmod, 0, false
+	}
+	st.postFailCount++
+	if st.postFailCount >= maxContentPostAttempts && !st.giveUpLogged {
+		st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+		st.giveUpLogged = true
+		return true
+	}
+	return false
 }
 
 // setUploaded records a successful (or advanced) upload of the given snapshot, so future ticks
@@ -469,9 +524,11 @@ func (st *contentState) setUploaded(hash string, size, mod int64, native, provid
 	st.markerNative = native
 	st.markerProvider = provider
 	st.markerLoaded = true
+	st.uploaded = true
 	st.evalSize = size
 	st.evalMod = mod
 	st.evalSet = true
+	st.postFailCount, st.giveUpLogged = 0, false
 }
 
 // ensureMarkerLoadedLocked loads the persisted last-uploaded marker the first time a transcript is
@@ -491,6 +548,9 @@ func (u *contentUploader) ensureMarkerLoadedLocked(id transcriptIdentity, st *co
 	st.markerMod = m.ModNanos
 	st.markerNative = m.NativeSessionID
 	st.markerProvider = m.Provider
+	// A persisted marker is only ever written for a real acceptance (2xx / 409); permanent-4xx
+	// rejections are never persisted, so a loaded marker is always a real upload.
+	st.uploaded = true
 	st.evalSize = m.Size
 	st.evalMod = m.ModNanos
 	st.evalSet = true
