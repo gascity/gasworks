@@ -37,6 +37,10 @@ func runDaemon(args []string) int {
 	collector := fs.String("collector", "", "Collector base URL; enables the uploader")
 	tokenFile := fs.String("token-file", "", "bearer token file (rotating), required with -collector")
 	allowLoopbackHTTP := fs.Bool("allow-loopback-http", false, "permit a plain-http loopback collector (dev only)")
+	// Content upload (Phase 1b) is opt-in and OFF by default: with it off the daemon is metadata-only,
+	// exactly as before. It reuses the -collector base + -token-file credential (no second endpoint or
+	// credential) and requires the watcher (-approved-root). OBSERVER_CONTENT_UPLOAD=1 sets the default.
+	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and -approved-root)")
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
@@ -71,12 +75,22 @@ func runDaemon(args []string) int {
 	}
 
 	if *collector != "" {
-		up, err := buildUploadConfig(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP)
+		client, err := buildCollectorClient(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
 			return 2
 		}
-		cfg.Upload = up
+		cfg.Upload = &daemon.UploadLoopConfig{Sender: client}
+		if *contentUpload {
+			if len(approvedRoots) == 0 {
+				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root; running metadata-only")
+			} else {
+				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
+				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
+			}
+		}
+	} else if *contentUpload {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
 	}
 	if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
@@ -102,9 +116,11 @@ func runDaemon(args []string) int {
 	return 0
 }
 
-// buildUploadConfig constructs the uploader loop config from the collector endpoint and a rotating
-// token file. The credential is read fresh per attempt by the E1.9 client.
-func buildUploadConfig(endpoint, sourceID, tokenFile string, allowLoopbackHTTP bool) (*daemon.UploadLoopConfig, error) {
+// buildCollectorClient constructs the authenticated collector client from the endpoint and a
+// rotating token file. The credential is read fresh per attempt by the E1.9 client. The same client
+// serves both the observation-batch uploader and the whole-transcript content side channel, so
+// content upload never introduces a second endpoint or credential.
+func buildCollectorClient(endpoint, sourceID, tokenFile string, allowLoopbackHTTP bool) (*upload.Client, error) {
 	if tokenFile == "" {
 		return nil, fmt.Errorf("-token-file is required with -collector")
 	}
@@ -121,7 +137,18 @@ func buildUploadConfig(endpoint, sourceID, tokenFile string, allowLoopbackHTTP b
 	if err != nil {
 		return nil, fmt.Errorf("build collector client: %w", err)
 	}
-	return &daemon.UploadLoopConfig{Sender: client}, nil
+	return client, nil
+}
+
+// envTrue reports whether an environment variable is set to a truthy value (1/true/yes/on), used to
+// derive a flag's default from the environment.
+func envTrue(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // newWatchLoopConfig builds the transcript watcher config from the approved roots, the durable

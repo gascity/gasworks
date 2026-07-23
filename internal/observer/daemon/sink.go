@@ -219,6 +219,26 @@ func (a *CandidateSinkAdapter) resolveSession(ref codex.TranscriptRef, cand *cod
 	return s.nativeID, s.provider, false
 }
 
+// SessionFor returns the native session id and provider threaded for the transcript identified by
+// (device, inode) — the same identity the watcher's cursor and the content side channel key on — or
+// ok=false when no SESSION_LIFECYCLE record has yet been observed for it. It lets the content
+// uploader key a whole-transcript snapshot by the exact native session id the metadata observations
+// carry, without re-parsing. A session whose own record omitted the provider falls back to the sink
+// default provider, matching how DeliverCandidates stamps provenance.
+func (a *CandidateSinkAdapter) SessionFor(device, inode uint64) (nativeID, provider string, ok bool) {
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	s := a.sessions[transcriptIdentity{device: device, inode: inode}]
+	if s == nil || s.nativeID == "" {
+		return "", "", false
+	}
+	prov := s.provider
+	if prov == "" {
+		prov = a.provider
+	}
+	return s.nativeID, prov, true
+}
+
 // runContextFor returns the run context to stamp onto a session's observation, or nil when the
 // session has no wrapper binding (passive capture). A bound session's USAGE/SESSION observation
 // carries the explicit run id under DECLARED_BOUNDARY membership — the wrapper declared the run and
