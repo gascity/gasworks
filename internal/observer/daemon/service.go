@@ -59,6 +59,9 @@ type Service struct {
 	watcher       *codex.Watcher
 	watchInterval time.Duration
 
+	content         *contentUploader
+	contentInterval time.Duration
+
 	now func() time.Time
 	log func(string)
 
@@ -109,6 +112,11 @@ type ServiceConfig struct {
 	Upload *UploadLoopConfig
 	// Watch, when non-nil, enables the Codex transcript watcher.
 	Watch *WatchLoopConfig
+	// ContentUpload, when non-nil AND Watch is set, enables the whole-transcript content side
+	// channel. It reuses the watcher (for per-transcript observations + native-session lookup) and
+	// its Sender must be the same authenticated collector client the observation uploader uses.
+	// It is opt-in and never changes the metadata-only behavior when nil.
+	ContentUpload *ContentUploadLoopConfig
 
 	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects SO_PEERCRED.
 	PeerUID func(*net.UnixConn) (uint32, error)
@@ -127,6 +135,23 @@ type UploadLoopConfig struct {
 	// Retry bounds the delivery retry loop.
 	Retry upload.RetryPolicy
 	// Interval is the ticker cadence; 0 selects DefaultUploadInterval.
+	Interval time.Duration
+}
+
+// ContentUploadLoopConfig configures the whole-transcript content side channel. Sender is required
+// (the shared collector client). StateDir defaults to the watcher's cursor state dir; the numeric
+// bounds fall back to their package defaults when zero.
+type ContentUploadLoopConfig struct {
+	// Sender POSTs whole-file snapshots to the collector content route (the shared *upload.Client).
+	Sender ContentSender
+	// StateDir persists the per-transcript last-uploaded markers; "" reuses WatchLoopConfig.StateDir.
+	StateDir string
+	// MaxBytes bounds a single whole-file upload; 0 selects DefaultMaxContentBytes.
+	MaxBytes int64
+	// Debounce is how long a transcript must be stable before its content is uploaded; 0 selects
+	// DefaultContentDebounce.
+	Debounce time.Duration
+	// Interval is the content-loop ticker cadence; 0 selects DefaultContentInterval.
 	Interval time.Duration
 }
 
@@ -240,9 +265,27 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		s.uploadInterval = durationOr(cfg.Upload.Interval, DefaultUploadInterval)
 	}
 
-	// 5. Prepare the transcript watcher (it dials the same socket the server listens on).
+	// 5. Prepare the transcript watcher (it dials the same socket the server listens on). When
+	// content upload is enabled, its uploader is wired in as the watcher's content observer so the
+	// same per-poll pass that drains the tail also feeds the whole-file side channel.
 	if cfg.Watch != nil {
-		w, err := s.buildWatcher(cfg.Watch, srv.SocketPath())
+		sink, err := s.buildSink(cfg.Watch, srv.SocketPath())
+		if err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
+		var obs codex.ContentObserver
+		if cfg.ContentUpload != nil {
+			cu, err := s.buildContentUploader(cfg, sink)
+			if err != nil {
+				_ = sp.Close()
+				return nil, err
+			}
+			s.content = cu
+			s.contentInterval = durationOr(cfg.ContentUpload.Interval, DefaultContentInterval)
+			obs = cu
+		}
+		w, err := s.buildWatcher(cfg.Watch, sink, obs)
 		if err != nil {
 			_ = sp.Close()
 			return nil, err
@@ -296,9 +339,10 @@ func daemonAlive(socketPath string) bool {
 	return err == nil
 }
 
-// buildWatcher wires the committed candidate sink (with the partial-commit refinement) over a
-// local client onto a codex watcher.
-func (s *Service) buildWatcher(cfg *WatchLoopConfig, socketPath string) (*codex.Watcher, error) {
+// buildSink constructs the committed candidate sink over a local client. It is split from the
+// watcher build so the content uploader can share the same sink's native-session threading (its
+// SessionFor read seam) rather than re-parsing transcripts.
+func (s *Service) buildSink(cfg *WatchLoopConfig, socketPath string) (*CandidateSinkAdapter, error) {
 	provider := cfg.Provider
 	if provider == "" {
 		provider = codex.Provider
@@ -321,19 +365,53 @@ func (s *Service) buildWatcher(cfg *WatchLoopConfig, socketPath string) (*codex.
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build candidate sink: %w", err)
 	}
+	return sink, nil
+}
+
+// buildWatcher wires the committed candidate sink (with the partial-commit refinement) onto a codex
+// watcher, plus the optional whole-file content observer (nil when content upload is disabled).
+func (s *Service) buildWatcher(cfg *WatchLoopConfig, sink *CandidateSinkAdapter, obs codex.ContentObserver) (*codex.Watcher, error) {
 	w, err := codex.NewWatcher(codex.WatchConfig{
-		ApprovedRoots: cfg.ApprovedRoots,
-		StateDir:      cfg.StateDir,
-		References:    cfg.References,
-		Sink:          NewPartialCandidateSinkAdapter(sink),
-		Match:         cfg.Match,
-		Interval:      cfg.Interval,
-		Now:           s.now,
+		ApprovedRoots:   cfg.ApprovedRoots,
+		StateDir:        cfg.StateDir,
+		References:      cfg.References,
+		Sink:            NewPartialCandidateSinkAdapter(sink),
+		ContentObserver: obs,
+		Match:           cfg.Match,
+		Interval:        cfg.Interval,
+		Now:             s.now,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build watcher: %w", err)
 	}
 	return w, nil
+}
+
+// buildContentUploader wires the whole-transcript content side channel over the shared collector
+// sender and the sink's native-session lookup. Its markers persist in the content state dir, which
+// defaults to the watcher's cursor state dir (outside the approved roots, so they are never tailed).
+func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAdapter) (*contentUploader, error) {
+	if cfg.ContentUpload.Sender == nil {
+		return nil, errors.New("observer daemon: content upload requires a sender")
+	}
+	stateDir := cfg.ContentUpload.StateDir
+	if stateDir == "" {
+		stateDir = cfg.Watch.StateDir
+	}
+	cu, err := newContentUploader(contentUploaderConfig{
+		sender:   cfg.ContentUpload.Sender,
+		sessions: sink,
+		stateDir: stateDir,
+		maxBytes: cfg.ContentUpload.MaxBytes,
+		debounce: cfg.ContentUpload.Debounce,
+		read:     codex.ReadValidatedTranscript,
+		now:      s.now,
+		log:      s.log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)
+	}
+	return cu, nil
 }
 
 // Start begins serving on the socket and launches the uploader and watcher loops. It is safe to
@@ -371,6 +449,13 @@ func (s *Service) Start() error {
 		go func() {
 			defer s.wg.Done()
 			s.runWatchLoop(s.loopCtx)
+		}()
+	}
+	if s.content != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runContentLoop(s.loopCtx)
 		}()
 	}
 	s.ready = true
@@ -498,6 +583,22 @@ func (s *Service) runWatchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-time.After(watchRestartBackoff):
+		}
+	}
+}
+
+// runContentLoop drives the whole-transcript content side channel on a bounded ticker until ctx is
+// cancelled. Each tick is best-effort and self-contained; a failure only backs the uploader off and
+// never affects the watcher or the observation uploader.
+func (s *Service) runContentLoop(ctx context.Context) {
+	t := time.NewTicker(s.contentInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.content.tick(ctx)
 		}
 	}
 }
