@@ -127,6 +127,36 @@ type PartialCandidateSink interface {
 // prove the watcher only ever reads O(new bytes); the default is readRangeAt.
 type ReadRangeFunc func(f *os.File, off, length int64) ([]byte, error)
 
+// ContentObservation reports one tracked transcript's current filesystem identity, path, and stat
+// after a poll drained its tail. It is the input to an optional whole-file side channel (Phase 1b
+// content upload): the identity + root + locator let the consumer re-open the same file through the
+// watcher's race-free validated open, and Size/ModNanos are the cheap debounce signal (a file that
+// has stopped growing is stable). It carries no transcript content — the consumer reads that itself,
+// on demand, only when it decides to upload.
+type ContentObservation struct {
+	// Root is the approved root the file was discovered beneath (the openat2 anchor).
+	Root string
+	// Locator is the file path relative to Root (never absolute), for the validated re-open.
+	Locator string
+	// Path is the current absolute path, for provenance (the content endpoint's source-path header).
+	Path string
+	// Device / Inode are the filesystem identity the cursor and session-threading key on.
+	Device uint64
+	Inode  uint64
+	// Size / ModNanos are the current stat, the debounce (stability) signal.
+	Size     int64
+	ModNanos int64
+}
+
+// ContentObserver is an optional seam the watcher notifies once per tracked file per poll, right
+// after the file's tail has been drained, with the file's current identity/path/stat. It is a
+// fire-and-forget side channel: the watcher ignores whatever it does, so a slow or failing content
+// consumer can never stall or fail the metadata poll. Implementations MUST return promptly (record
+// cheap state; do network I/O elsewhere).
+type ContentObserver interface {
+	ObserveContent(ctx context.Context, obs ContentObservation)
+}
+
 const (
 	// DefaultPollInterval is the steady-state poll cadence when WatchConfig.Interval is unset. It
 	// is a substitute for the absent filesystem-notification signal; the endpoint budget tunes it.
@@ -164,6 +194,10 @@ type WatchConfig struct {
 	MaxReadChunk int64
 	// ReadRange overrides the file-tail reader; nil uses readRangeAt.
 	ReadRange ReadRangeFunc
+	// ContentObserver, when non-nil, is notified once per tracked file per poll (after its tail is
+	// drained) with the file's current identity/path/stat, driving the optional whole-file content
+	// side channel. It never affects the metadata poll's success or cursor advancement.
+	ContentObserver ContentObserver
 	// Now overrides the clock (unused by Poll; Run's ticker uses Interval). nil uses time.Now.
 	Now func() time.Time
 }
@@ -430,6 +464,11 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 
+	// The file is open and its identity is corroborated: size/mod are the current stat. Notify the
+	// optional content side channel before touching the tail. This is a cheap, fire-and-forget hook
+	// (it must not block); it never affects the tail read or cursor advancement below.
+	w.observeContent(ctx, tf, size, mod)
+
 	readOff := tf.cursor.ReadOffset()
 	if size <= readOff {
 		tf.cursor.observe(size, mod)
@@ -478,6 +517,59 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 	return derr
+}
+
+// observeContent fires the optional content side channel for one tracked file with its current
+// stat. It is a no-op when no observer is configured, and the observer's contract forbids blocking,
+// so this never delays the poll.
+func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, modNanos int64) {
+	if w.cfg.ContentObserver == nil {
+		return
+	}
+	w.cfg.ContentObserver.ObserveContent(ctx, ContentObservation{
+		Root:     tf.root,
+		Locator:  tf.locator,
+		Path:     tf.path,
+		Device:   tf.dev,
+		Inode:    tf.ino,
+		Size:     size,
+		ModNanos: modNanos,
+	})
+}
+
+// ErrTranscriptTooLarge reports that a transcript exceeds the caller's whole-file content ceiling.
+// ReadValidatedTranscript returns it (with the file's true size) instead of reading the file, so a
+// pathologically large transcript is skipped by the content side channel rather than buffered.
+var ErrTranscriptTooLarge = errors.New("codex watcher: transcript exceeds the maximum content size")
+
+// ReadValidatedTranscript reads the whole current content of the transcript identified by
+// (root, locator, dev, ino) through the SAME race-free validated open the tail reader uses: the file
+// is opened relative to a fd on the trusted approved root (RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH) and
+// fstat-validated against the tracked (device,inode) regular-file identity, so no symlink swap or
+// inode reuse after discovery can redirect the read. It refuses a file larger than maxBytes,
+// returning ErrTranscriptTooLarge and the true size without reading any content (maxBytes<=0 disables
+// the ceiling). A file that vanished, was symlink-swapped, went non-regular, or rotated to a new
+// inode returns the same skippable errors openValidatedTranscript reports, which the content side
+// channel treats as "skip this file, retry next poll". This is the accessor the daemon's content
+// upload reads whole snapshots through, keeping the symlink-safe open logic in one place.
+func ReadValidatedTranscript(root, locator string, dev, ino uint64, maxBytes int64) (content []byte, size, modNanos int64, err error) {
+	f, size, modNanos, err := openValidatedTranscript(root, locator, dev, ino)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer f.Close()
+	if maxBytes > 0 && size > maxBytes {
+		return nil, size, modNanos, ErrTranscriptTooLarge
+	}
+	buf := make([]byte, size)
+	n, err := io.ReadFull(f, buf)
+	// A file that shrank between the fstat and the read yields a short read (ErrUnexpectedEOF); a file
+	// that grew is snapshot at the fstat size (the extra tail is captured on a later poll). Neither is
+	// an error — the content endpoint dedups by hash and a later, larger snapshot supersedes.
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return nil, size, modNanos, err
+	}
+	return buf[:n], size, modNanos, nil
 }
 
 // deliverCandidates delivers one poll's candidates and reports how many leading candidates were
