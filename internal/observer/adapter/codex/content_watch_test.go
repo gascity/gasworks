@@ -10,16 +10,30 @@ import (
 	"testing"
 )
 
-// recordingContentObserver records every ContentObservation the watcher fires.
+// recordingContentObserver records every ContentObservation the watcher fires, and every identity it
+// forgets when a transcript is dropped.
 type recordingContentObserver struct {
-	mu  sync.Mutex
-	obs []ContentObservation
+	mu     sync.Mutex
+	obs    []ContentObservation
+	forgot [][2]uint64
 }
 
 func (o *recordingContentObserver) ObserveContent(_ context.Context, obs ContentObservation) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.obs = append(o.obs, obs)
+}
+
+func (o *recordingContentObserver) ForgetContent(device, inode uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.forgot = append(o.forgot, [2]uint64{device, inode})
+}
+
+func (o *recordingContentObserver) forgotten() [][2]uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([][2]uint64(nil), o.forgot...)
 }
 
 func (o *recordingContentObserver) last() (ContentObservation, bool) {
@@ -70,6 +84,50 @@ func TestWatcherFiresContentObserverWithStat(t *testing.T) {
 	got2, _ := obs.last()
 	if got2.Size != info.Size() {
 		t.Fatalf("second obs size = %d, want %d", got2.Size, info.Size())
+	}
+}
+
+// TestWatcherForgetsContentOnDrop proves the watcher notifies the content observer (once) when a
+// tracked transcript is fully removed, at the same reconcile that GCs the cursor state — so the
+// content side channel can release its per-identity state and durable marker.
+func TestWatcherForgetsContentOnDrop(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		ApprovedRoots:   []string{root},
+		StateDir:        state,
+		Sink:            &recordingSink{},
+		ContentObserver: obs,
+	})
+
+	writeFileString(t, p, msgLine("a")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll 1: %v", err)
+	}
+	pinfo, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	dev, ino, ok := fileIdentityOf(pinfo)
+	if !ok {
+		t.Fatalf("file identity")
+	}
+	if len(obs.forgotten()) != 0 {
+		t.Fatalf("forgot before drop: %v", obs.forgotten())
+	}
+
+	// Remove the transcript; the next poll must GC the identity and forget the content state.
+	if err := os.Remove(p); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll 2: %v", err)
+	}
+	got := obs.forgotten()
+	if len(got) != 1 || got[0] != [2]uint64{dev, ino} {
+		t.Fatalf("forgot = %v, want exactly [(%d,%d)]", got, dev, ino)
 	}
 }
 

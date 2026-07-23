@@ -31,6 +31,13 @@ const (
 // when the caller supplies no context deadline. Timeouts are always bounded.
 const DefaultAttemptTimeout = 30 * time.Second
 
+// DefaultContentTimeout bounds a single whole-transcript content upload. It is far larger
+// than DefaultAttemptTimeout because a content POST streams the entire transcript (up to
+// hundreds of MiB) rather than a small observation batch, and the 30 s attempt timeout would
+// otherwise cut a large upload over a slow link and force a wasteful re-read/re-hash/re-send
+// loop. It is still bounded so a hung server cannot stall the content loop forever.
+const DefaultContentTimeout = 10 * time.Minute
+
 // maxResponseBytes bounds a decoded response body so a hostile or misconfigured server
 // cannot exhaust memory. Ack and capabilities responses are small typed JSON.
 const maxResponseBytes int64 = 1 << 20
@@ -282,6 +289,10 @@ type Config struct {
 	Proxy *url.URL
 	// AttemptTimeout bounds a single attempt (0 selects DefaultAttemptTimeout).
 	AttemptTimeout time.Duration
+	// ContentTimeout bounds a single whole-transcript content upload (0 selects
+	// DefaultContentTimeout). It is separate from AttemptTimeout because content bodies are
+	// orders of magnitude larger than observation batches.
+	ContentTimeout time.Duration
 	// AllowLoopbackHTTP permits a plain-HTTP endpoint only when the host is loopback — an
 	// explicit development mode, never a production path.
 	AllowLoopbackHTTP bool
@@ -295,6 +306,7 @@ type Config struct {
 // contract.
 type Client struct {
 	http     *http.Client
+	content  *http.Client
 	base     *url.URL
 	sourceID string
 	cred     CredentialSource
@@ -321,26 +333,37 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, err
 	}
 
+	rt := &http.Transport{
+		// DisableCompression stops the transport from adding Accept-Encoding: gzip and
+		// transparently inflating responses, so the client sees and can reject any
+		// unexpected Content-Encoding rather than silently decoding it.
+		DisableCompression:  true,
+		TLSClientConfig:     tlsCfg,
+		Proxy:               proxyFunc(cfg.Proxy),
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        4,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	// The observation-batch client and the content client share one transport (connection pool,
+	// TLS config, redirect refusal) but carry different whole-request timeouts: batches are small
+	// and bounded at the attempt timeout, whereas a whole-transcript content upload needs a much
+	// larger ceiling so a large body over a slow link is not cut and re-sent in a loop.
 	transport := &http.Client{
 		Timeout:       attemptTimeoutOrDefault(cfg.AttemptTimeout),
 		CheckRedirect: refuseRedirect,
-		Transport: &http.Transport{
-			// DisableCompression stops the transport from adding Accept-Encoding: gzip and
-			// transparently inflating responses, so the client sees and can reject any
-			// unexpected Content-Encoding rather than silently decoding it.
-			DisableCompression:  true,
-			TLSClientConfig:     tlsCfg,
-			Proxy:               proxyFunc(cfg.Proxy),
-			ForceAttemptHTTP2:   true,
-			MaxIdleConns:        4,
-			IdleConnTimeout:     30 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		Transport:     rt,
+	}
+	contentClient := &http.Client{
+		Timeout:       contentTimeoutOrDefault(cfg.ContentTimeout),
+		CheckRedirect: refuseRedirect,
+		Transport:     rt,
 	}
 	base := *cfg.Endpoint
 	base.Path = strings.TrimRight(base.Path, "/")
 	return &Client{
 		http:     transport,
+		content:  contentClient,
 		base:     &base,
 		sourceID: cfg.SourceID,
 		cred:     cfg.Credential,
@@ -419,6 +442,14 @@ func proxyFunc(p *url.URL) func(*http.Request) (*url.URL, error) {
 // any header to the redirect target.
 func refuseRedirect(req *http.Request, _ []*http.Request) error {
 	return fmt.Errorf("%w: %s", ErrRedirectRefused, req.URL.Host)
+}
+
+// contentTimeoutOrDefault selects the whole-transcript content-upload timeout.
+func contentTimeoutOrDefault(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultContentTimeout
+	}
+	return d
 }
 
 func attemptTimeoutOrDefault(d time.Duration) time.Duration {

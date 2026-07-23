@@ -239,6 +239,15 @@ func (a *CandidateSinkAdapter) SessionFor(device, inode uint64) (nativeID, provi
 	return s.nativeID, prov, true
 }
 
+// Forget drops the threaded session state for a transcript identity. The watcher calls it (via the
+// content side channel's ForgetContent) when a transcript has fully rotated away, so a later file
+// that reuses the same (device,inode) cannot inherit the previous transcript's native session id.
+func (a *CandidateSinkAdapter) Forget(device, inode uint64) {
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	delete(a.sessions, transcriptIdentity{device: device, inode: inode})
+}
+
 // runContextFor returns the run context to stamp onto a session's observation, or nil when the
 // session has no wrapper binding (passive capture). A bound session's USAGE/SESSION observation
 // carries the explicit run id under DECLARED_BOUNDARY membership — the wrapper declared the run and

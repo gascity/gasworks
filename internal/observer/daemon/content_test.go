@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -67,8 +68,9 @@ func (f *fakeContentSender) at(i int) upload.ContentRequest {
 }
 
 type fakeSessions struct {
-	mu sync.Mutex
-	m  map[transcriptIdentity][2]string
+	mu     sync.Mutex
+	m      map[transcriptIdentity][2]string
+	forgot []transcriptIdentity
 }
 
 func newSessions() *fakeSessions { return &fakeSessions{m: map[transcriptIdentity][2]string{}} }
@@ -89,9 +91,20 @@ func (f *fakeSessions) SessionFor(dev, ino uint64) (string, string, bool) {
 	return s[0], s[1], true
 }
 
+func (f *fakeSessions) Forget(dev, ino uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := transcriptIdentity{device: dev, inode: ino}
+	if _, ok := f.m[id]; ok {
+		delete(f.m, id)
+		f.forgot = append(f.forgot, id)
+	}
+}
+
 type fakeReader struct {
-	mu sync.Mutex
-	m  map[transcriptIdentity]struct {
+	mu    sync.Mutex
+	reads int
+	m     map[transcriptIdentity]struct {
 		content []byte
 		mod     int64
 	}
@@ -113,9 +126,22 @@ func (r *fakeReader) set(dev, ino uint64, content string, mod int64) {
 	}{content: []byte(content), mod: mod}
 }
 
+func (r *fakeReader) readCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads
+}
+
+func (r *fakeReader) del(dev, ino uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.m, transcriptIdentity{device: dev, inode: ino})
+}
+
 func (r *fakeReader) read(_, _ string, dev, ino uint64, maxBytes int64) ([]byte, int64, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.reads++
 	f, ok := r.m[transcriptIdentity{device: dev, inode: ino}]
 	if !ok {
 		return nil, 0, 0, os.ErrNotExist
@@ -136,6 +162,20 @@ type contentHarness struct {
 	reader   *fakeReader
 	clock    *fakeClock
 	stateDir string
+	logMu    sync.Mutex
+	logs     []string
+}
+
+func (h *contentHarness) appendLog(s string) {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	h.logs = append(h.logs, s)
+}
+
+func (h *contentHarness) logLines() []string {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	return append([]string(nil), h.logs...)
 }
 
 func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness {
@@ -154,6 +194,7 @@ func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness 
 		read:     h.reader.read,
 		now:      h.clock.now,
 		debounce: 30 * time.Second,
+		log:      h.appendLog,
 	}
 	if cfg.maxBytes != 0 {
 		base.maxBytes = cfg.maxBytes
@@ -515,5 +556,259 @@ func TestContentUploadSkipsUnknownSessionThenRetries(t *testing.T) {
 	}
 	if h.sender.at(0).NativeSessionID != "late-sess" {
 		t.Fatalf("native id = %q, want late-sess", h.sender.at(0).NativeSessionID)
+	}
+}
+
+// Theme A: an unknown-session transcript is never whole-file read/hashed — the session id is
+// resolved before any read, so the hot loop that re-read a stable file every tick is gone.
+func TestContentUploadUnknownSessionNotRead(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 31, 32
+	h.reader.set(dev, ino, "body", 1)
+	// Session deliberately unknown.
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	h.clock.advance(1 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 0 {
+		t.Fatalf("uploaded with unknown session: %d", h.sender.count())
+	}
+	if h.reader.readCount() != 0 {
+		t.Fatalf("whole-file read %d times for unknown-session transcript; want 0", h.reader.readCount())
+	}
+}
+
+// Theme A: a codex transcript whose session id is known only from the persisted marker (the sink's
+// in-memory threading is empty after a restart) still uploads its grown content — no permanent loss.
+func TestContentUploadCodexRestartUsesMarkerSession(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 21, 22
+	h.sessions.set(dev, ino, "codex-sess", "codex")
+	h.reader.set(dev, ino, "body-v1", 1)
+	h.observe(dev, ino, "/p", 7, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("initial upload = %d, want 1", h.sender.count())
+	}
+
+	// Restart: a fresh uploader with EMPTY session threading (the codex head SESSION_LIFECYCLE line
+	// is behind the durable cursor and never re-parsed), same state dir + reader. The transcript grew.
+	sender2 := &fakeContentSender{}
+	u2, err := newContentUploader(contentUploaderConfig{
+		sender:   sender2,
+		sessions: newSessions(), // empty
+		stateDir: h.stateDir,
+		read:     h.reader.read,
+		now:      h.clock.now,
+		debounce: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("restart newContentUploader: %v", err)
+	}
+	h.reader.set(dev, ino, "body-v1-and-then-some", 2) // grew → new hash, not a no-op
+	u2.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "s.jsonl", Path: "/p", Device: dev, Inode: ino, Size: 21, ModNanos: 2,
+	})
+	h.clock.advance(31 * time.Second)
+	u2.tick(context.Background())
+	if sender2.count() != 1 {
+		t.Fatalf("post-restart grown transcript not uploaded (data loss): %d", sender2.count())
+	}
+	if got := sender2.at(0).NativeSessionID; got != "codex-sess" {
+		t.Fatalf("native id = %q, want codex-sess recovered from the persisted marker", got)
+	}
+}
+
+// Theme B: a permanent 4xx (422) advances state and is not re-POSTed with identical bytes, and does
+// not arm the global hold or disable the whole feature.
+func TestContentUploadPermanentStatusAdvancesNoLoop(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 422}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 41, 42
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if sender.count() != 1 {
+		t.Fatalf("permanent 422 re-POSTed identical bytes: %d, want 1", sender.count())
+	}
+	if h.u.disabled {
+		t.Fatal("permanent 422 wrongly disabled all content upload")
+	}
+	if !h.u.holdUntil.IsZero() {
+		t.Fatal("permanent 422 wrongly armed the global hold")
+	}
+}
+
+// Theme C: a structurally invalid native session id is skipped client-side (never POSTed, never
+// read), so the server's 422 loop cannot arise.
+func TestContentUploadInvalidSessionSkipped(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 51, 52
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "bad/session id", "codex") // '/' and space violate the contract
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 0 {
+		t.Fatalf("sent an invalid session id: %d", h.sender.count())
+	}
+	if h.reader.readCount() != 0 {
+		t.Fatalf("read a transcript with invalid provenance: %d reads", h.reader.readCount())
+	}
+}
+
+// Theme D: ForgetContent (fired by the watcher on drop) evicts in-memory state, removes the durable
+// marker, and clears the sink's session mapping.
+func TestContentUploadForgetContentEvictsStateAndMarker(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 61, 62
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	markerPath := contentMarkerPath(h.stateDir, dev, ino)
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("marker not written: %v", err)
+	}
+
+	h.u.ForgetContent(dev, ino)
+
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("marker not removed on forget: %v", err)
+	}
+	h.u.mu.Lock()
+	_, present := h.u.files[transcriptIdentity{device: dev, inode: ino}]
+	h.u.mu.Unlock()
+	if present {
+		t.Fatal("files entry not evicted on forget")
+	}
+	if _, _, ok := h.sessions.SessionFor(dev, ino); ok {
+		t.Fatal("sink session mapping not forgotten")
+	}
+}
+
+// Theme D: a vanished transcript's read error is logged at most once per streak, not every tick.
+func TestContentUploadReadErrorLoggedOnce(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 101, 102
+	h.sessions.set(dev, ino, "s", "codex")
+	// No reader content set → read returns os.ErrNotExist.
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	h.clock.advance(1 * time.Second)
+	h.u.tick(context.Background())
+	n := 0
+	for _, l := range h.logLines() {
+		if strings.Contains(l, "content upload: read ") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("read-error logged %d times across two ticks, want 1", n)
+	}
+}
+
+// Theme D: a marker temp file left by a crash mid-persist is swept on startup.
+func TestContentUploadBootSweepsOrphanTemps(t *testing.T) {
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, ".tmp-content-marker-abc123")
+	if err := os.WriteFile(orphan, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newContentUploader(contentUploaderConfig{
+		sender:   &fakeContentSender{},
+		sessions: newSessions(),
+		stateDir: dir,
+		read:     newReader().read,
+		now:      newClock().now,
+		debounce: 30 * time.Second,
+	}); err != nil {
+		t.Fatalf("newContentUploader: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphan temp marker not swept: %v", err)
+	}
+}
+
+// Theme E: after the watcher drops an identity, a new file reusing the same (device,inode) uploads
+// under its OWN session id, not the previous file's — no stale marker or session resurrection.
+func TestContentUploadInodeReuseUsesNewSession(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 71, 72
+	h.reader.set(dev, ino, "aaa", 1)
+	h.sessions.set(dev, ino, "sessA", "codex")
+	h.observe(dev, ino, "/pA", 3, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 || h.sender.at(0).NativeSessionID != "sessA" {
+		t.Fatalf("file A upload wrong: count=%d", h.sender.count())
+	}
+
+	// Watcher drops A (fully rotated); a new file reuses the identity.
+	h.u.ForgetContent(dev, ino)
+	h.reader.set(dev, ino, "bbbbb", 5)
+	h.sessions.set(dev, ino, "sessB", "codex")
+	h.observe(dev, ino, "/pB", 5, 5)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 2 {
+		t.Fatalf("reused-inode new file not uploaded: %d", h.sender.count())
+	}
+	if got := h.sender.at(1).NativeSessionID; got != "sessB" {
+		t.Fatalf("reused inode uploaded under %q, want sessB", got)
+	}
+}
+
+// Theme G: a 429 shed recorded while processing the first job in a tick stops the remaining jobs in
+// that same tick (the hold is re-checked before each POST, not only at tick entry).
+func TestContentUploadMidTickShedStopsRemaining(t *testing.T) {
+	sender := &fakeContentSender{respond: func(n int, _ upload.ContentRequest) (*upload.ContentResult, error) {
+		if n == 0 {
+			return &upload.ContentResult{StatusCode: 429, RetryAfter: 60 * time.Second}, nil
+		}
+		return &upload.ContentResult{StatusCode: 200}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	for i, id := range []uint64{81, 82} {
+		h.reader.set(1, id, "body", int64(i+1))
+		h.sessions.set(1, id, "s", "codex")
+		h.observe(1, id, "/p", 4, int64(i+1))
+	}
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if sender.count() != 1 {
+		t.Fatalf("mid-tick 429 did not stop remaining jobs: %d POSTs, want 1", sender.count())
+	}
+}
+
+// Theme H: an absurd server Retry-After is capped so it cannot silently disable content upload for
+// the whole process lifetime.
+func TestContentUploadCapsRetryAfter(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 429, RetryAfter: 1000 * time.Hour}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 91, 92
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	want := h.clock.now().Add(maxContentHold)
+	h.u.mu.Lock()
+	got := h.u.holdUntil
+	h.u.mu.Unlock()
+	if !got.Equal(want) {
+		t.Fatalf("holdUntil = %v, want capped at %v", got, want)
 	}
 }

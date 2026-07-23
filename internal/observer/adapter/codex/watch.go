@@ -155,6 +155,12 @@ type ContentObservation struct {
 // cheap state; do network I/O elsewhere).
 type ContentObserver interface {
 	ObserveContent(ctx context.Context, obs ContentObservation)
+	// ForgetContent is called once when the watcher drops a transcript identity that has fully
+	// rotated away / been deleted (the same point it GCs the durable cursor state). The consumer
+	// must release any per-identity in-memory state and durable marker for that (device,inode) so a
+	// later file that reuses the identity starts fresh and cannot be resurrected by a stale marker,
+	// and so a long-lived daemon does not accumulate state for transcripts that no longer exist.
+	ForgetContent(device, inode uint64)
 }
 
 const (
@@ -403,6 +409,11 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			// this (device,inode) cannot resurrect a stale cursor and skip its own leading bytes.
 			_ = os.Remove(cursorStatePath(w.cfg.StateDir, key.dev, key.ino))
 			delete(w.tracked, key)
+			// Release the content side channel's per-identity state + durable marker at the same
+			// point, so a reused identity starts fresh and idle state does not accumulate.
+			if w.cfg.ContentObserver != nil {
+				w.cfg.ContentObserver.ForgetContent(key.dev, key.ino)
+			}
 		}
 	}
 	out := make([]*trackedFile, 0, len(w.tracked))
