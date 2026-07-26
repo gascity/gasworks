@@ -34,7 +34,7 @@ jobs:
           # fixed by the pinned dependency version and is not ours to reformat (some deps
           # still ship pre-//go:build tag syntax that a newer gofmt would rewrite, which would
           # then be reverted by `go mod vendor` — an unresolvable gofmt/vendor-verify conflict).
-          unformatted="$(gofmt -l . | grep -v '^vendor/')"
+          unformatted="$(gofmt -l . | grep -v '^vendor/' || true)"
           if [ -n "$unformatted" ]; then
             echo "::error::gofmt found unformatted files:"
             echo "$unformatted"
