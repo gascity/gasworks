@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Command gasworks-observer is the standalone Gas City Observer endpoint binary. It ties the
 // committed observer subsystems into a working daemon and its interactive surfaces:

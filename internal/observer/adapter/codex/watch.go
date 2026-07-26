@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/wire"
 )
@@ -709,53 +707,6 @@ func (w *Watcher) reportRefusal(ctx context.Context, refusal transcriptRefusal, 
 	w.refused[path] = true
 	diag := refusalDiagnostic(refusal)
 	_ = w.cfg.Sink.DeliverCandidates(ctx, TranscriptRef{}, []*Candidate{diag})
-}
-
-// openValidatedTranscript opens the transcript identified by (root, locator) and fstat-validates
-// the handle is the tracked (device,inode) regular file. The open resolves locator RELATIVE to a
-// fd on the trusted approved root with RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH, so no symlink anywhere
-// within the subtree — final component OR any parent directory — can redirect it, and it cannot
-// escape the root. This is race-free: unlike re-resolving an absolute path (where O_NOFOLLOW guards
-// only the final component and a parent-directory swap after discovery could redirect the open even
-// under inode reuse), the kernel resolves the whole path under the fixed root fd in one refusing
-// step. Reading from the returned handle — never re-resolving the path — is what lets drain trust
-// the bytes. On a kernel without openat2 (ENOSYS) it degrades to the O_NOFOLLOW final-component
-// guard, which still refuses a final-component symlink and validates identity. The caller Closes f.
-func openValidatedTranscript(root, locator string, dev, ino uint64) (f *os.File, size, modNanos int64, err error) {
-	rootFd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	defer unix.Close(rootFd)
-	how := &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_BENEATH,
-	}
-	fd, err := unix.Openat2(rootFd, locator, how)
-	if err != nil {
-		switch {
-		case errors.Is(err, unix.ENOSYS):
-			return openValidatedFallback(filepath.Join(root, locator), dev, ino)
-		case errors.Is(err, unix.ENOENT):
-			return nil, 0, 0, os.ErrNotExist // vanished mid-poll
-		case errors.Is(err, unix.ELOOP), errors.Is(err, unix.EXDEV):
-			return nil, 0, 0, errRefusedResolve // a symlink under the root / an escape attempt
-		default:
-			return nil, 0, 0, err
-		}
-	}
-	return validateOpenFile(os.NewFile(uintptr(fd), locator), dev, ino)
-}
-
-// openValidatedFallback is the pre-openat2 (ENOSYS) path: open the absolute path refusing only a
-// final-component symlink (O_NOFOLLOW) and validate identity. It leaves the parent-component swap
-// window open, but only runs on kernels older than 5.6 that lack openat2.
-func openValidatedFallback(path string, dev, ino uint64) (*os.File, int64, int64, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	return validateOpenFile(f, dev, ino)
 }
 
 // validateOpenFile fstats an already-open handle and confirms it is a regular file whose

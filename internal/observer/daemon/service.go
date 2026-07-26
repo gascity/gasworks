@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package daemon
 
@@ -118,7 +118,8 @@ type ServiceConfig struct {
 	// It is opt-in and never changes the metadata-only behavior when nil.
 	ContentUpload *ContentUploadLoopConfig
 
-	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects SO_PEERCRED.
+	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects the native
+	// Linux or Darwin credential API.
 	PeerUID func(*net.UnixConn) (uint32, error)
 	// Now overrides the clock; nil selects time.Now.
 	Now func() time.Time

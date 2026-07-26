@@ -3,7 +3,6 @@
 package runwrap
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -426,55 +425,6 @@ func shimChildEnv() []string {
 		out = append(out, kv)
 	}
 	return out
-}
-
-// readSelfIdentity reads the shim's own (boot_id, pid, process_start_time). Because execve
-// preserves the pid and kernel start time, this is exactly the child's identity.
-func readSelfIdentity() (wire.ProcessIdentity, error) {
-	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if err != nil {
-		return wire.ProcessIdentity{}, fmt.Errorf("read boot id: %w", err)
-	}
-	bootID := strings.TrimSpace(string(boot))
-	if bootID == "" {
-		return wire.ProcessIdentity{}, errors.New("empty boot id")
-	}
-	start, err := readProcessStartTime("/proc/self/stat")
-	if err != nil {
-		return wire.ProcessIdentity{}, err
-	}
-	return wire.ProcessIdentity{
-		BootId:           bootID,
-		Pid:              int64(os.Getpid()),
-		ProcessStartTime: start,
-	}, nil
-}
-
-// readProcessStartTime parses field 22 (starttime, clock ticks since boot) from a /proc stat
-// file. The comm field (field 2) may contain spaces and parentheses, so parsing resumes after
-// the last ')': the fields after it start at field 3, making starttime the 20th such field.
-func readProcessStartTime(statPath string) (int64, error) {
-	data, err := os.ReadFile(statPath)
-	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", statPath, err)
-	}
-	lastParen := bytes.LastIndexByte(data, ')')
-	if lastParen < 0 || lastParen+2 >= len(data) {
-		return 0, fmt.Errorf("malformed stat file %s", statPath)
-	}
-	fields := strings.Fields(string(data[lastParen+2:]))
-	const startTimeIndexAfterComm = 19 // field 22 - field 3 == index 19
-	if len(fields) <= startTimeIndexAfterComm {
-		return 0, fmt.Errorf("stat file %s has too few fields", statPath)
-	}
-	start, err := strconv.ParseInt(fields[startTimeIndexAfterComm], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse start time in %s: %w", statPath, err)
-	}
-	if start < 0 {
-		return 0, fmt.Errorf("negative start time in %s", statPath)
-	}
-	return start, nil
 }
 
 // writeIdentity / readIdentity move a ProcessIdentity across the handshake pipe as one JSON

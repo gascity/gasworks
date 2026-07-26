@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package local
 
@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/spool"
@@ -103,7 +102,7 @@ type ServerConfig struct {
 	WriteTimeout time.Duration
 	// MaxMessageBytes bounds a single request/response; <=0 selects DefaultMaxMessageBytes.
 	MaxMessageBytes int
-	// PeerUID reads the connected peer's UID; nil selects the Linux SO_PEERCRED reader. Tests
+	// PeerUID reads the connected peer's UID; nil selects the platform credential reader. Tests
 	// inject a seam to simulate a mismatched peer since they run as a single user.
 	PeerUID func(*net.UnixConn) (uint32, error)
 }
@@ -435,27 +434,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("observer local: remove socket: %w", err)
 	}
 	return nil
-}
-
-// peerUIDFromSocket reads the connected peer's UID via Linux SO_PEERCRED. It uses the raw
-// connection control seam so it never dups the fd or fights the runtime poller. A platform or
-// syscall failure returns an error, which the handler treats as fail-closed.
-func peerUIDFromSocket(conn *net.UnixConn) (uint32, error) {
-	raw, err := conn.SyscallConn()
-	if err != nil {
-		return 0, fmt.Errorf("observer local: raw conn: %w", err)
-	}
-	var ucred *syscall.Ucred
-	var opErr error
-	if ctlErr := raw.Control(func(fd uintptr) {
-		ucred, opErr = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); ctlErr != nil {
-		return 0, fmt.Errorf("observer local: peer cred control: %w", ctlErr)
-	}
-	if opErr != nil {
-		return 0, fmt.Errorf("observer local: peer cred: %w", opErr)
-	}
-	return ucred.Uid, nil
 }
 
 // ---- single-writer durable spool ----
