@@ -191,6 +191,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.SourceID == "" {
 		return nil, errors.New("observer daemon: service source id is required")
 	}
+	socketPath, err := local.ValidateServerPaths(cfg.Dir, cfg.SocketPath)
+	if err != nil {
+		return nil, fmt.Errorf("observer daemon: validate paths: %w", err)
+	}
+	cfg.SocketPath = socketPath
 	now := cfg.Now
 	if now == nil {
 		now = time.Now

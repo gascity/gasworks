@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -439,7 +441,11 @@ func singletonConfig(dir string) ServiceConfig {
 
 func TestServiceUsesExplicitRuntimeSocketPath(t *testing.T) {
 	stateDir := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "runtime", "observer.sock")
+	socketPath := filepath.Join(
+		t.TempDir(),
+		"gasworks-observer-"+strconv.Itoa(os.Geteuid()),
+		"socket",
+	)
 	cfg := singletonConfig(stateDir)
 	cfg.SocketPath = socketPath
 
@@ -456,6 +462,17 @@ func TestServiceUsesExplicitRuntimeSocketPath(t *testing.T) {
 	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
 	if _, err := local.NewClient(socketPath).Status(context.Background()); err != nil {
 		t.Fatalf("Status through explicit socket: %v", err)
+	}
+}
+
+func TestServiceRejectsUnsafeStateDirectoryBeforeFilesystemIO(t *testing.T) {
+	_, err := NewService(ServiceConfig{
+		Dir:      string(filepath.Separator),
+		SourceID: testSourceID,
+		Capacity: permissiveCapacity(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe state directory") {
+		t.Fatalf("NewService error = %v, want unsafe state directory refusal", err)
 	}
 }
 
@@ -506,8 +523,18 @@ func TestStaleSocketIsCleaned(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// A leftover, dead socket-path artifact (nothing listening behind it).
-	writeFile(t, filepath.Join(dir, "socket"), "stale")
+	// A leftover, dead socket artifact (nothing listening behind it).
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{
+		Name: filepath.Join(dir, "socket"),
+		Net:  "unix",
+	})
+	if err != nil {
+		t.Fatalf("listen stale socket: %v", err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatalf("close stale socket: %v", err)
+	}
 
 	svc, err := NewService(singletonConfig(dir))
 	if err != nil {

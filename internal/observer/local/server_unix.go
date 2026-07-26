@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -141,23 +142,12 @@ type Server struct {
 
 // NewServer validates the configuration and returns an unstarted server.
 func NewServer(cfg ServerConfig) (*Server, error) {
-	if cfg.Dir == "" {
-		return nil, errors.New("observer local: server dir is required")
-	}
-	if filepath.Clean(cfg.Dir) == string(filepath.Separator) {
-		return nil, errors.New("observer local: unsafe state directory")
+	socketPath, err := ValidateServerPaths(cfg.Dir, cfg.SocketPath)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Spool == nil {
 		return nil, errors.New("observer local: server spool is required")
-	}
-	socketPath := cfg.SocketPath
-	if socketPath == "" {
-		socketPath = filepath.Join(cfg.Dir, socketFilename)
-	} else if !filepath.IsAbs(socketPath) {
-		return nil, errors.New("observer local: explicit socket path must be absolute")
-	}
-	if filepath.Clean(filepath.Dir(socketPath)) == string(filepath.Separator) {
-		return nil, errors.New("observer local: unsafe runtime directory")
 	}
 	expected := uint32(os.Geteuid())
 	if cfg.ExpectedUID != nil {
@@ -197,12 +187,48 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}, nil
 }
 
+// ValidateServerPaths validates and resolves the durable state and runtime
+// socket paths without creating or modifying either location.
+func ValidateServerPaths(dir, socketPath string) (string, error) {
+	if dir == "" {
+		return "", errors.New("observer local: server dir is required")
+	}
+	cleanDir := filepath.Clean(dir)
+	if cleanDir == string(filepath.Separator) {
+		return "", errors.New("observer local: unsafe state directory")
+	}
+	if socketPath == "" {
+		return filepath.Join(cleanDir, socketFilename), nil
+	}
+	if !filepath.IsAbs(socketPath) {
+		return "", errors.New("observer local: explicit socket path must be absolute")
+	}
+	socketPath = filepath.Clean(socketPath)
+	runtimeDir := filepath.Dir(socketPath)
+	if runtimeDir == string(filepath.Separator) {
+		return "", errors.New("observer local: unsafe runtime directory")
+	}
+	if filepath.Base(socketPath) != socketFilename {
+		return "", fmt.Errorf("observer local: explicit socket filename must be %q", socketFilename)
+	}
+	if runtimeDir != cleanDir {
+		wantLeaf := "gasworks-observer-" + strconv.Itoa(os.Geteuid())
+		if filepath.Base(runtimeDir) != wantLeaf {
+			return "", fmt.Errorf(
+				"observer local: explicit socket must use dedicated runtime directory %q",
+				wantLeaf,
+			)
+		}
+	}
+	return socketPath, nil
+}
+
 // SocketPath returns the runtime socket path.
 func (s *Server) SocketPath() string { return s.socketPath }
 
 // Start creates the owner-only state directory and socket and begins accepting connections. It
-// unconditionally unlinks any stale path at the socket location first: the socket is a runtime
-// artifact recreated on every start and its presence is never treated as liveness.
+// unlinks only a stale socket at the runtime location first. A non-socket path is never treated as
+// Observer-owned and is refused without modification.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -218,18 +244,21 @@ func (s *Server) Start() error {
 			return err
 		}
 	}
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("observer local: unlink stale socket: %w", err)
+	if err := removeSocketIfPresent(s.socketPath); err != nil {
+		return err
 	}
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		return fmt.Errorf("observer local: listen: %w", err)
 	}
+	unixListener := ln.(*net.UnixListener)
+	unixListener.SetUnlinkOnClose(false)
 	if err := os.Chmod(s.socketPath, socketMode); err != nil {
 		ln.Close()
+		_ = removeSocketIfPresent(s.socketPath)
 		return fmt.Errorf("observer local: chmod socket: %w", err)
 	}
-	s.ln = ln.(*net.UnixListener)
+	s.ln = unixListener
 	base := s.ln.AcceptUnix
 	if s.acceptMiddleware != nil {
 		s.accept = s.acceptMiddleware(base)
@@ -241,6 +270,23 @@ func (s *Server) Start() error {
 	s.started = true
 	s.wg.Add(1)
 	go s.acceptLoop()
+	return nil
+}
+
+func removeSocketIfPresent(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("observer local: inspect stale socket: %w", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("observer local: runtime path %s is not a socket", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("observer local: unlink stale socket: %w", err)
+	}
 	return nil
 }
 
@@ -464,8 +510,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("observer local: remove socket: %w", err)
+	if err := removeSocketIfPresent(s.socketPath); err != nil {
+		return err
 	}
 	return nil
 }
@@ -515,9 +561,17 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("observer local: spool dir is required")
 	}
+	if filepath.Clean(cfg.Dir) == string(filepath.Separator) {
+		return nil, errors.New("observer local: unsafe spool directory")
+	}
 	if cfg.SourceID == "" {
 		return nil, errors.New("observer local: spool source id is required")
 	}
+	formatVersion := cfg.FormatVersion
+	if formatVersion == 0 {
+		formatVersion = spool.CurrentFormatVersion
+	}
+	cfg.FormatVersion = formatVersion
 	capModel, err := spool.NewCapacityModel(cfg.Capacity)
 	if err != nil {
 		return nil, err
@@ -527,12 +581,6 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 		now = time.Now
 	}
 	walDir := filepath.Join(cfg.Dir, walSubdirName)
-	if err := os.MkdirAll(walDir, stateDirMode); err != nil {
-		return nil, fmt.Errorf("observer local: create wal dir: %w", err)
-	}
-	if err := os.Chmod(walDir, stateDirMode); err != nil {
-		return nil, fmt.Errorf("observer local: chmod wal dir: %w", err)
-	}
 	// Boot recovery runs before any append: it validates the sidecars, truncates a partial
 	// final frame (so OpenSegment sees a clean tail rather than bricking), reclaims an
 	// interrupted CreateSegment slot, and reconstructs the authoritative next sequence for the
@@ -541,6 +589,33 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 	rec, err := spool.Recover(cfg.Dir)
 	if err != nil {
 		return nil, err
+	}
+	if rec.SourceID != "" &&
+		(rec.SourceID != cfg.SourceID || rec.FormatVersion != formatVersion) {
+		return nil, fmt.Errorf(
+			"%w: configured %q/v%d, durable %q/v%d",
+			spool.ErrIdentityMismatch,
+			cfg.SourceID,
+			formatVersion,
+			rec.SourceID,
+			rec.FormatVersion,
+		)
+	}
+	if rec.SourceID == "" && rec.AcknowledgedThrough > 0 {
+		return nil, fmt.Errorf(
+			"%w: identity is missing for acknowledged sequence %d",
+			spool.ErrIdentityMismatch,
+			rec.AcknowledgedThrough,
+		)
+	}
+	if err := spool.BindIdentity(cfg.Dir, cfg.SourceID, formatVersion); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(walDir, stateDirMode); err != nil {
+		return nil, fmt.Errorf("observer local: create wal dir: %w", err)
+	}
+	if err := os.Chmod(walDir, stateDirMode); err != nil {
+		return nil, fmt.Errorf("observer local: chmod wal dir: %w", err)
 	}
 	if rec.Outcome == spool.OutcomeInterruptedCreate {
 		if _, err := spool.ReclaimInterruptedCreate(cfg.Dir, rec); err != nil {
@@ -565,7 +640,7 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 		dir:             cfg.Dir,
 		walDir:          walDir,
 		sourceID:        cfg.SourceID,
-		formatVersion:   cfg.FormatVersion,
+		formatVersion:   formatVersion,
 		terminalReserve: cfg.Capacity.TerminalReserveBytes,
 		sync:            cfg.Sync,
 		now:             now,

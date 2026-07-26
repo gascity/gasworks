@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,14 @@ func permissiveCap() spool.CapacityConfig {
 		MaxSegmentBytes:      spool.DefaultSegmentCeiling,
 		ScratchBytes:         1 << 20,
 		SafetyMarginRatio:    spool.MinSafetyMarginRatio,
+	}
+}
+
+func TestObserverSocketPathRejectsUnmanagedDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	_, err := observerSocketPath(filepath.Join(t.TempDir(), "socket"), stateDir)
+	if err == nil || !strings.Contains(err.Error(), "dedicated runtime directory") {
+		t.Fatalf("observerSocketPath error = %v, want dedicated runtime directory refusal", err)
 	}
 }
 
@@ -153,7 +162,11 @@ func TestRunObservedEndToEnd(t *testing.T) {
 func TestRunObservedUsesExplicitRuntimeSocket(t *testing.T) {
 	sh := shPath(t)
 	stateDir := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "runtime", "observer.sock")
+	socketPath := filepath.Join(
+		t.TempDir(),
+		"gasworks-observer-"+strconv.Itoa(os.Geteuid()),
+		"socket",
+	)
 	svc, err := daemon.NewService(daemon.ServiceConfig{
 		Dir:               stateDir,
 		SocketPath:        socketPath,

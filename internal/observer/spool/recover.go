@@ -21,6 +21,10 @@ const (
 	ackFilename      = "ack"
 )
 
+// CurrentFormatVersion is the durable WAL/identity format written by a spool
+// whose caller does not explicitly select a version.
+const CurrentFormatVersion uint32 = 1
+
 // Sidecar magics.
 const (
 	identityMagic uint32 = 0x4F494431 // "OID1"
@@ -30,6 +34,10 @@ const (
 // ErrChecksumMismatch is returned when a checksummed sidecar (identity/ack) fails its
 // CRC32C. The store is unhealthy; recovery does not guess past a corrupt control file.
 var ErrChecksumMismatch = errors.New("observer spool: sidecar checksum mismatch")
+
+// ErrIdentityMismatch is returned when a configured source or format would
+// rebind an existing durable spool to a different identity.
+var ErrIdentityMismatch = errors.New("observer spool: durable source identity mismatch")
 
 // RecoveryOutcome classifies what recovery had to do to the WAL.
 type RecoveryOutcome int
@@ -51,7 +59,8 @@ const (
 
 // Recovery is the result of startup recovery over the WAL.
 type Recovery struct {
-	// SourceID and FormatVersion come from the identity sidecar (empty/0 if absent).
+	// SourceID and FormatVersion come from the identity sidecar, or are recovered from
+	// consistent segment headers when repairing a missing sidecar.
 	SourceID      string
 	FormatVersion uint32
 	// HighestDurableSequence is the highest valid durable frame sequence (0 if none).
@@ -178,9 +187,15 @@ func recoverSegment(dir, path string, rec *Recovery, identityPresent bool, ident
 		}
 		return &CorruptionError{Segment: base, Offset: 0, Detail: err.Error()}
 	}
-	if identityPresent && hdr.SourceID != identitySource {
+	if rec.SourceID == "" {
+		rec.SourceID = hdr.SourceID
+		rec.FormatVersion = hdr.FormatVersion
+	} else if hdr.SourceID != rec.SourceID {
 		return &CorruptionError{Segment: base, Offset: 0,
 			Detail: "segment source id does not match identity sidecar"}
+	} else if hdr.FormatVersion != rec.FormatVersion {
+		return &CorruptionError{Segment: base, Offset: 0,
+			Detail: "segment format version does not match durable identity"}
 	}
 	if *expected == 0 {
 		*expected = hdr.FirstSequence
@@ -387,6 +402,31 @@ func readIdentity(dir string) (string, uint32, bool, error) {
 		return "", 0, false, err
 	}
 	return id, ver, true, nil
+}
+
+// BindIdentity creates the checksummed identity sidecar for a recovered spool,
+// or verifies that the existing sidecar names the same source and format. The
+// caller must recover and compare any surviving segment headers before binding
+// a previously absent sidecar.
+func BindIdentity(dir, sourceID string, formatVersion uint32) error {
+	existingSource, existingVersion, ok, err := readIdentity(dir)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if existingSource != sourceID || existingVersion != formatVersion {
+			return fmt.Errorf(
+				"%w: configured %q/v%d, durable %q/v%d",
+				ErrIdentityMismatch,
+				sourceID,
+				formatVersion,
+				existingSource,
+				existingVersion,
+			)
+		}
+		return nil
+	}
+	return writeIdentity(dir, sourceID, formatVersion)
 }
 
 // ---- ack sidecar ----

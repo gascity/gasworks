@@ -93,9 +93,9 @@ func TestDarwinOpenValidatedTranscriptDoesNotBlockOnFIFOReplacement(t *testing.T
 	go func() {
 		defer close(writerDone)
 		time.Sleep(250 * time.Millisecond)
-		writer, openErr := os.OpenFile(path, os.O_WRONLY, 0)
+		fd, openErr := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK, 0)
 		if openErr == nil {
-			_ = writer.Close()
+			_ = unix.Close(fd)
 		}
 	}()
 

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gascity/gasworks/internal/observer/local"
 	"github.com/gascity/gasworks/internal/observer/runwrap"
 )
 
@@ -103,13 +104,7 @@ func socketPathFor(dir string) string { return filepath.Join(dir, socketFilename
 
 // observerSocketPath resolves an explicit runtime socket or the state-directory default.
 func observerSocketPath(flagSocket, stateDir string) (string, error) {
-	if flagSocket == "" {
-		return socketPathFor(stateDir), nil
-	}
-	if !filepath.IsAbs(flagSocket) {
-		return "", fmt.Errorf("observer socket path must be absolute: %q", flagSocket)
-	}
-	return filepath.Clean(flagSocket), nil
+	return local.ValidateServerPaths(stateDir, flagSocket)
 }
 
 // multiFlag collects a repeatable string flag (e.g. -approved-root a -approved-root b).

@@ -3,6 +3,7 @@ package spool
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"hash/crc32"
 	"os"
@@ -570,6 +571,21 @@ func TestRecoverCrossSegmentGapIsCorruption(t *testing.T) {
 
 // ---- identity / ack validation and interrupted replacement ----
 
+func TestIdentityV1ContractGolden(t *testing.T) {
+	const golden = "4f49443100000001000f7372635f636f6e74726163743132339062048f"
+	got := hex.EncodeToString(encodeIdentity("src_contract123", CurrentFormatVersion))
+	if got != golden {
+		t.Fatalf("identity v1 bytes = %s, want %s", got, golden)
+	}
+	sourceID, version, err := decodeIdentity(mustDecodeHex(t, golden))
+	if err != nil {
+		t.Fatalf("decode golden identity: %v", err)
+	}
+	if sourceID != "src_contract123" || version != CurrentFormatVersion {
+		t.Fatalf("decoded identity = %q/v%d", sourceID, version)
+	}
+}
+
 func TestRecoverIdentityChecksumMismatch(t *testing.T) {
 	dir := recoverDir(t)
 	if err := writeIdentity(dir, testSourceID, 1); err != nil {
@@ -580,6 +596,15 @@ func TestRecoverIdentityChecksumMismatch(t *testing.T) {
 	if !errors.Is(err, ErrChecksumMismatch) {
 		t.Fatalf("err = %v, want ErrChecksumMismatch", err)
 	}
+}
+
+func mustDecodeHex(t *testing.T, value string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatalf("decode hex fixture: %v", err)
+	}
+	return decoded
 }
 
 func TestRecoverAckChecksumMismatch(t *testing.T) {
