@@ -106,13 +106,16 @@ func TestSnapshotObserverArchiveInventory(t *testing.T) {
 		t.Fatalf("goreleaser snapshot failed: %v\n%s", err, out)
 	}
 
-	// Both observer arches must exist and carry exactly {LICENSE, gasworks-observer}.
-	for _, arch := range []string{"amd64", "arm64"} {
-		obs := globOne(t, filepath.Join(dist, "gasworks-observer_*_linux_"+arch+".tar.gz"))
-		got := readTarGzNames(t, obs)
-		want := []string{"LICENSE", observerBinName}
-		if !equalStrings(got, want) {
-			t.Errorf("observer %s archive inventory = %v, want %v", arch, got, want)
+	// Both supported operating systems and architectures must carry exactly
+	// {LICENSE, gasworks-observer}.
+	for _, goos := range []string{"linux", "darwin"} {
+		for _, arch := range []string{"amd64", "arm64"} {
+			obs := globOne(t, filepath.Join(dist, "gasworks-observer_*_"+goos+"_"+arch+".tar.gz"))
+			got := readTarGzNames(t, obs)
+			want := []string{"LICENSE", observerBinName}
+			if !equalStrings(got, want) {
+				t.Errorf("observer %s/%s archive inventory = %v, want %v", goos, arch, got, want)
+			}
 		}
 	}
 

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Package local implements the endpoint's owner-only daemon socket (E1.5): a bounded,
 // typed, length-prefixed request/response protocol over a user-local Unix-domain socket,
@@ -7,8 +7,8 @@
 //
 // The daemon exposes no inbound network port. Every request is serviced by the serialized
 // single-writer spool and a producer receives success only after the spool has made the
-// write durable (fsync-before-reply). Peer identity is verified with Linux SO_PEERCRED and
-// rejected fail-closed when it does not match the daemon's own effective UID.
+// write durable (fsync-before-reply). Peer identity is verified with the native Unix socket
+// credential API and rejected fail-closed when it does not match the daemon's own effective UID.
 //
 // This file owns the wire protocol: the closed set of request kinds, the typed
 // request/response structs (no map[string]any on any wire type), and the length-prefixed,

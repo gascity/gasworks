@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Command gasworks-observer is the standalone Gas City Observer endpoint binary. It ties the
 // committed observer subsystems into a working daemon and its interactive surfaces:
@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/gascity/gasworks/internal/observer/local"
 	"github.com/gascity/gasworks/internal/observer/runwrap"
 )
 
@@ -29,8 +30,7 @@ import (
 // it never leaks into the child environment.
 const shimEnvVar = "RUNWRAP_SHIM"
 
-// socketFilename mirrors internal/observer/local's runtime socket name; the daemon listens at
-// <dir>/socket and the run/hook clients dial the same path.
+// socketFilename mirrors internal/observer/local's default runtime socket name.
 const socketFilename = "socket"
 
 func main() {
@@ -101,6 +101,11 @@ func observerDir(flagDir string) (string, error) {
 
 // socketPathFor returns the daemon socket path under the observer state directory.
 func socketPathFor(dir string) string { return filepath.Join(dir, socketFilename) }
+
+// observerSocketPath resolves an explicit runtime socket or the state-directory default.
+func observerSocketPath(flagSocket, stateDir string) (string, error) {
+	return local.ValidateServerPaths(stateDir, flagSocket)
+}
 
 // multiFlag collects a repeatable string flag (e.g. -approved-root a -approved-root b).
 type multiFlag []string

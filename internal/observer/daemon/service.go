@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package daemon
 
@@ -97,8 +97,10 @@ const (
 
 // ServiceConfig configures the assembled endpoint.
 type ServiceConfig struct {
-	// Dir is the observer state directory; the socket, the WAL, and the durable sidecars live here.
+	// Dir is the observer state directory; the WAL and durable sidecars live here.
 	Dir string
+	// SocketPath is the owner-only runtime socket. Empty defaults to Dir/socket.
+	SocketPath string
 	// SourceID is the durable spool source id stamped into every segment header and every batch.
 	SourceID string
 	// Capacity is the spool byte-ceiling model input (validated by the spool writer).
@@ -118,7 +120,8 @@ type ServiceConfig struct {
 	// It is opt-in and never changes the metadata-only behavior when nil.
 	ContentUpload *ContentUploadLoopConfig
 
-	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects SO_PEERCRED.
+	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects the native
+	// Linux or Darwin credential API.
 	PeerUID func(*net.UnixConn) (uint32, error)
 	// Now overrides the clock; nil selects time.Now.
 	Now func() time.Time
@@ -188,6 +191,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.SourceID == "" {
 		return nil, errors.New("observer daemon: service source id is required")
 	}
+	socketPath, err := local.ValidateServerPaths(cfg.Dir, cfg.SocketPath)
+	if err != nil {
+		return nil, fmt.Errorf("observer daemon: validate paths: %w", err)
+	}
+	cfg.SocketPath = socketPath
 	now := cfg.Now
 	if now == nil {
 		now = time.Now
@@ -227,10 +235,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 
 	// 3. Build the owner-only socket server (unstarted).
 	srv, err := local.NewServer(local.ServerConfig{
-		Dir:      cfg.Dir,
-		Spool:    sp,
-		Registry: reg,
-		PeerUID:  cfg.PeerUID,
+		Dir:        cfg.Dir,
+		SocketPath: cfg.SocketPath,
+		Spool:      sp,
+		Registry:   reg,
+		PeerUID:    cfg.PeerUID,
 	})
 	if err != nil {
 		_ = sp.Close()

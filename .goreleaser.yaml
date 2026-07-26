@@ -62,8 +62,8 @@ builds:
       - -X github.com/gascity/gasworks/internal/version.Commit={{ .ShortCommit }}
       - -X github.com/gascity/gasworks/internal/version.Date={{ .Date }}
 
-  # The Observer endpoint binary (O4.1). It is Linux-only (//go:build linux) and, by design,
-  # has ZERO Gas City dependency — it must NOT import internal/version, so it carries no
+  # The Observer endpoint binary (O4.1) supports Linux and macOS and, by design, has ZERO
+  # Gas City dependency — it must NOT import internal/version, so it carries no
   # version ldflags (the -X targets above would be a no-op here and are deliberately omitted).
   # It ships as an INDEPENDENT archive (see the `observer` archive below), is excluded from the
   # CLI/forwarder default archive, and is deliberately kept OUT of the Homebrew tap so its
@@ -74,7 +74,7 @@ builds:
     binary: gasworks-observer
     env:
       - CGO_ENABLED=0
-    goos: [linux]
+    goos: [linux, darwin]
     goarch: [amd64, arm64]
     mod_timestamp: "{{ .CommitTimestamp }}"
     flags:

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package main
 
@@ -29,7 +29,8 @@ const defaultCeilingBytes int64 = 1 << 30
 // gracefully. The uploader is enabled by -collector; the watcher is enabled by -approved-root.
 func runDaemon(args []string) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
-	dir := fs.String("dir", "", "observer state directory (socket + WAL); default XDG state dir")
+	dir := fs.String("dir", "", "observer durable state directory; default XDG state dir")
+	socket := fs.String("socket", "", "owner-only Unix socket path; default <dir>/socket")
 	sourceID := fs.String("source-id", "", "durable spool source id (required)")
 	workspace := fs.String("workspace", "", "registry workspace scope")
 	ceiling := fs.Int64("ceiling-bytes", defaultCeilingBytes, "spool byte ceiling")
@@ -64,9 +65,15 @@ func runDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
 		return 1
 	}
+	socketPath, err := observerSocketPath(*socket, stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		return 2
+	}
 
 	cfg := daemon.ServiceConfig{
 		Dir:               stateDir,
+		SocketPath:        socketPath,
 		SourceID:          *sourceID,
 		Capacity:          defaultCapacity(*ceiling),
 		RegistrySource:    *sourceID,

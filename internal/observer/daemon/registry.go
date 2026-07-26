@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Package daemon is the endpoint's wiring layer above the owner-only local socket (E1.5) and the
 // vendored evidence/wire/codex contracts. It owns the daemon-side boundary/ancestry projection

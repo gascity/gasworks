@@ -21,6 +21,10 @@ const (
 	ackFilename      = "ack"
 )
 
+// CurrentFormatVersion is the durable WAL/identity format written by a spool
+// whose caller does not explicitly select a version.
+const CurrentFormatVersion uint32 = 1
+
 // Sidecar magics.
 const (
 	identityMagic uint32 = 0x4F494431 // "OID1"
@@ -30,6 +34,10 @@ const (
 // ErrChecksumMismatch is returned when a checksummed sidecar (identity/ack) fails its
 // CRC32C. The store is unhealthy; recovery does not guess past a corrupt control file.
 var ErrChecksumMismatch = errors.New("observer spool: sidecar checksum mismatch")
+
+// ErrIdentityMismatch is returned when a configured source or format would
+// rebind an existing durable spool to a different identity.
+var ErrIdentityMismatch = errors.New("observer spool: durable source identity mismatch")
 
 // RecoveryOutcome classifies what recovery had to do to the WAL.
 type RecoveryOutcome int
@@ -51,7 +59,8 @@ const (
 
 // Recovery is the result of startup recovery over the WAL.
 type Recovery struct {
-	// SourceID and FormatVersion come from the identity sidecar (empty/0 if absent).
+	// SourceID and FormatVersion come from the identity sidecar, or are recovered from
+	// consistent segment headers when repairing a missing sidecar.
 	SourceID      string
 	FormatVersion uint32
 	// HighestDurableSequence is the highest valid durable frame sequence (0 if none).
@@ -113,6 +122,27 @@ func (e *CorruptionError) Error() string {
 // interrupted-create segment contributes no durable frame), so reclaiming and re-creating at
 // NextSequence never reuses a sequence.
 func Recover(dir string) (*Recovery, error) {
+	return recover(dir, nil)
+}
+
+// RecoverBound performs startup recovery only after every durable identity
+// sidecar and segment header encountered has been verified against the
+// configured source and format. A binding mismatch is returned before recovery
+// diagnostics, truncation, or interrupted-create reclamation can mutate the
+// spool.
+func RecoverBound(dir, sourceID string, formatVersion uint32) (*Recovery, error) {
+	return recover(dir, &configuredBinding{
+		sourceID:      sourceID,
+		formatVersion: formatVersion,
+	})
+}
+
+type configuredBinding struct {
+	sourceID      string
+	formatVersion uint32
+}
+
+func recover(dir string, binding *configuredBinding) (*Recovery, error) {
 	rec := &Recovery{Outcome: OutcomeClean}
 
 	sourceID, formatVersion, ok, err := readIdentity(dir)
@@ -122,6 +152,14 @@ func Recover(dir string) (*Recovery, error) {
 	if ok {
 		rec.SourceID = sourceID
 		rec.FormatVersion = formatVersion
+		if binding != nil &&
+			(sourceID != binding.sourceID || formatVersion != binding.formatVersion) {
+			return nil, bindingMismatchError(
+				binding,
+				sourceID,
+				formatVersion,
+			)
+		}
 	}
 
 	ack, ackOK, err := readAck(dir)
@@ -140,7 +178,7 @@ func Recover(dir string) (*Recovery, error) {
 	expected := int64(0) // 0 means "not yet established"; the first segment sets it.
 	for i, path := range segPaths {
 		isLast := i == len(segPaths)-1
-		if err := recoverSegment(dir, path, rec, ok, sourceID, &expected, isLast); err != nil {
+		if err := recoverSegment(dir, path, rec, ok, sourceID, binding, &expected, isLast); err != nil {
 			return nil, err
 		}
 	}
@@ -149,12 +187,32 @@ func Recover(dir string) (*Recovery, error) {
 	return rec, nil
 }
 
+func bindingMismatchError(binding *configuredBinding, sourceID string, formatVersion uint32) error {
+	return fmt.Errorf(
+		"%w: configured %q/v%d, durable %q/v%d",
+		ErrIdentityMismatch,
+		binding.sourceID,
+		binding.formatVersion,
+		sourceID,
+		formatVersion,
+	)
+}
+
 // recoverSegment validates one segment's header and frames, updating rec.HighestDurable and
 // the running expected sequence. A torn tail (only legal as the physical last frame of the
 // last, actively-appended segment) is truncated after a diagnostic; interior corruption —
 // including a short read in an already-rotated, immutable earlier segment — returns a
 // *CorruptionError.
-func recoverSegment(dir, path string, rec *Recovery, identityPresent bool, identitySource string, expected *int64, isLast bool) error {
+func recoverSegment(
+	dir string,
+	path string,
+	rec *Recovery,
+	identityPresent bool,
+	identitySource string,
+	binding *configuredBinding,
+	expected *int64,
+	isLast bool,
+) error {
 	base := filepath.Base(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -178,9 +236,19 @@ func recoverSegment(dir, path string, rec *Recovery, identityPresent bool, ident
 		}
 		return &CorruptionError{Segment: base, Offset: 0, Detail: err.Error()}
 	}
-	if identityPresent && hdr.SourceID != identitySource {
+	if rec.SourceID == "" {
+		if binding != nil &&
+			(hdr.SourceID != binding.sourceID || hdr.FormatVersion != binding.formatVersion) {
+			return bindingMismatchError(binding, hdr.SourceID, hdr.FormatVersion)
+		}
+		rec.SourceID = hdr.SourceID
+		rec.FormatVersion = hdr.FormatVersion
+	} else if hdr.SourceID != rec.SourceID {
 		return &CorruptionError{Segment: base, Offset: 0,
 			Detail: "segment source id does not match identity sidecar"}
+	} else if hdr.FormatVersion != rec.FormatVersion {
+		return &CorruptionError{Segment: base, Offset: 0,
+			Detail: "segment format version does not match durable identity"}
 	}
 	if *expected == 0 {
 		*expected = hdr.FirstSequence
@@ -387,6 +455,31 @@ func readIdentity(dir string) (string, uint32, bool, error) {
 		return "", 0, false, err
 	}
 	return id, ver, true, nil
+}
+
+// BindIdentity creates the checksummed identity sidecar for a recovered spool,
+// or verifies that the existing sidecar names the same source and format. The
+// caller must recover and compare any surviving segment headers before binding
+// a previously absent sidecar.
+func BindIdentity(dir, sourceID string, formatVersion uint32) error {
+	existingSource, existingVersion, ok, err := readIdentity(dir)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if existingSource != sourceID || existingVersion != formatVersion {
+			return fmt.Errorf(
+				"%w: configured %q/v%d, durable %q/v%d",
+				ErrIdentityMismatch,
+				sourceID,
+				formatVersion,
+				existingSource,
+				existingVersion,
+			)
+		}
+		return nil
+	}
+	return writeIdentity(dir, sourceID, formatVersion)
 }
 
 // ---- ack sidecar ----

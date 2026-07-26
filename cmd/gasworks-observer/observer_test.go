@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,14 @@ func permissiveCap() spool.CapacityConfig {
 		MaxSegmentBytes:      spool.DefaultSegmentCeiling,
 		ScratchBytes:         1 << 20,
 		SafetyMarginRatio:    spool.MinSafetyMarginRatio,
+	}
+}
+
+func TestObserverSocketPathRejectsUnmanagedDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	_, err := observerSocketPath(filepath.Join(t.TempDir(), "socket"), stateDir)
+	if err == nil || !strings.Contains(err.Error(), "dedicated runtime directory") {
+		t.Fatalf("observerSocketPath error = %v, want dedicated runtime directory refusal", err)
 	}
 }
 
@@ -147,6 +156,40 @@ func TestRunObservedEndToEnd(t *testing.T) {
 		if !containsLabel(labels, want) {
 			t.Fatalf("durable WAL missing %s; got %v", want, labels)
 		}
+	}
+}
+
+func TestRunObservedUsesExplicitRuntimeSocket(t *testing.T) {
+	sh := shPath(t)
+	stateDir := t.TempDir()
+	socketPath := filepath.Join(
+		t.TempDir(),
+		"gasworks-observer-"+strconv.Itoa(os.Geteuid()),
+		"socket",
+	)
+	svc, err := daemon.NewService(daemon.ServiceConfig{
+		Dir:               stateDir,
+		SocketPath:        socketPath,
+		SourceID:          "src_cmd_socket",
+		Capacity:          permissiveCap(),
+		RegistrySource:    "src_cmd_socket",
+		RegistryWorkspace: "ws",
+		PeerUID:           func(*net.UnixConn) (uint32, error) { return uint32(os.Geteuid()), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	code := runRun([]string{"-dir", stateDir, "-socket", socketPath, "--", sh, "-c", "exit 0"})
+	if code != 0 {
+		t.Fatalf("run exit code = %d, want 0", code)
+	}
+	if labels := walLabels(t, stateDir); !containsLabel(labels, "RUN_ENDED") {
+		t.Fatalf("durable WAL under state dir missing RUN_ENDED: %v", labels)
 	}
 }
 

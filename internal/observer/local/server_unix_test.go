@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -126,6 +127,11 @@ func readFrames(t *testing.T, dir string) []spool.Frame {
 
 func uidPtr(u uint32) *uint32 { return &u }
 
+func managedRuntimeDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "gasworks-observer-"+strconv.Itoa(os.Geteuid()))
+}
+
 // ---- round-trip append proves durable ack with an assigned sequence ----
 
 func TestAppendRoundTripAssignsSequence(t *testing.T) {
@@ -177,6 +183,186 @@ func TestAppendRoundTripAssignsSequence(t *testing.T) {
 		if env.Kind == "" {
 			t.Fatalf("frame %d payload missing kind", i)
 		}
+	}
+}
+
+func TestServerSeparatesRuntimeSocketFromDurableState(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeDir := managedRuntimeDir(t)
+	socketPath := filepath.Join(runtimeDir, "socket")
+	w := newWriter(t, stateDir, nil)
+	srv := startServer(t, ServerConfig{
+		Dir:        stateDir,
+		SocketPath: socketPath,
+		Spool:      w,
+	})
+
+	if srv.SocketPath() != socketPath {
+		t.Fatalf("SocketPath = %q, want %q", srv.SocketPath(), socketPath)
+	}
+	if info, err := os.Stat(runtimeDir); err != nil {
+		t.Fatalf("stat runtime dir: %v", err)
+	} else if info.Mode().Perm() != 0o700 {
+		t.Fatalf("runtime dir mode = %04o, want 0700", info.Mode().Perm())
+	}
+	if _, err := NewClient(socketPath).AppendObservation(context.Background(), pendingMessage(t)); err != nil {
+		t.Fatalf("append through separate socket: %v", err)
+	}
+	if got := len(readFrames(t, stateDir)); got != 1 {
+		t.Fatalf("durable frames in state dir = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, "wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("WAL was written under runtime dir: %v", err)
+	}
+}
+
+func TestServerRejectsSymlinkedRuntimeSocketDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	parent := t.TempDir()
+	actualRuntime := filepath.Join(parent, "actual")
+	if err := os.Mkdir(actualRuntime, 0o700); err != nil {
+		t.Fatalf("mkdir actual runtime: %v", err)
+	}
+	symlinkRuntime := filepath.Join(parent, "gasworks-observer-"+strconv.Itoa(os.Geteuid()))
+	if err := os.Symlink(actualRuntime, symlinkRuntime); err != nil {
+		t.Fatalf("symlink runtime: %v", err)
+	}
+	w := newWriter(t, stateDir, nil)
+	srv, err := NewServer(ServerConfig{
+		Dir:        stateDir,
+		SocketPath: filepath.Join(symlinkRuntime, "socket"),
+		Spool:      w,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := srv.Start(); err == nil || !strings.Contains(err.Error(), "runtime directory") {
+		t.Fatalf("Start error = %v, want symlinked runtime directory refusal", err)
+	}
+}
+
+func TestServerRejectsRootAsManagedStateOrRuntimeDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	w := newWriter(t, stateDir, nil)
+	for _, cfg := range []ServerConfig{
+		{Dir: string(filepath.Separator), Spool: w},
+		{Dir: stateDir, SocketPath: filepath.Join(string(filepath.Separator), "socket"), Spool: w},
+	} {
+		if _, err := NewServer(cfg); err == nil || !strings.Contains(err.Error(), "unsafe") {
+			t.Fatalf("NewServer(%+v) error = %v, want unsafe directory refusal", cfg, err)
+		}
+	}
+}
+
+func TestServerRejectsUnmanagedExplicitRuntimeDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	w := newWriter(t, stateDir, nil)
+	_, err := NewServer(ServerConfig{
+		Dir:        stateDir,
+		SocketPath: filepath.Join(t.TempDir(), "socket"),
+		Spool:      w,
+	})
+	if err == nil || !strings.Contains(err.Error(), "dedicated runtime directory") {
+		t.Fatalf("NewServer error = %v, want dedicated runtime directory refusal", err)
+	}
+}
+
+func TestServerRefusesNonSocketAtRuntimePath(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeDir := managedRuntimeDir(t)
+	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+	socketPath := filepath.Join(runtimeDir, "socket")
+	if err := os.WriteFile(socketPath, []byte("preserve me"), 0o600); err != nil {
+		t.Fatalf("write runtime file: %v", err)
+	}
+	w := newWriter(t, stateDir, nil)
+	srv, err := NewServer(ServerConfig{Dir: stateDir, SocketPath: socketPath, Spool: w})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := srv.Start(); err == nil || !strings.Contains(err.Error(), "not a socket") {
+		t.Fatalf("Start error = %v, want non-socket refusal", err)
+	}
+	data, err := os.ReadFile(socketPath)
+	if err != nil {
+		t.Fatalf("read preserved runtime file: %v", err)
+	}
+	if string(data) != "preserve me" {
+		t.Fatalf("runtime file changed to %q", data)
+	}
+}
+
+func TestServerShutdownPreservesReplacementAtRuntimePath(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeDir := managedRuntimeDir(t)
+	w := newWriter(t, stateDir, nil)
+	srv := startServer(t, ServerConfig{
+		Dir:        stateDir,
+		SocketPath: filepath.Join(runtimeDir, socketFilename),
+		Spool:      w,
+	})
+	socketPath := srv.SocketPath()
+	if err := os.Remove(socketPath); err != nil {
+		t.Fatalf("unlink live socket path: %v", err)
+	}
+	if err := os.WriteFile(socketPath, []byte("preserve me"), 0o600); err != nil {
+		t.Fatalf("write replacement runtime file: %v", err)
+	}
+
+	err := srv.Shutdown(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not a socket") {
+		t.Fatalf("Shutdown error = %v, want replacement refusal", err)
+	}
+	data, readErr := os.ReadFile(socketPath)
+	if readErr != nil {
+		t.Fatalf("read preserved replacement: %v", readErr)
+	}
+	if string(data) != "preserve me" {
+		t.Fatalf("replacement changed to %q", data)
+	}
+}
+
+func TestSpoolWriterBindsDurableSourceIdentity(t *testing.T) {
+	dir := t.TempDir()
+	first, err := NewSpoolWriter(SpoolConfig{
+		Dir:      dir,
+		SourceID: "src_original",
+		Capacity: permissiveCapacity(),
+	})
+	if err != nil {
+		t.Fatalf("first NewSpoolWriter: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first writer: %v", err)
+	}
+
+	rec, err := spool.Recover(dir)
+	if err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if rec.SourceID != "src_original" || rec.FormatVersion != 1 {
+		t.Fatalf("durable identity = %q/v%d, want src_original/v1", rec.SourceID, rec.FormatVersion)
+	}
+
+	second, err := NewSpoolWriter(SpoolConfig{
+		Dir:      dir,
+		SourceID: "src_reattributed",
+		Capacity: permissiveCapacity(),
+	})
+	if second != nil {
+		_ = second.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "source identity") {
+		t.Fatalf("second NewSpoolWriter error = %v, want source identity mismatch", err)
+	}
+	rec, err = spool.Recover(dir)
+	if err != nil {
+		t.Fatalf("Recover after rejected reopen: %v", err)
+	}
+	if rec.SourceID != "src_original" {
+		t.Fatalf("identity changed after rejected reopen: %q", rec.SourceID)
 	}
 }
 
@@ -383,9 +569,17 @@ func TestRestartRecreatesSocketAndContinuesSequence(t *testing.T) {
 	}
 	_ = w1.Close()
 
-	// Simulate a stale leftover socket file the crashed daemon never cleaned up.
-	if err := os.WriteFile(filepath.Join(dir, socketFilename), []byte("stale"), 0o600); err != nil {
-		t.Fatalf("plant stale socket: %v", err)
+	// Simulate a stale socket the crashed daemon never cleaned up.
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{
+		Name: filepath.Join(dir, socketFilename),
+		Net:  "unix",
+	})
+	if err != nil {
+		t.Fatalf("listen stale socket: %v", err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
+		t.Fatalf("close stale socket: %v", err)
 	}
 
 	w2 := newWriter(t, dir, nil) // OpenSegment continues from sequence 1
@@ -902,5 +1096,80 @@ func TestBootRecoveryTruncatesTornTail(t *testing.T) {
 	}
 	if ack.Sequence != 2 {
 		t.Fatalf("post-recovery seq = %d, want 2", ack.Sequence)
+	}
+}
+
+func TestBootRecoveryRejectsRebindingBeforeTornTailMutation(t *testing.T) {
+	for _, identitySidecar := range []bool{true, false} {
+		t.Run("identity-sidecar-"+strconv.FormatBool(identitySidecar), func(t *testing.T) {
+			dir := t.TempDir()
+			writer, err := NewSpoolWriter(SpoolConfig{
+				Dir:      dir,
+				SourceID: "src_original",
+				Capacity: permissiveCapacity(),
+			})
+			if err != nil {
+				t.Fatalf("NewSpoolWriter: %v", err)
+			}
+			if _, err := writer.AppendObservation(sealMessage(t, 1, "obs_original")); err != nil {
+				t.Fatalf("AppendObservation: %v", err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			entries, err := os.ReadDir(filepath.Join(dir, "wal"))
+			if err != nil {
+				t.Fatalf("read WAL: %v", err)
+			}
+			var segmentPath string
+			for _, entry := range entries {
+				if filepath.Ext(entry.Name()) == ".seg" {
+					segmentPath = filepath.Join(dir, "wal", entry.Name())
+				}
+			}
+			segment, err := os.OpenFile(segmentPath, os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatalf("open segment: %v", err)
+			}
+			if _, err := segment.Write([]byte{0x4F, 0x46, 0x52}); err != nil {
+				_ = segment.Close()
+				t.Fatalf("append torn frame: %v", err)
+			}
+			if err := segment.Close(); err != nil {
+				t.Fatalf("close segment: %v", err)
+			}
+			if !identitySidecar {
+				if err := os.Remove(filepath.Join(dir, "identity")); err != nil {
+					t.Fatalf("remove identity sidecar: %v", err)
+				}
+			}
+			before, err := os.Stat(segmentPath)
+			if err != nil {
+				t.Fatalf("stat segment before rejected open: %v", err)
+			}
+
+			rebound, err := NewSpoolWriter(SpoolConfig{
+				Dir:      dir,
+				SourceID: "src_reattributed",
+				Capacity: permissiveCapacity(),
+			})
+			if rebound != nil {
+				_ = rebound.Close()
+			}
+			if !errors.Is(err, spool.ErrIdentityMismatch) {
+				t.Fatalf("NewSpoolWriter error = %v, want ErrIdentityMismatch", err)
+			}
+			after, err := os.Stat(segmentPath)
+			if err != nil {
+				t.Fatalf("stat segment after rejected open: %v", err)
+			}
+			if after.Size() != before.Size() {
+				t.Fatalf("rejected binding changed segment size: %d -> %d", before.Size(), after.Size())
+			}
+			if _, err := os.Stat(filepath.Join(dir, "recovery")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected binding wrote recovery diagnostics: %v", err)
+			}
+		})
 	}
 }
