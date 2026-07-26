@@ -38,7 +38,9 @@ func openValidatedTranscript(root, locator string, dev, ino uint64) (*os.File, i
 		}
 		final := i == len(parts)-1
 		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-		if !final {
+		if final {
+			flags |= unix.O_NONBLOCK
+		} else {
 			flags |= unix.O_DIRECTORY
 		}
 		fd, openErr := unix.Openat(dirFD, part, flags, 0)

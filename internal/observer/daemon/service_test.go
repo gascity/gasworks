@@ -437,6 +437,28 @@ func singletonConfig(dir string) ServiceConfig {
 	}
 }
 
+func TestServiceUsesExplicitRuntimeSocketPath(t *testing.T) {
+	stateDir := t.TempDir()
+	socketPath := filepath.Join(t.TempDir(), "runtime", "observer.sock")
+	cfg := singletonConfig(stateDir)
+	cfg.SocketPath = socketPath
+
+	svc, err := NewService(cfg)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if svc.SocketPath() != socketPath {
+		t.Fatalf("SocketPath = %q, want %q", svc.SocketPath(), socketPath)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+	if _, err := local.NewClient(socketPath).Status(context.Background()); err != nil {
+		t.Fatalf("Status through explicit socket: %v", err)
+	}
+}
+
 // TestSingletonRejectsSecondDaemon proves the exclusive directory lock refuses a second daemon on
 // the same state dir (no socket hijack / shared WAL / ack regression), and that the lock releases on
 // Shutdown so a legitimate restart succeeds.

@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestDarwinOpenValidatedTranscriptWalksBeneathRoot(t *testing.T) {
@@ -69,4 +72,45 @@ func TestDarwinOpenValidatedTranscriptRefusesParentSymlinkEscape(t *testing.T) {
 	if !errors.Is(err, errRefusedResolve) {
 		t.Fatalf("openValidatedTranscript error = %v, want errRefusedResolve", err)
 	}
+}
+
+func TestDarwinOpenValidatedTranscriptDoesNotBlockOnFIFOReplacement(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	dev, ino, ok := fileIdentityOf(info)
+	if !ok {
+		t.Fatal("file identity unavailable")
+	}
+
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		time.Sleep(250 * time.Millisecond)
+		writer, openErr := os.OpenFile(path, os.O_WRONLY, 0)
+		if openErr == nil {
+			_ = writer.Close()
+		}
+	}()
+
+	start := time.Now()
+	file, _, _, err := openValidatedTranscript(root, "session.jsonl", dev, ino)
+	elapsed := time.Since(start)
+	if file != nil {
+		_ = file.Close()
+		t.Fatal("openValidatedTranscript returned FIFO")
+	}
+	if !errors.Is(err, errNotRegular) {
+		t.Fatalf("openValidatedTranscript error = %v, want errNotRegular", err)
+	}
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("openValidatedTranscript blocked on FIFO for %v", elapsed)
+	}
+	<-writerDone
 }

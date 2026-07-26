@@ -29,8 +29,7 @@ import (
 // it never leaks into the child environment.
 const shimEnvVar = "RUNWRAP_SHIM"
 
-// socketFilename mirrors internal/observer/local's runtime socket name; the daemon listens at
-// <dir>/socket and the run/hook clients dial the same path.
+// socketFilename mirrors internal/observer/local's default runtime socket name.
 const socketFilename = "socket"
 
 func main() {
@@ -101,6 +100,17 @@ func observerDir(flagDir string) (string, error) {
 
 // socketPathFor returns the daemon socket path under the observer state directory.
 func socketPathFor(dir string) string { return filepath.Join(dir, socketFilename) }
+
+// observerSocketPath resolves an explicit runtime socket or the state-directory default.
+func observerSocketPath(flagSocket, stateDir string) (string, error) {
+	if flagSocket == "" {
+		return socketPathFor(stateDir), nil
+	}
+	if !filepath.IsAbs(flagSocket) {
+		return "", fmt.Errorf("observer socket path must be absolute: %q", flagSocket)
+	}
+	return filepath.Clean(flagSocket), nil
+}
 
 // multiFlag collects a repeatable string flag (e.g. -approved-root a -approved-root b).
 type multiFlag []string

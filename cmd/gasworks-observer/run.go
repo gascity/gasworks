@@ -45,6 +45,7 @@ func nativeSessionIDFromPath(path string) (string, bool) {
 func runRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	dir := fs.String("dir", "", "observer state directory (to locate the daemon socket)")
+	socket := fs.String("socket", "", "daemon Unix socket path; default <dir>/socket")
 	allowUnobserved := fs.Bool("allow-unobserved", false, "run the child WITHOUT observation (emergency bypass)")
 	beadsProject := fs.String("beads-project", "", "beads project id (with -work-item)")
 	workItem := fs.String("work-item", "", "work item bead id (with -beads-project)")
@@ -87,7 +88,12 @@ func runRun(args []string) int {
 			fmt.Fprintln(os.Stderr, "gasworks-observer run:", err)
 			return 1
 		}
-		dc = daemon.NewWrapperDaemonClient(local.NewClient(socketPathFor(stateDir)))
+		socketPath, err := observerSocketPath(*socket, stateDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-observer run:", err)
+			return 2
+		}
+		dc = daemon.NewWrapperDaemonClient(local.NewClient(socketPath))
 	}
 
 	// The wrapper forwards signals to the child and runs the terminal sequence on exit, so the run

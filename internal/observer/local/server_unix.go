@@ -79,8 +79,10 @@ type Registry interface {
 
 // ServerConfig configures the daemon socket server.
 type ServerConfig struct {
-	// Dir is the observer state directory; the socket lives at Dir/socket.
+	// Dir is the durable observer state directory.
 	Dir string
+	// SocketPath is the runtime Unix socket. Empty defaults to Dir/socket.
+	SocketPath string
 	// Spool is the durable single-writer seam (required).
 	Spool Spool
 	// Registry is the daemon's boundary/ancestry projection. When non-nil the server folds every
@@ -142,8 +144,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("observer local: server dir is required")
 	}
+	if filepath.Clean(cfg.Dir) == string(filepath.Separator) {
+		return nil, errors.New("observer local: unsafe state directory")
+	}
 	if cfg.Spool == nil {
 		return nil, errors.New("observer local: server spool is required")
+	}
+	socketPath := cfg.SocketPath
+	if socketPath == "" {
+		socketPath = filepath.Join(cfg.Dir, socketFilename)
+	} else if !filepath.IsAbs(socketPath) {
+		return nil, errors.New("observer local: explicit socket path must be absolute")
+	}
+	if filepath.Clean(filepath.Dir(socketPath)) == string(filepath.Separator) {
+		return nil, errors.New("observer local: unsafe runtime directory")
 	}
 	expected := uint32(os.Geteuid())
 	if cfg.ExpectedUID != nil {
@@ -171,7 +185,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	return &Server{
 		dir:             cfg.Dir,
-		socketPath:      filepath.Join(cfg.Dir, socketFilename),
+		socketPath:      socketPath,
 		spool:           cfg.Spool,
 		registry:        cfg.Registry,
 		expectedUID:     expected,
@@ -195,11 +209,14 @@ func (s *Server) Start() error {
 	if s.started {
 		return errors.New("observer local: server already started")
 	}
-	if err := os.MkdirAll(s.dir, stateDirMode); err != nil {
-		return fmt.Errorf("observer local: create state dir: %w", err)
+	if err := ensureOwnerOnlyDirectory(s.dir, "state directory"); err != nil {
+		return err
 	}
-	if err := os.Chmod(s.dir, stateDirMode); err != nil {
-		return fmt.Errorf("observer local: chmod state dir: %w", err)
+	runtimeDir := filepath.Dir(s.socketPath)
+	if filepath.Clean(runtimeDir) != filepath.Clean(s.dir) {
+		if err := ensureOwnerOnlyDirectory(runtimeDir, "runtime directory"); err != nil {
+			return err
+		}
 	}
 	if err := os.Remove(s.socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("observer local: unlink stale socket: %w", err)
@@ -224,6 +241,23 @@ func (s *Server) Start() error {
 	s.started = true
 	s.wg.Add(1)
 	go s.acceptLoop()
+	return nil
+}
+
+func ensureOwnerOnlyDirectory(path, label string) error {
+	if err := os.MkdirAll(path, stateDirMode); err != nil {
+		return fmt.Errorf("observer local: create %s: %w", label, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("observer local: inspect %s: %w", label, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("observer local: %s must be a real directory", label)
+	}
+	if err := os.Chmod(path, stateDirMode); err != nil {
+		return fmt.Errorf("observer local: chmod %s: %w", label, err)
+	}
 	return nil
 }
 

@@ -180,6 +180,74 @@ func TestAppendRoundTripAssignsSequence(t *testing.T) {
 	}
 }
 
+func TestServerSeparatesRuntimeSocketFromDurableState(t *testing.T) {
+	stateDir := t.TempDir()
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	socketPath := filepath.Join(runtimeDir, "observer.sock")
+	w := newWriter(t, stateDir, nil)
+	srv := startServer(t, ServerConfig{
+		Dir:        stateDir,
+		SocketPath: socketPath,
+		Spool:      w,
+	})
+
+	if srv.SocketPath() != socketPath {
+		t.Fatalf("SocketPath = %q, want %q", srv.SocketPath(), socketPath)
+	}
+	if info, err := os.Stat(runtimeDir); err != nil {
+		t.Fatalf("stat runtime dir: %v", err)
+	} else if info.Mode().Perm() != 0o700 {
+		t.Fatalf("runtime dir mode = %04o, want 0700", info.Mode().Perm())
+	}
+	if _, err := NewClient(socketPath).AppendObservation(context.Background(), pendingMessage(t)); err != nil {
+		t.Fatalf("append through separate socket: %v", err)
+	}
+	if got := len(readFrames(t, stateDir)); got != 1 {
+		t.Fatalf("durable frames in state dir = %d, want 1", got)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, "wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("WAL was written under runtime dir: %v", err)
+	}
+}
+
+func TestServerRejectsSymlinkedRuntimeSocketDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	parent := t.TempDir()
+	actualRuntime := filepath.Join(parent, "actual")
+	if err := os.Mkdir(actualRuntime, 0o700); err != nil {
+		t.Fatalf("mkdir actual runtime: %v", err)
+	}
+	symlinkRuntime := filepath.Join(parent, "redirect")
+	if err := os.Symlink(actualRuntime, symlinkRuntime); err != nil {
+		t.Fatalf("symlink runtime: %v", err)
+	}
+	w := newWriter(t, stateDir, nil)
+	srv, err := NewServer(ServerConfig{
+		Dir:        stateDir,
+		SocketPath: filepath.Join(symlinkRuntime, "observer.sock"),
+		Spool:      w,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if err := srv.Start(); err == nil || !strings.Contains(err.Error(), "runtime directory") {
+		t.Fatalf("Start error = %v, want symlinked runtime directory refusal", err)
+	}
+}
+
+func TestServerRejectsRootAsManagedStateOrRuntimeDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	w := newWriter(t, stateDir, nil)
+	for _, cfg := range []ServerConfig{
+		{Dir: string(filepath.Separator), Spool: w},
+		{Dir: stateDir, SocketPath: filepath.Join(string(filepath.Separator), "observer.sock"), Spool: w},
+	} {
+		if _, err := NewServer(cfg); err == nil || !strings.Contains(err.Error(), "unsafe") {
+			t.Fatalf("NewServer(%+v) error = %v, want unsafe directory refusal", cfg, err)
+		}
+	}
+}
+
 // TestAppendDurableBeforeReply proves a producer sees success only after the WAL fsync fires.
 func TestAppendDurableBeforeReply(t *testing.T) {
 	dir := t.TempDir()

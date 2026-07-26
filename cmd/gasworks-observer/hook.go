@@ -30,6 +30,7 @@ func runHook(args []string) int {
 
 	fs := flag.NewFlagSet("hook codex", flag.ContinueOnError)
 	dir := fs.String("dir", "", "observer state directory (to locate the daemon socket)")
+	socket := fs.String("socket", "", "daemon Unix socket path; default <dir>/socket")
 	sourceID := fs.String("source-id", "", "observer source id")
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable)")
@@ -42,10 +43,15 @@ func runHook(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-observer hook:", err)
 		return 1
 	}
+	socketPath, err := observerSocketPath(*socket, stateDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gasworks-observer hook:", err)
+		return 2
+	}
 
 	// Bound the socket round-trip to the same 2s hook budget so a stalled or unreachable daemon can
 	// never outlast the hook's hard deadline.
-	client := local.NewClient(socketPathFor(stateDir), local.WithTimeout(codex.DefaultHookTimeout))
+	client := local.NewClient(socketPath, local.WithTimeout(codex.DefaultHookTimeout))
 	seam := daemon.NewDaemonSeamAdapter(client)
 
 	cfg := codex.HookConfig{

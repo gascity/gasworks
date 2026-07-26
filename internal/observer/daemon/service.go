@@ -97,8 +97,10 @@ const (
 
 // ServiceConfig configures the assembled endpoint.
 type ServiceConfig struct {
-	// Dir is the observer state directory; the socket, the WAL, and the durable sidecars live here.
+	// Dir is the observer state directory; the WAL and durable sidecars live here.
 	Dir string
+	// SocketPath is the owner-only runtime socket. Empty defaults to Dir/socket.
+	SocketPath string
 	// SourceID is the durable spool source id stamped into every segment header and every batch.
 	SourceID string
 	// Capacity is the spool byte-ceiling model input (validated by the spool writer).
@@ -228,10 +230,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 
 	// 3. Build the owner-only socket server (unstarted).
 	srv, err := local.NewServer(local.ServerConfig{
-		Dir:      cfg.Dir,
-		Spool:    sp,
-		Registry: reg,
-		PeerUID:  cfg.PeerUID,
+		Dir:        cfg.Dir,
+		SocketPath: cfg.SocketPath,
+		Spool:      sp,
+		Registry:   reg,
+		PeerUID:    cfg.PeerUID,
 	})
 	if err != nil {
 		_ = sp.Close()
