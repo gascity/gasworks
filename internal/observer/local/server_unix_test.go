@@ -1098,3 +1098,78 @@ func TestBootRecoveryTruncatesTornTail(t *testing.T) {
 		t.Fatalf("post-recovery seq = %d, want 2", ack.Sequence)
 	}
 }
+
+func TestBootRecoveryRejectsRebindingBeforeTornTailMutation(t *testing.T) {
+	for _, identitySidecar := range []bool{true, false} {
+		t.Run("identity-sidecar-"+strconv.FormatBool(identitySidecar), func(t *testing.T) {
+			dir := t.TempDir()
+			writer, err := NewSpoolWriter(SpoolConfig{
+				Dir:      dir,
+				SourceID: "src_original",
+				Capacity: permissiveCapacity(),
+			})
+			if err != nil {
+				t.Fatalf("NewSpoolWriter: %v", err)
+			}
+			if _, err := writer.AppendObservation(sealMessage(t, 1, "obs_original")); err != nil {
+				t.Fatalf("AppendObservation: %v", err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			entries, err := os.ReadDir(filepath.Join(dir, "wal"))
+			if err != nil {
+				t.Fatalf("read WAL: %v", err)
+			}
+			var segmentPath string
+			for _, entry := range entries {
+				if filepath.Ext(entry.Name()) == ".seg" {
+					segmentPath = filepath.Join(dir, "wal", entry.Name())
+				}
+			}
+			segment, err := os.OpenFile(segmentPath, os.O_WRONLY|os.O_APPEND, 0o600)
+			if err != nil {
+				t.Fatalf("open segment: %v", err)
+			}
+			if _, err := segment.Write([]byte{0x4F, 0x46, 0x52}); err != nil {
+				_ = segment.Close()
+				t.Fatalf("append torn frame: %v", err)
+			}
+			if err := segment.Close(); err != nil {
+				t.Fatalf("close segment: %v", err)
+			}
+			if !identitySidecar {
+				if err := os.Remove(filepath.Join(dir, "identity")); err != nil {
+					t.Fatalf("remove identity sidecar: %v", err)
+				}
+			}
+			before, err := os.Stat(segmentPath)
+			if err != nil {
+				t.Fatalf("stat segment before rejected open: %v", err)
+			}
+
+			rebound, err := NewSpoolWriter(SpoolConfig{
+				Dir:      dir,
+				SourceID: "src_reattributed",
+				Capacity: permissiveCapacity(),
+			})
+			if rebound != nil {
+				_ = rebound.Close()
+			}
+			if !errors.Is(err, spool.ErrIdentityMismatch) {
+				t.Fatalf("NewSpoolWriter error = %v, want ErrIdentityMismatch", err)
+			}
+			after, err := os.Stat(segmentPath)
+			if err != nil {
+				t.Fatalf("stat segment after rejected open: %v", err)
+			}
+			if after.Size() != before.Size() {
+				t.Fatalf("rejected binding changed segment size: %d -> %d", before.Size(), after.Size())
+			}
+			if _, err := os.Stat(filepath.Join(dir, "recovery")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("rejected binding wrote recovery diagnostics: %v", err)
+			}
+		})
+	}
+}

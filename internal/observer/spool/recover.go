@@ -122,6 +122,27 @@ func (e *CorruptionError) Error() string {
 // interrupted-create segment contributes no durable frame), so reclaiming and re-creating at
 // NextSequence never reuses a sequence.
 func Recover(dir string) (*Recovery, error) {
+	return recover(dir, nil)
+}
+
+// RecoverBound performs startup recovery only after every durable identity
+// sidecar and segment header encountered has been verified against the
+// configured source and format. A binding mismatch is returned before recovery
+// diagnostics, truncation, or interrupted-create reclamation can mutate the
+// spool.
+func RecoverBound(dir, sourceID string, formatVersion uint32) (*Recovery, error) {
+	return recover(dir, &configuredBinding{
+		sourceID:      sourceID,
+		formatVersion: formatVersion,
+	})
+}
+
+type configuredBinding struct {
+	sourceID      string
+	formatVersion uint32
+}
+
+func recover(dir string, binding *configuredBinding) (*Recovery, error) {
 	rec := &Recovery{Outcome: OutcomeClean}
 
 	sourceID, formatVersion, ok, err := readIdentity(dir)
@@ -131,6 +152,14 @@ func Recover(dir string) (*Recovery, error) {
 	if ok {
 		rec.SourceID = sourceID
 		rec.FormatVersion = formatVersion
+		if binding != nil &&
+			(sourceID != binding.sourceID || formatVersion != binding.formatVersion) {
+			return nil, bindingMismatchError(
+				binding,
+				sourceID,
+				formatVersion,
+			)
+		}
 	}
 
 	ack, ackOK, err := readAck(dir)
@@ -149,7 +178,7 @@ func Recover(dir string) (*Recovery, error) {
 	expected := int64(0) // 0 means "not yet established"; the first segment sets it.
 	for i, path := range segPaths {
 		isLast := i == len(segPaths)-1
-		if err := recoverSegment(dir, path, rec, ok, sourceID, &expected, isLast); err != nil {
+		if err := recoverSegment(dir, path, rec, ok, sourceID, binding, &expected, isLast); err != nil {
 			return nil, err
 		}
 	}
@@ -158,12 +187,32 @@ func Recover(dir string) (*Recovery, error) {
 	return rec, nil
 }
 
+func bindingMismatchError(binding *configuredBinding, sourceID string, formatVersion uint32) error {
+	return fmt.Errorf(
+		"%w: configured %q/v%d, durable %q/v%d",
+		ErrIdentityMismatch,
+		binding.sourceID,
+		binding.formatVersion,
+		sourceID,
+		formatVersion,
+	)
+}
+
 // recoverSegment validates one segment's header and frames, updating rec.HighestDurable and
 // the running expected sequence. A torn tail (only legal as the physical last frame of the
 // last, actively-appended segment) is truncated after a diagnostic; interior corruption —
 // including a short read in an already-rotated, immutable earlier segment — returns a
 // *CorruptionError.
-func recoverSegment(dir, path string, rec *Recovery, identityPresent bool, identitySource string, expected *int64, isLast bool) error {
+func recoverSegment(
+	dir string,
+	path string,
+	rec *Recovery,
+	identityPresent bool,
+	identitySource string,
+	binding *configuredBinding,
+	expected *int64,
+	isLast bool,
+) error {
 	base := filepath.Base(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -188,6 +237,10 @@ func recoverSegment(dir, path string, rec *Recovery, identityPresent bool, ident
 		return &CorruptionError{Segment: base, Offset: 0, Detail: err.Error()}
 	}
 	if rec.SourceID == "" {
+		if binding != nil &&
+			(hdr.SourceID != binding.sourceID || hdr.FormatVersion != binding.formatVersion) {
+			return bindingMismatchError(binding, hdr.SourceID, hdr.FormatVersion)
+		}
 		rec.SourceID = hdr.SourceID
 		rec.FormatVersion = hdr.FormatVersion
 	} else if hdr.SourceID != rec.SourceID {

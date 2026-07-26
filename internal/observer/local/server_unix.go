@@ -586,20 +586,9 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 	// interrupted CreateSegment slot, and reconstructs the authoritative next sequence for the
 	// empty and fully-compacted-WAL cases. Interior corruption surfaces as a typed error and
 	// refuses to start (the E1.4 quarantine path owns it), never a silent reset.
-	rec, err := spool.Recover(cfg.Dir)
+	rec, err := spool.RecoverBound(cfg.Dir, cfg.SourceID, formatVersion)
 	if err != nil {
 		return nil, err
-	}
-	if rec.SourceID != "" &&
-		(rec.SourceID != cfg.SourceID || rec.FormatVersion != formatVersion) {
-		return nil, fmt.Errorf(
-			"%w: configured %q/v%d, durable %q/v%d",
-			spool.ErrIdentityMismatch,
-			cfg.SourceID,
-			formatVersion,
-			rec.SourceID,
-			rec.FormatVersion,
-		)
 	}
 	if rec.SourceID == "" && rec.AcknowledgedThrough > 0 {
 		return nil, fmt.Errorf(
