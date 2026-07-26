@@ -75,6 +75,28 @@ jobs:
           # vendor mode automatically.
           "$(go env GOPATH)/bin/govulncheck" ./...
 
+  darwin-observer:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.26.5"
+
+      - name: Exercise native macOS Observer boundaries
+        run: >-
+          go test -mod=vendor
+          ./internal/observer/local
+          ./internal/observer/adapter/codex
+          ./internal/observer/runwrap
+          ./internal/observer/daemon
+          ./cmd/gasworks-observer
+          -count=1
+
+      - name: Build macOS Observer companion
+        run: go build -mod=vendor -trimpath ./cmd/gasworks-observer
+
   windows-locking:
     runs-on: windows-latest
     steps:
