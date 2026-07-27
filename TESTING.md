@@ -1,238 +1,403 @@
-# TESTING.md — Engineering Testing Requirements
+# TESTING.md — Engineering Testing Policy
 
-**Status:** Org standard (v1). Applies to every repo. Copy this file to each repo's root; CI and
-code review enforce it. The reference *implementation* of these requirements is
-[`gastownhall/gascity/TESTING.md`](https://github.com/gastownhall/gascity/blob/main/TESTING.md)
-("Gas City Testing Philosophy") — when this doc says "do X," that repo shows what X looks like in
-real Go.
+**Status:** Organization standard (v2). This exact file is synchronized from
+[`gascity/infra`](https://github.com/gascity/infra/blob/main/docs/standards/TESTING.md)
+into each participating repository's root. Do not edit the synchronized copy by
+hand.
 
-> **The one rule.** A change is *done* when every behavior a caller can trigger has a test that
-> exercises it against the **real dependency** it talks to — or against a double **proven** to behave
-> like the real one — and asserts the **observable state**, not just a return value. A green suite
-> that only drives fakes returning success is not coverage.
+This file is the canonical, normative source for how Gas City repositories
+design, place, review, and time tests. The reference implementation is
+[`gastownhall/gascity/TESTING.md`](https://github.com/gastownhall/gascity/blob/main/TESTING.md).
+Gas City's repository-specific commands, inventories, and checked ledgers stay
+there; this document carries the language-neutral policy.
 
-This standard has **teeth** (the rules above, kept sharp below) and an **on-ramp** (scoping,
-waivers, a path for legacy code) so the teeth are adoptable rather than ignored.
+> **The one rule.** A change is done when every distinct caller-visible risk it
+> changes has one smallest owning proof; every reusable substitute is held to
+> the same observable contract as each behaviorally distinct production
+> implementation; every critical boundary retains an exact-production-path
+> proof against the real dependency at a protected cadence; and every assertion
+> observes the promised result rather than merely proving that plumbing returned
+> success. The feedback budget changes where a proof runs, never whether the
+> risk is proved.
 
----
+## 1. Authority, applicability, and local supplements
 
-## 1. Applicability — find your repo type first
+This policy wins when an older plan, audit, or contributor document conflicts
+with it. Existing exceptions are debt, not precedent. A repository may add
+`TESTING.local.md` for its commands, provider inventory, test lanes, measured
+budgets, and stronger repository-specific rules. A local supplement may
+strengthen this standard but may not weaken or silently replace it.
 
-The teeth apply where there's real state to get wrong. Scope before you start:
+Apply only the proof categories that match the repository:
 
-| Repo type | Required tiers | "boundary / write path" means | Notes |
-|---|---|---|---|
-| **Service + datastore** | unit, contract, integration (real DB), e2e (critical paths) | DB writes, auth decisions, external-service calls | The full standard. The motivating incident lived here. |
-| **Frontend (web/mobile)** | unit, component/view, contract (vs the API schema) | API mutations the UI triggers | Real-dep = the API contract + a recorded fake client; e2e against a real backend for critical flows. |
-| **Library / SDK (no external deps)** | unit | exported API + any state it mutates | **No integration tier.** Test the public contract + edge cases; skip the real-dependency rule (there is no boundary). |
-| **CLI tool** | unit, golden/CLI (e.g. testscript) | side effects on fs/process/exit code | Exercise the real binary against a real (temp) filesystem; fake only the external service. |
-| **Data / ETL / ML pipeline** | unit (transforms), integration (real source/sink on sample) | reads/writes to the store; schema | Test transforms on fixtures + one real-source/sink integration; assert output rows/schema. |
-| **Infra / IaC / GitOps** | lint/validate, plan-diff, post-deploy smoke | the deployed resource's behavior | Real-dep tests run against a **non-prod env, nightly** (cloud APIs are slow) — not PR-gating. A deploy is verified by observed behavior after rollout, not "the manifest applied." |
-| **Config-only / docs** | lint + schema validation | n/a | No code tiers. |
+| Repository type | Required proof categories | Boundary examples |
+| --- | --- | --- |
+| Service + datastore | unit, contract/conformance, real-store integration, small critical E2E portfolio | writes, authorization, queues, external services |
+| Frontend | unit, component/view, generated API contract, small browser portfolio | mutations, state projection, accessibility-critical interaction |
+| Library / SDK | unit; conformance when multiple implementations share a port | exported behavior, serialization, state mutation |
+| CLI | unit, golden/CLI surface, focused real process/filesystem composition | arguments, output, exit status, files and subprocesses |
+| Data / ETL / ML | unit transforms, schema contract, real source/sink integration on bounded data | rows, schemas, checkpoints, idempotency |
+| Infrastructure / IaC / GitOps | lint/validate, plan or render diff, post-deploy smoke | deployed behavior, policy, rollout safety |
+| Config-only / documentation | lint, schema, link/generated-content agreement | configuration and published docs |
 
-If a rule below is "n/a" for your repo type per this table, it's satisfied — don't rubber-stamp an
-unsatisfiable checkbox.
+An organization-owned front-door journey may compose several repositories. It
+does not justify duplicating the same journey in every repository.
 
----
+## 2. The outcome: protected PR feedback under five minutes
 
-## 2. Definitions (these terms ARE the teeth — read them)
+The required PR graph reaches terminal status at p95 **under five minutes**,
+measured from validation submission or workflow creation until the last
+required summary or status reaches a terminal conclusion. Each repository
+documents one consistent CI-native start and end point. Use the most recent 20
+comparable, non-superseded required graphs from the same runner, OS,
+architecture, concurrency, and suite-policy cohort; include failures and
+timeouts, and exclude only superseded-SHA cancellations. Report queue time
+separately; target execution from the first required job starting through the
+required summary completing at or below **4m30s**.
 
-- **Write path** — code that mutates external state (INSERT/UPDATE/DELETE, enqueue, file/object
-  write, token revocation, any external side effect) or whose failure causes data loss. Includes
-  the query/payload/signature builders and the validators that gate a mutation.
-- **Real dependency** — an *actual instance* of the external system: an ephemeral container
-  (Postgres/Redis), a CI service, or a non-prod environment running the real binary. **A double
-  typed to the dependency's interface is NOT a real dependency.**
-- **Observable state** — the persisted result read back from the backing store (DB/cache/file/queue)
-  or surfaced via the system's own API/events *after* the operation. A test asserting only a return
-  value or HTTP status has **not** verified observable state.
-- **Proven (of a double)** — a contract/conformance test runs the *identical* assertions against
-  **both** the double and the real implementation, and fails if they diverge. (Gas City: the
-  `*test/conformance.go` suites run against `MemStore`, `FileStore`, real `tmux`, etc.)
-- **Critical boundary** — a boundary on a write path, an authorization decision, secret/crypto
-  handling, or a write to an external system. Teeth bite hardest here.
+The budget determines cadence:
 
----
+- **Pull request:** fast deterministic owners, fast conformance, affected
+  coordination proofs, and relevant inexpensive real boundaries.
+- **Protected main or merge queue:** broader real-provider and composition
+  proofs that cannot fit the PR budget.
+- **Scheduled or explicit profile:** credentialed external systems, cloud,
+  destructive recovery, soak, load, and live-model journeys.
 
-## 3. Definition of Done (every PR)
+A slow test may move later only after lower layers own its branch and
+error-detail matrix and the later lane retains its unique composition risk. A
+release that depends on a non-PR proof needs fresh evidence for the exact
+release SHA. Moving a test without that ownership map deletes quality; it does
+not improve feedback.
 
-For the tiers your repo type requires (§1):
+A repository that cannot yet measure or meet this objective records a checked,
+owned, expiring adoption exception. It does not silently redefine the metric.
 
-- [ ] Every new/changed **write path / critical boundary** has a test against the **real dependency**
-      that asserts **observable state** — not a fake hardcoded to succeed, not return-value-only.
-- [ ] Every **double** standing in for a real dependency is **proven** by a contract/conformance test
-      (same assertions vs the double *and* the real impl).
-- [ ] Every **caller-triggerable or behavior-silently-changing error branch** (e.g. a write that
-      returns success on a 5xx; a false-negative auth check) is covered by **fault injection**.
-- [ ] Tests fail if the behavior is wrong: assert state **before and after**, exact status codes, and
-      returned ids. (Reads still assert the returned *data*, not merely a 200.)
-- [ ] No PR-gating test **skips** because its dependency is absent (§6).
-- [ ] The PR description's "verified" claim **cites the path and the test** (file:function) that
-      exercised it against a real dependency — or links a waiver (§5).
-- [ ] `lint`, `typecheck`/compile (including build-tagged tests), and the required tiers are green.
+## 3. Definitions
 
-Can't check a box and no waiver applies? The change isn't done — say so in the PR.
+- **Risk / observable promise** — the regression a test must catch, stated in
+  one sentence from the caller's perspective.
+- **Owning proof** — the one smallest test or check responsible for detecting
+  that risk.
+- **Accountable owner** — the person or team responsible for a manifest,
+  exception, or debt item, with a tracked work item when remediation remains.
+- **Real dependency** — an actual downstream system, process, browser, protocol
+  peer, cloud service, or real binary against an isolated filesystem. A
+  production adapter pointed at a fake peer is not a real dependency.
+- **Exact production path** — the constructor and adapter composition the
+  application actually uses, connected to the real dependency. Testing either
+  the adapter or dependency through a nearby test-only composition is
+  insufficient.
+- **Observable result** — the promised output or state: exact pure result,
+  returned data, rendered user state, persisted transition read back, emitted
+  event, protocol response, or documented interaction when arguments or order
+  are themselves the contract.
+- **Reusable substitute** — a fake, stub, spy, emulator, in-memory
+  implementation, or other fast implementation used across consumer tests.
+- **Proven substitute** — a reusable substitute exercised by the same shared
+  observable-contract suite as every behaviorally distinct production
+  implementation or composition of that port.
+- **Critical boundary** — a write, authorization decision, secret or
+  cryptographic operation, external side effect, recovery path, or failure that
+  can lose or expose state.
+- **Waiver** — a scoped exception naming its reason, accountable owner,
+  replacement proof, protected cadence, approval, tracked work item, and
+  CI-enforced expiry.
 
----
+Conformance is a reusable testing pattern, not a separate execution tier. The
+same contract can run against an in-memory implementation, a process-backed
+adapter, and an external system at different cadences.
 
-## 4. Why this exists
+## 4. One risk, one smallest owning proof
 
-A feature shipped marked "verified end-to-end" while its core write path returned 500 in
-production. Unit tests were green because the in-memory fake returned `200`; the real database call
-behind that path had **never been exercised by any test**. The "verification" had only checked that
-endpoints returned `401`/`200` on reads — plumbing, not behavior. The bug was a one-line query
-argument mismatch a single real-dependency test would have caught.
+Start with the regression sentence. Search for its current owning proof before
+adding a test. Strengthen or parameterize that proof instead of creating
+another journey.
 
-This is the *class* of failure the rules above kill. It is not about a coverage percentage; it's
-about never confusing "the suite is green" with "the behavior works."
+Use this order:
 
----
+1. **Provider or port promise:** add the case once to the shared conformance
+   suite.
+2. **Domain transition or implementation decision:** write a unit test beside
+   the code.
+3. **CLI, UI, or API surface behavior:** use a component, golden, or surface
+   test with fast providers.
+4. **Argument plumbing or lifecycle ordering:** use one focused coordination
+   test with recording collaborators.
+5. **Real process, protocol, filesystem, database, browser, or provider
+   composition:** retain one integration proof for that boundary.
+6. **Critical cross-boundary journey:** admit an E2E only when lower layers
+   cannot own the composition risk.
+7. **Documentation, schema, or generated-code agreement:** add a deterministic
+   sync or freshness check.
 
-## 5. Adoption — new code, legacy code, and waivers
+Higher layers prove wiring; they do not repeat lower layers' branch matrix.
+Coverage is an ownership map of distinct obligations, not a pyramid ratio or a
+line percentage.
 
-- **New code** follows this standard from day one.
-- **Existing untested code:** do **not** gate merges on retro-fixing all of it — that kills
-  adoption. Apply **test-on-modify**: any PR that touches an untested write path **MUST** add the
-  real-dependency test for that path going forward. Keep a short risk-ordered `TESTING_ROADMAP.md`
-  (mutation/auth/payment first, then handlers, then remaining boundaries) with target quarters.
-  Untouched legacy code is a documented exception until its path is next modified.
-- **Waivers:** a repo MAY file a boundary-specific exception in `TESTING_EXCEPTIONS.md` when (1)
-  real-dependency testing is genuinely impractical (a vendor API billed per call, an unmigrated
-  legacy system), **and** (2) a credible contract/fidelity test stands in, **and** (3) the entry has
-  an owner, a sunset date, and a re-evaluation date. Waivers are public and approved by the repo's
-  governance owner. **There is no waiver for the assertion rule** — even a waived boundary's stand-in
-  test MUST assert behavior, never just a 200.
+## 5. RED, GREEN, refactor, measure, verify
 
----
+Every behavior change and bug fix follows this loop:
 
-## 6. Principles (MUST / SHOULD)
+1. **RED:** add the smallest owning proof and observe it fail for the intended
+   reason. Reproduce a reported bug before changing production code.
+2. **GREEN:** make the narrowest production change that satisfies the proof.
+3. **Refactor:** improve boundaries and names, replace expensive collaborators
+   with proven substitutes, and remove duplicate assertions.
+4. **Measure:** repeat the focused test and run the affected suite or shard.
+   Record before/after wall time when adding, moving, or materially changing
+   tests.
+5. **Verify:** run the focused owning proof plus the relevant conformance,
+   coordination, integration, or E2E proof.
 
-1. **Real dependency for critical boundaries.** Every **critical boundary** (§2) **MUST** have ≥1
-   test against a real instance that asserts observable state. A double may run for speed/breadth but
-   is **never the sole coverage** of a critical boundary. Non-critical boundaries (read-only caches,
-   logging, observability) **SHOULD** have a contract test; their real-dependency test **MAY** run
-   nightly or skip-when-unavailable.
-2. **Risk-based coverage.** Prioritize tests for code that builds/mutates a query, computes an
-   allow/deny decision, handles secrets/crypto, or writes to an external system. Don't test the easy
-   read path and skip the risky write sibling on the same surface.
-3. **Doubles MUST NOT drift.** Every double substituting for a real dependency is **proven** by a
-   conformance test (identical assertions vs double and real). Prefer hand-written doubles next to
-   the interface over mock libraries; where a "double" can be a *real* in-memory implementation
-   (Gas City's `MemStore`), that's strictly better.
-4. **Failure paths are first-class.** Every caller-triggerable or silently-behavior-changing error
-   branch **MUST** have a fault-injecting (spy) test proving the code fails loud. (Rare internal
-   errors in non-critical paths MAY rely on contract tests alone.)
-5. **No false-green.** A test **MUST** fail when behavior is wrong: assert the observable state
-   transition, the exact status, and returned ids — never just "no error."
-6. **"Verified" is a behavior, not a wire.** A mutation is verified when it **succeeded against the
-   real backend and the result is observable**. Reads returning 200 and gates returning 401 verify
-   plumbing only.
-7. **No silent-skip-as-pass.** A test that skips when its dependency is absent provides **zero**
-   coverage and **MUST NOT** count toward a boundary requirement. **CI MUST provision every
-   dependency a PR-gating test needs**; a skip in PR CI is a failure, not a pass. (Local dev may skip
-   when a dep is absent — the gate must run it for real. Gas City provisions dolt/tmux for exactly
-   this reason.)
-8. **Deterministic & isolated.** No shared/prod instances; uniquely-keyed per-test data; control the
-   clock and seeds; no ordering dependencies.
+A behavior-neutral test migration maps every retired assertion to its new
+smallest owning proof and names the retained real-boundary proof. “The broad
+test still passes” is not a semantic-parity argument.
 
----
+## 6. Design production code for fast proofs
 
-## 7. The layers
+Core logic receives dependencies; composition edges choose production
+implementations. Prefer an existing port. Inject a function for one isolated
+side effect. Do not introduce an interface merely to satisfy a mocking tool.
 
-Push coverage **down** for breadth/speed — but **every critical boundary gets ≥1 test up the stack
-against the real thing.**
+| Nondeterminism | Fast seam | Retained real proof |
+| --- | --- | --- |
+| Persistence | repository/store port with in-memory implementation | store contract, durability, and lifecycle |
+| Time, timers, backoff | injected clock, scheduler, or virtual time | real adapter behavior |
+| Async completion | event, callback, channel/promise, watcher, notifier | public event/protocol composition |
+| Subprocess | narrow executor with scripted results | argument-to-real-binary compatibility |
+| IDs and randomness | injected deterministic generator | format/entropy adapter |
+| Filesystem | filesystem port or isolated in-memory implementation | OS-specific semantics and atomicity |
+| Network or external API | protocol emulator or narrow client double | contract plus one real endpoint composition |
 
-| Layer | Exercises | Dependencies | Runs |
-|---|---|---|---|
-| **Unit** | pure logic, one component | doubles | every PR, fast |
-| **Contract / conformance** | a double's fidelity to the real impl; cross-service/-language wire shape | both double and real | every PR |
-| **Integration** | one service against its real backing store | **real DB** (container/CI service) | every PR |
-| **E2E (cross-service)** | the real call graph through the public surface, real session | real services (in-process or compose) | every PR for critical paths |
-| **Nightly / real-external** | slow or external deps (IdP, KMS, 3rd-party, cloud APIs) | **real external**, behind build tags | nightly + manual; **never PR-gating** |
+Environment variables, current working directory, global clocks, package-level
+mutable state, ambient credentials, and executable discovery belong at
+composition edges. Consumer unit tests must not need them to steer domain
+behavior.
 
-Build-tagged real-external tests **MUST** still be **compiled** every PR (a tag-compile gate) so
-they can't rot between nightly runs.
+## 7. Meaningful failure edges and observable assertions
 
----
+Test distinct equivalence classes, not command × provider × error Cartesian
+products. Consider only the applicable boundaries:
 
-## 8. Test doubles & proving they're honest
+- invalid input or missing required value;
+- collaborator failure before a side effect;
+- partial success requiring rollback, idempotency, or recovery;
+- cancellation or deadline propagation;
+- concurrency conflict or lost update;
+- serialization, schema, or protocol incompatibility; and
+- restart, reconnect, or resume at a real lifecycle boundary.
 
-- **Fake** (working in-memory impl), **Stub** (canned data), **Spy** (records calls + injects
-  faults), and — best — a **real in-memory implementation** usable in prod *and* tests.
-- A double **MUST** sit behind the same interface the real impl satisfies, substituted at a real seam
-  (interface/constructor/injection), never by editing the code under test.
-- **Integration/conformance tests exist to prove the fakes are honest.** Every provider interface
-  **SHOULD** have a conformance suite run against *all* its implementations (the double and the
-  real). A double whose only test asserts it returns what it was told to return proves nothing.
+If several consumers share one provider, shared provider failures belong in
+conformance, each consumer's distinct translation belongs in a focused unit
+test, and one consumer-to-real-provider integration retains the wiring risk.
+Add another combination only when it represents a different contract.
 
----
+Assertions must make wrong behavior fail:
 
-## 9. Coverage = a path list, not a percentage
+- mutations assert state before and after, then read the result back;
+- reads assert returned data, not only `200`;
+- pure functions assert exact results and relevant invariants;
+- CLI tests assert output, exit status, and side effects; and
+- interaction assertions are used only when calls, arguments, or ordering are
+  observable behavior.
 
-The artifact a reviewer checks is the set of caller-triggerable paths and the test exercising each:
-every endpoint/handler, every mutation/write, every authz decision (allow **and** deny), every
-mapped dependency-error branch, and every new cross-service contract (one generated source of truth
-both sides assert against). Chase the path list to zero gaps. 90% line coverage with the one risky
-write path untested is exactly how the incident happened.
+## 8. Asynchronous tests wait for facts, not elapsed time
 
----
+New or changed tests must not use fixed sleeps or open-coded polling to wait for
+completion. Use events, callbacks, channels/promises, barriers, fake clocks,
+virtual time, or deterministic schedulers. Subscribe before triggering work,
+correlate completion by request or resource identity, then reread durable state.
 
-## 10. Keeping real-dependency tests fast and trustworthy
+At a true black-box boundary with no completion signal, polling is allowed only
+through one context-aware bounded helper. The helper uses a ticker or bounded
+backoff, reports the last observed state, and has one named boundary proof.
+Busy loops and a fixed sleep before polling are forbidden.
 
-Real-dep tests are worthless if they're so slow or flaky that teams disable them. Required practices:
+Safety deadlines detect hangs; they do not determine normal duration. Making a
+deadline larger does not repair a missing lifecycle signal.
 
-- **Runtime budget.** Target the PR-gating suite under **~10 min**. Over budget → move the slowest
-  real-dep tests to nightly and keep a contract-tested fake in the gate.
-- **Cost knobs (keep the teeth, cut the cost):** one shared container per run with cleanup/rollback
-  between tests (not one-per-PR); **transaction-rollback** for DB isolation; a *proven* fake in PR +
-  the real dep nightly for slow/expensive externals.
-- **Test data.** Uniquely-key every test's data (UUID/timestamp prefix — Gas City uses a
-  `gctest-<hex>` isolation prefix) so parallel tests can't collide; prefer code factories over
-  checked-in `fixtures.json`; create your own fixtures and clean them up **through the API**.
-- **Flaky-test policy.** **No blind retries** (they hide intermittent bugs). A test flaking >1% in a
-  week is **quarantined** to a non-gating queue and root-caused by the author/code-owner within a
-  bounded window; quarantine count is tracked and trends to zero. Usual causes: a timeout, shared
-  state, or a system-clock dependency.
+## 9. Real boundaries, doubles, and conformance
 
----
+When a provider method or invariant changes:
 
-## 11. Anti-patterns (call these out in review)
+1. change the shared observable-contract suite first;
+2. run it against every behaviorally distinct production implementation or
+   composition;
+3. run it against every reusable substitute; and
+4. keep implementation-specific tests only for behavior outside the shared
+   contract.
 
-- **Plumbing-as-verification** — "it returns 401/200, so it works," for a feature whose job is to
-  mutate state. (For a read feature, still assert the returned *data*, not just the 200.)
-- **Fake-returns-200** — the only test of a boundary is a double hardcoded to succeed.
-- **Easy-path-only** — testing the simple read path and skipping the risky write path on the same
-  surface.
-- **False-green** — asserting "no error"/"2xx" without asserting the state actually changed.
-- **Drift-by-twins** — two hand-maintained copies of a contract that can silently diverge; use one
-  generated source.
-- **Silent-skip-as-pass** — an integration test that skips when its dependency is absent and is never
-  run anywhere. CI MUST provision the dependency.
+Production coverage enters through the exact constructor or composition the
+application uses. Proving a nearby raw implementation is insufficient. A thin
+alias with no state, transformation, or behavior may use a focused
+exact-constructor wiring proof.
 
----
+A skipped conformance case is a visible gap and requires a waiver. A
+consumer-local stub modeling one narrow interaction does not need the full
+provider suite, but it cannot satisfy a critical real-boundary requirement.
 
-## 12. CI requirements
+Prefer working in-memory implementations and small hand-written fakes over
+interaction-heavy mocks. Add recording only when arguments or order are part of
+the contract. A fake models observable behavior, not production internals.
 
-- **PR-gating MUST include** (for the tiers your repo type requires): lint, typecheck/compile
-  (incl. compilation of build-tagged tests), unit, contract/conformance, integration (real DB via
-  container/service), and critical-path e2e. Floor for *every* repo: lint + typecheck/compile.
-- **PR-gating MUST NOT include** slow/flaky external-dependency tests — those run nightly.
-- **A nightly job MUST** run the real-external (build-tagged) tests and fail loudly.
-- **A change to a published contract/package MUST** bump its version and keep consumer fixtures in
-  sync (enforced by a gate) so the wire contract can't drift unnoticed.
+## 10. Keep E2E and front-door portfolios deliberately small
 
----
+Admit an E2E only when all are true:
 
-## 13. The reviewer's job
+- it protects a high-value user journey or high-blast-radius recovery path;
+- the risk exists only when real boundaries are composed;
+- lower layers already own branch and error-detail coverage;
+- assertions use stable public outcomes rather than internal timing;
+- setup is hermetic and cleanup is targeted;
+- diagnostics name the last meaningful state;
+- it has an accountable owner, lane, trigger, and measured budget.
 
-Before approving, ask: **"What can a caller do here, and which of those does a *real-dependency* test
-exercise, asserting observable state?"** If a write path is covered only by a fake, request the real
-test (or a waiver) before merging. **Approving green ≠ approving covered.**
+Maintain a checked manifest of each E2E's journey, unique risk, lower-layer
+owning proofs, real resources, trigger paths, cadence, budget, diagnostics, and
+accountable owner. Reject empty, stale, duplicate, or unowned entries.
 
----
+Whole-platform journeys run through the real front door inside a fenced
+synthetic tenant and assert downstream side effects. They belong to one
+organization-owned portfolio, with a small deployment-blocking subset and
+broader scheduled/probe coverage. A major effort points to an existing journey
+or adds the one missing composition proof; it does not receive an E2E for every
+acceptance criterion.
 
-## Out of scope for v1 (tracked for v2)
+## 11. First-attempt reliability, skips, and quarantine
 
-Performance/load testing + regression budgets, accessibility testing (frontend), security/abuse
-fuzzing, and contract-version deprecation gates are important but deliberately deferred so v1 stays
-adoptable. Teams that need them now should add them per-repo; org-wide requirements land in v2.
+A deterministic product-test failure on a SHA may not be retried into green.
+Required status retains the worst product-test result across attempts. A
+pre-test runner or service outage may be retried only with attached
+infrastructure evidence and separate reporting. Every flake is a defect with
+one accountable owner.
+
+No required test skips because its dependency is absent. CI provisions the
+dependency or the test runs in an equipped protected lane. Capability-based
+local skips require that equipped lane or a waiver.
+
+Quarantine is exceptional and requires a checked ledger with captured failure
+evidence, a still-failing nonblocking lane, replacement coverage, accountable
+owner, and CI-enforced expiry. Quarantined coverage cannot satisfy a required
+gate. Do not weaken assertions, add sleeps, or broaden retries to hide an
+unknown race.
+
+## 12. Timing and resource ratchets
+
+Performance claims require comparable evidence:
+
+- repeat the focused test with result caching disabled;
+- run the affected suite or shard;
+- compare like runner, OS, architecture, concurrency, cache state, and suite
+  variant; and
+- treat one warm-cache run as diagnostic, never as a baseline.
+
+An authoritative p95 needs at least 20 comparable samples. Checked per-profile
+baselines fail material regressions and ratchet downward after sustained
+improvement. Each repository defines its material-regression threshold;
+increases require a waiver.
+
+Repositories also ratchet test-resource use: fixed sleeps and polling,
+subprocesses, listeners and test servers, containers and external services,
+ambient environment or CWD mutation, and package/global mutable state.
+
+A resource is not debt merely because a unique real-boundary proof requires
+it. Every occurrence belongs to one of two checked categories:
+
+- an exact manifest-owned proof naming its unique risk, resource, cleanup,
+  cadence, and budget; or
+- legacy or duplicated debt with a census, accountable owner, replacement
+  proof, and expiry.
+
+A clean repository starts at zero unowned debt. Fixed completion sleeps,
+open-coded polling, ambient mutation, and hidden global state cannot be
+reclassified as boundary proofs. The one sanctioned context-aware black-box
+polling helper is inventory-owned. Reductions lower the census in the same
+change; growth or duplication fails unless an explicit policy change proves
+the unique need and updates the manifest. Wrapping a resource call must not
+hide it from the inventory.
+
+A source census is an anti-growth guard, not a universal hermeticity proof.
+Individual resource-using proofs and retained real-composition proofs still
+require review.
+
+## 13. Adoption, legacy debt, and waivers
+
+New code follows this standard immediately. Existing untested code uses
+**test-on-modify**: touching an unowned critical path adds its smallest owning
+proof and retained real-boundary proof. Untouched legacy debt stays visible in
+a risk-ordered roadmap or checked ledger rather than blocking every unrelated
+change.
+
+A waiver is boundary-specific and contains:
+
+- scope and reason;
+- accountable owner and tracked work item;
+- replacement proof;
+- protected cadence;
+- approving governance owner; and
+- CI-enforced expiry and re-evaluation date.
+
+There is no waiver for a meaningful assertion. A waived boundary's replacement
+proof must still fail when the promised behavior is wrong.
+
+## 14. Definition of Done
+
+For the repository's applicable categories:
+
+- [ ] Each changed risk has one regression sentence and one smallest owning
+      proof.
+- [ ] Distinct failure equivalence classes are covered without duplicating a
+      lower layer's matrix.
+- [ ] Reusable substitutes pass the shared contract against exact production
+      compositions, or a scoped waiver names the gap.
+- [ ] Each changed critical boundary retains one real-dependency proof at a
+      protected cadence and asserts observable state.
+- [ ] Async tests wait on facts; no new completion sleeps or open-coded polling.
+- [ ] Required tests pass on the first attempt; skips and quarantine do not
+      masquerade as coverage.
+- [ ] Test changes include focused and affected-suite timing evidence.
+- [ ] Lint, schema/typecheck/compile, and applicable proof categories are green.
+- [ ] The PR names the test and retained boundary proof, or links its waiver.
+
+## 15. CI contract
+
+Every repository gates lint plus schema/typecheck/compile as applicable. Its
+required PR graph also runs fast deterministic owners, conformance, affected
+coordination proofs, and affordable real boundaries. Build-tagged, feature-
+gated, or profile tests are compiled or otherwise validated on every PR so
+later lanes cannot rot.
+
+Protected-main, merge-queue, scheduled, and post-deploy lanes own the broader
+proofs named in the ownership manifests. A published contract change updates
+one generated source of truth and checks consumer fixtures. A deployment
+cannot rely on stale evidence from another SHA.
+
+Selective routing is allowed only when an executable dependency/ownership map
+proves the omitted suites are unaffected. Until that exists, keep a
+conservative broad fast sweep.
+
+## 16. The reviewer's questions
+
+Before approval, ask:
+
+1. What regression must this catch?
+2. What is its smallest owning proof?
+3. What retained real-boundary proof demonstrates the wiring?
+4. Does a higher-level test duplicate lower-layer branch coverage?
+5. Does the cadence meet the feedback budget without deleting unique quality?
+
+Call out these anti-patterns:
+
+- plumbing-as-verification (`200` or “no error” without the promised result);
+- a fake hardcoded to succeed as the only boundary proof;
+- one test per command × provider × error combination;
+- fixed sleeps and blind polling for asynchronous completion;
+- retries or quarantine used to turn a deterministic failure green;
+- broad E2E branch matrices that belong in unit or conformance owners;
+- moving a slow unique proof later without exact-SHA freshness; and
+- hand-maintained twin contracts that can drift.
+
+Product load/capacity, accessibility, security/abuse fuzzing, and contract
+deprecation may impose additional repository or platform standards. They do not
+weaken this testing policy.
