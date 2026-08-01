@@ -423,6 +423,10 @@ type runner struct {
 // stamped with this run id under DECLARED_BOUNDARY membership (the wrapper declares the run).
 // The stamped run_id is what the spool uses to classify a PROCESS_LIFECYCLE frame's run.
 func (r *runner) common(now time.Time) evidence.Common {
+	return commonForRun(r.runID, now)
+}
+
+func commonForRun(runID string, now time.Time) evidence.Common {
 	return evidence.Common{
 		OccurredAt: now,
 		CapturedAt: now,
@@ -432,7 +436,7 @@ func (r *runner) common(now time.Time) evidence.Common {
 			ContentPolicy:  wire.ProvenanceContentPolicyMETADATAONLY,
 		},
 		RunContext: &wire.RunContext{
-			RunId:              r.runID,
+			RunId:              runID,
 			MembershipEvidence: wire.RunContextMembershipEvidenceDECLAREDBOUNDARY,
 		},
 	}
