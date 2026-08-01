@@ -57,6 +57,8 @@ func dispatch(args []string) int {
 		return runDaemon(args[1:])
 	case "run":
 		return runRun(args[1:])
+	case "declare-work":
+		return runDeclareWork(args[1:])
 	case "hook":
 		return runHook(args[1:])
 	case "-h", "--help", "help":
@@ -75,6 +77,7 @@ func usage() {
 Usage:
   gasworks-observer daemon   [flags]      run the endpoint daemon
   gasworks-observer run      [flags] -- CMD [args...]  run a child as an observed run
+  gasworks-observer declare-work [flags]  declare work on the current explicit run
   gasworks-observer hook codex [flags]    Codex SessionStart hook handler (reads stdin)
 `)
 }

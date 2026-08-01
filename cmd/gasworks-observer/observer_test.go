@@ -128,6 +128,93 @@ func containsLabel(labels []string, want string) bool {
 	return false
 }
 
+// TestDeclareWorkAppendsCurrentExplicitRunReferenceEndToEnd proves the dynamic claim-time
+// command uses only the wrapper-authored GASWORKS_RUN_ID and durably appends the exact
+// (project, bead) tuple as a DECLARED work reference through the real local daemon.
+func TestDeclareWorkAppendsCurrentExplicitRunReferenceEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	startBareDaemon(t, dir)
+	t.Setenv(runwrap.RunIDEnvVar, "gwr_declared_test")
+
+	code := dispatch([]string{
+		"declare-work",
+		"-dir", dir,
+		"-beads-project", "prj_test",
+		"-work-item", "mc-test",
+	})
+	if code != 0 {
+		t.Fatalf("declare-work exit code = %d, want 0", code)
+	}
+
+	recs, err := upload.SpoolFrameStore{Dir: dir}.ReadRange(wire.SequenceMin, 1<<40)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("durable WAL frames = %d, want 1", len(recs))
+	}
+	var obs wire.Observation
+	if err := obs.UnmarshalJSON(recs[0].Payload); err != nil {
+		t.Fatalf("decode durable observation: %v", err)
+	}
+	work, err := obs.AsWorkReferenceObservation()
+	if err != nil {
+		t.Fatalf("decode durable work reference: %v", err)
+	}
+	if got := work.WorkReference; got.TeamServerProjectId != "prj_test" ||
+		got.BeadId != "mc-test" || got.Origin != wire.WorkReferenceOriginDECLARED {
+		t.Fatalf("work reference = %+v, want exact DECLARED project/bead tuple", got)
+	}
+	if work.RunContext == nil || work.RunContext.RunId != "gwr_declared_test" ||
+		work.RunContext.MembershipEvidence != wire.RunContextMembershipEvidenceDECLAREDBOUNDARY {
+		t.Fatalf("run context = %+v, want current explicit run with DECLARED_BOUNDARY", work.RunContext)
+	}
+	if work.Provenance.Adapter != "gasworks-wrapper" ||
+		work.Provenance.ContentPolicy != wire.ProvenanceContentPolicyMETADATAONLY {
+		t.Fatalf("provenance = %+v, want wrapper METADATA_ONLY provenance", work.Provenance)
+	}
+}
+
+// TestDeclareWorkRejectsMissingExplicitRun proves an unwrapped process cannot manufacture a
+// dynamic association: without GASWORKS_RUN_ID the command fails before contacting the daemon.
+func TestDeclareWorkRejectsMissingExplicitRun(t *testing.T) {
+	dir := t.TempDir()
+	startBareDaemon(t, dir)
+	t.Setenv(runwrap.RunIDEnvVar, "")
+
+	code := dispatch([]string{
+		"declare-work",
+		"-dir", dir,
+		"-beads-project", "prj_test",
+		"-work-item", "mc-test",
+	})
+	if code == 0 {
+		t.Fatal("declare-work without GASWORKS_RUN_ID succeeded")
+	}
+
+	recs, err := upload.SpoolFrameStore{Dir: dir}.ReadRange(wire.SequenceMin, 1<<40)
+	if err != nil {
+		t.Fatalf("read wal: %v", err)
+	}
+	if len(recs) != 0 {
+		t.Fatalf("durable WAL frames = %d, want 0", len(recs))
+	}
+}
+
+func TestDeclareWorkRequiresCompleteProjectAndBeadTuple(t *testing.T) {
+	for _, args := range [][]string{
+		{"declare-work", "-beads-project", "prj_test"},
+		{"declare-work", "-work-item", "mc-test"},
+	} {
+		t.Run(strings.Join(args, "_"), func(t *testing.T) {
+			t.Setenv(runwrap.RunIDEnvVar, "gwr_declared_test")
+			if code := dispatch(args); code != 2 {
+				t.Fatalf("dispatch(%v) exit code = %d, want usage error 2", args, code)
+			}
+		})
+	}
+}
+
 func shPath(t *testing.T) string {
 	t.Helper()
 	p, err := exec.LookPath("sh")
