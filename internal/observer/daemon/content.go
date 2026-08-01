@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -32,54 +31,27 @@ const (
 	// skipped with one diagnostic rather than buffered into memory.
 	DefaultMaxContentBytes = int64(200) << 20
 	// contentTransientHold is the global back-off applied after a transport/5xx failure or a 429 with
-	// no Retry-After, so a persistent server problem does not hot-loop the content POST.
+	// no Retry-After, so a persistent server problem does not hot-loop the artifact lifecycle.
 	contentTransientHold = 15 * time.Second
 	// maxContentHold caps how long a single server-supplied Retry-After can shed content upload, so a
 	// malformed or absurd value cannot silently disable content upload for the whole process lifetime.
 	maxContentHold = 5 * time.Minute
 	// maxContentPostAttempts bounds how many times a single stable snapshot is re-read + re-hashed +
-	// re-POSTed after transport/retryable failures before the uploader gives up on THAT snapshot (until
+	// republished after transport/retryable failures before the uploader gives up on THAT snapshot (until
 	// its content changes). Without it, a within-cap transcript that cannot finish within the content
 	// timeout (a slow link) would re-read+re-hash the whole file every backoff forever.
 	maxContentPostAttempts = 5
 	// contentMarkerVersion is the on-disk last-uploaded marker schema version.
-	contentMarkerVersion = 1
-	// maxNativeSessionIDLen / maxSourcePathLen mirror the Phase 1a server header-validation limits,
-	// enforced client-side so a structurally invalid transcript never triggers a server 422 loop.
-	maxNativeSessionIDLen = 256
-	maxSourcePathLen      = 1024
+	contentMarkerVersion = 2
 )
 
-// nativeSessionIDPattern mirrors the Phase 1a server's X-Observer-Native-Session-Id contract.
-var nativeSessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
-
-// validContentHeaders reports whether the resolved provenance values satisfy the server's Phase 1a
-// header contract. A transcript that fails this can never produce an accepted upload, so the caller
-// skips it (logging once) instead of POSTing bytes the server will reject with 422.
-func validContentHeaders(nativeID, provider, sourcePath string) bool {
-	if nativeID == "" || len(nativeID) > maxNativeSessionIDLen || !nativeSessionIDPattern.MatchString(nativeID) {
-		return false
-	}
-	if provider != "claude" && provider != "codex" {
-		return false
-	}
-	if len(sourcePath) > maxSourcePathLen || !isPrintableASCII(sourcePath) {
-		return false
-	}
-	return true
+// validContentIdentity validates the two caller-known identity members used in
+// the artifact key. SourcePath is deliberately absent: it never leaves the host.
+func validContentIdentity(nativeID, provider string) bool {
+	return upload.ValidContentIdentity(nativeID, provider)
 }
 
-// isPrintableASCII reports whether s is entirely printable ASCII (a safe, header-legal value).
-func isPrintableASCII(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] > 0x7e {
-			return false
-		}
-	}
-	return true
-}
-
-// ContentSender POSTs one whole-transcript snapshot to the collector's content route. *upload.Client
+// ContentSender publishes one whole-transcript snapshot through the collector's artifact lifecycle. *upload.Client
 // satisfies it; tests substitute a scripted double. It is the ONLY collector seam the content side
 // channel uses — it reuses the same authenticated client (base URL + source-bound bearer) as the
 // observation-batch uploader, never a second credential.
@@ -155,12 +127,15 @@ type contentState struct {
 	// and provider of the last upload so a transcript uploaded at least once can still be keyed after a
 	// daemon restart, when the sink's in-memory session threading is empty (the codex head
 	// SESSION_LIFECYCLE line sits behind the durable cursor and is never re-parsed).
-	markerLoaded   bool
-	markerHash     string
-	markerSize     int64
-	markerMod      int64
-	markerNative   string
-	markerProvider string
+	markerLoaded         bool
+	markerHash           string
+	markerSize           int64
+	markerMod            int64
+	markerNative         string
+	markerProvider       string
+	markerArtifactID     string
+	markerArtifactKey    string
+	markerArtifactDigest string
 
 	// eval* is the (size,modNanos) of the snapshot last EVALUATED to a non-upload-needed outcome
 	// (uploaded, unchanged, oversize, invalid, or permanently-rejected). A file whose current stat
@@ -170,14 +145,14 @@ type contentState struct {
 	evalMod  int64
 	evalSet  bool
 
-	// uploaded records whether markerHash came from a real acceptance (2xx / 409) rather than a
+	// uploaded records whether markerHash came from a validated finalization (200) rather than a
 	// permanent-4xx rejection. Only a real acceptance may be durably persisted; a rejected hash is kept
-	// as in-memory dedup only, so a restart re-probes it (the 400/413/422 intent).
+	// as in-memory dedup only, so a restart re-probes it (the 400/409/413/415/422 intent).
 	uploaded bool
 
-	// postFail* count consecutive failed POSTs against a single (size,mod) snapshot so a snapshot that
-	// keeps failing (e.g. a file too slow to finish within the content timeout) is eventually given up
-	// on instead of re-read/re-hashed/re-POSTed forever; a stat change or a success resets them.
+	// postFail* count consecutive failed publications against a single (size,mod) snapshot. A snapshot
+	// that keeps failing is eventually given up on instead of being read, hashed, and published forever;
+	// a stat change or a success resets the counters.
 	postFailSize  int64
 	postFailMod   int64
 	postFailCount int
@@ -259,7 +234,7 @@ func (u *contentUploader) ObserveContent(_ context.Context, o codex.ContentObser
 }
 
 // tick evaluates every tracked transcript once and uploads those that are stable and changed. It is
-// the deterministic unit the content loop drives and tests call directly. Reads and POSTs happen
+// the deterministic unit the content loop drives and tests call directly. Reads and network calls happen
 // with u.mu released so ObserveContent never blocks on content I/O.
 func (u *contentUploader) tick(ctx context.Context) {
 	now := u.now()
@@ -291,12 +266,12 @@ func (u *contentUploader) tick(ctx context.Context) {
 		if !ok {
 			continue
 		}
-		// Enforce the server's header contract client-side. A structurally invalid value can never be
-		// accepted, so record the current stat as evaluated (skip future re-reads) and log once instead
-		// of POSTing bytes the server would reject with 422.
-		if !validContentHeaders(native, provider, st.path) {
+		// Enforce the artifact identity grammar before reading the whole file. A
+		// structurally invalid identity can never produce a stable artifact key, so
+		// record the current stat as evaluated and log once.
+		if !validContentIdentity(native, provider) {
 			if !st.invalidLogged {
-				u.logf("content upload: skipping %s: invalid provenance (session=%q provider=%q path-bytes=%d)", st.locator, native, provider, len(st.path))
+				u.logf("content upload: skipping %s: invalid identity (session=%q provider=%q)", st.locator, native, provider)
 				st.invalidLogged = true
 			}
 			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
@@ -311,7 +286,7 @@ func (u *contentUploader) tick(ctx context.Context) {
 			return
 		}
 		// A shed (429) or provision/auth latch (401/403/404/501) recorded while processing an earlier
-		// job in this same tick must stop the rest — re-check before each POST, not only at tick entry.
+		// job in this same tick must stop the rest — re-check before each publication, not only at tick entry.
 		u.mu.Lock()
 		stop := u.disabled || (!u.holdUntil.IsZero() && u.now().Before(u.holdUntil))
 		u.mu.Unlock()
@@ -338,7 +313,7 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 // processOne reads, hashes, and (if changed) uploads one transcript's whole content, then records
 // the outcome. The native session id + provider are already resolved and validated by the caller, so
 // no whole-file read happens for a transcript whose session id is unknown or structurally invalid.
-// All slow work (file read, network POST) runs without u.mu held.
+// All slow work (file read, artifact lifecycle) runs without u.mu held.
 func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity, root, locator, path, native, provider string) {
 	content, rsize, rmod, err := u.read(root, locator, id.device, id.inode, u.maxBytes)
 	if errors.Is(err, codex.ErrTranscriptTooLarge) {
@@ -385,7 +360,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// Content identical to the last handled snapshot (e.g. only the mtime moved): idempotent no-op.
 		// Advance eval so future ticks skip the re-read and do not re-POST. Only refresh + persist the
 		// durable marker when the hash came from a REAL acceptance; a hash recorded from a permanent-4xx
-		// rejection stays in-memory-only so a restart still re-probes it (the 400/413/422 intent).
+		// rejection stays in-memory-only so a restart still re-probes it (the 400/409/413/415/422 intent).
 		st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
 		if st.uploaded {
 			st.markerSize, st.markerMod = rsize, rmod
@@ -410,44 +385,58 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	now := u.now()
 	u.mu.Lock()
 	st = u.files[id]
-	if err != nil {
+	if err != nil || res == nil {
 		u.holdUntil = now.Add(contentTransientHold)
 		gaveUp := false
 		if st != nil {
 			gaveUp = st.recordPostFailureLocked(rsize, rmod)
 		}
 		u.mu.Unlock()
-		u.logf("content upload: POST %s: %v", locator, err)
+		if err != nil {
+			u.logf("content upload: publish %s: %v", locator, err)
+		} else {
+			u.logf("content upload: publish %s: empty result", locator)
+		}
 		if gaveUp {
 			u.logf("content upload: giving up on %s after %d failed attempts on this snapshot; will retry when it changes", locator, maxContentPostAttempts)
 		}
 		return
 	}
 	switch {
-	case res.StatusCode == 200 || res.StatusCode == 201:
+	case res.StatusCode == 200 && validFinalizedContentResult(res, hash):
 		var marker contentMarker
 		if st != nil {
-			st.setUploaded(hash, rsize, rmod, native, provider)
+			st.setUploaded(hash, rsize, rmod, native, provider, res.ArtifactID, res.ArtifactKey, res.Digest)
 			marker = st.markerRecord(id, now)
 		}
 		u.mu.Unlock()
 		if st != nil {
 			u.persistMarker(id, marker)
 		}
-		u.logf("content upload: sent %s for session %s (%d bytes, gc_session_id=%s)", locator, native, len(content), res.GCSessionID)
+		u.logf("content upload: finalized %s for session %s (%d bytes)", locator, native, len(content))
+	case res.StatusCode == 200:
+		u.holdUntil = now.Add(contentTransientHold)
+		gaveUp := false
+		if st != nil {
+			gaveUp = st.recordPostFailureLocked(rsize, rmod)
+		}
+		u.mu.Unlock()
+		u.logf("content upload: invalid finalized result for session %s", native)
+		if gaveUp {
+			u.logf("content upload: giving up on %s after %d failed attempts on this snapshot; will retry when it changes", locator, maxContentPostAttempts)
+		}
 	case res.StatusCode == 409:
-		// Idempotency content mismatch: the server already holds different bytes for this
-		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.
-		var marker contentMarker
+		// machine_ingest_v1 conflict is not acceptance. Suppress an in-process
+		// hot loop for identical bytes, but do not persist a marker: a restart must
+		// re-probe rather than convert conflict into durable success.
 		if st != nil {
-			st.setUploaded(hash, rsize, rmod, native, provider)
-			marker = st.markerRecord(id, now)
+			st.markerHash = hash
+			st.uploaded = false
+			st.markerNative, st.markerProvider = native, provider
+			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
 		}
 		u.mu.Unlock()
-		if st != nil {
-			u.persistMarker(id, marker)
-		}
-		u.logf("content upload: 409 content mismatch for session %s; advancing", native)
+		u.logf("content upload: 409 artifact idempotency conflict for session %s; not marking accepted", native)
 	case res.StatusCode == 429:
 		// Shed: honor Retry-After, but cap it so an absurd value cannot disable upload for the run.
 		hold := res.RetryAfter
@@ -467,7 +456,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.disabled = true
 		u.mu.Unlock()
 		u.logf("content upload: status %d; disabling content upload for this run", res.StatusCode)
-	case res.StatusCode == 400 || res.StatusCode == 413 || res.StatusCode == 422:
+	case res.StatusCode == 400 || res.StatusCode == 413 || res.StatusCode == 415 || res.StatusCode == 422:
 		// Permanent for THESE bytes (malformed / too large / contract violation the client guard
 		// missed): record the hash in memory so identical bytes are not re-POSTed, advance eval so the
 		// file is not re-read, but do NOT persist (a restart re-probes) and do NOT arm the global hold
@@ -498,6 +487,12 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	}
 }
 
+func validFinalizedContentResult(result *upload.ContentResult, contentHash string) bool {
+	return result != nil && result.ArtifactID != "" && len(result.ArtifactID) <= 128 &&
+		result.ArtifactKey != "" && len(result.ArtifactKey) <= 256 &&
+		result.Digest == "sha256:"+contentHash
+}
+
 // recordPostFailureLocked bumps the consecutive-failure counter for the current (size,mod) snapshot
 // and reports whether the uploader should give up on it. Once a single snapshot has failed
 // maxContentPostAttempts times it advances eval so the file is not re-read/re-hashed/re-POSTed until
@@ -515,14 +510,17 @@ func (st *contentState) recordPostFailureLocked(rsize, rmod int64) (gaveUp bool)
 	return false
 }
 
-// setUploaded records a successful (or advanced) upload of the given snapshot, so future ticks
+// setUploaded records a validated finalized upload of the given snapshot, so future ticks
 // dedup against it in memory and a restart can re-key the transcript from the persisted identity.
-func (st *contentState) setUploaded(hash string, size, mod int64, native, provider string) {
+func (st *contentState) setUploaded(hash string, size, mod int64, native, provider, artifactID, artifactKey, artifactDigest string) {
 	st.markerHash = hash
 	st.markerSize = size
 	st.markerMod = mod
 	st.markerNative = native
 	st.markerProvider = provider
+	st.markerArtifactID = artifactID
+	st.markerArtifactKey = artifactKey
+	st.markerArtifactDigest = artifactDigest
 	st.markerLoaded = true
 	st.uploaded = true
 	st.evalSize = size
@@ -539,16 +537,22 @@ func (u *contentUploader) ensureMarkerLoadedLocked(id transcriptIdentity, st *co
 		return
 	}
 	st.markerLoaded = true
-	m, ok := u.loadMarker(id)
+	m, finalized, ok := u.loadMarker(id)
 	if !ok {
+		return
+	}
+	st.markerNative = m.NativeSessionID
+	st.markerProvider = m.Provider
+	if !finalized {
 		return
 	}
 	st.markerHash = m.ContentSHA256
 	st.markerSize = m.Size
 	st.markerMod = m.ModNanos
-	st.markerNative = m.NativeSessionID
-	st.markerProvider = m.Provider
-	// A persisted marker is only ever written for a real acceptance (2xx / 409); permanent-4xx
+	st.markerArtifactID = m.ArtifactID
+	st.markerArtifactKey = m.ArtifactKey
+	st.markerArtifactDigest = m.ArtifactDigest
+	// A persisted marker is only ever written for a validated finalization (200); conflicts and permanent-4xx
 	// rejections are never persisted, so a loaded marker is always a real upload.
 	st.uploaded = true
 	st.evalSize = m.Size
@@ -567,6 +571,9 @@ type contentMarker struct {
 	ModNanos        int64  `json:"observed_mtime_nanos"`
 	NativeSessionID string `json:"native_session_id,omitempty"`
 	Provider        string `json:"provider,omitempty"`
+	ArtifactID      string `json:"artifact_id,omitempty"`
+	ArtifactKey     string `json:"artifact_key,omitempty"`
+	ArtifactDigest  string `json:"artifact_digest,omitempty"`
 	UploadedAt      string `json:"uploaded_at"`
 }
 
@@ -581,6 +588,9 @@ func (st *contentState) markerRecord(id transcriptIdentity, now time.Time) conte
 		ModNanos:        st.markerMod,
 		NativeSessionID: st.markerNative,
 		Provider:        st.markerProvider,
+		ArtifactID:      st.markerArtifactID,
+		ArtifactKey:     st.markerArtifactKey,
+		ArtifactDigest:  st.markerArtifactDigest,
 		UploadedAt:      now.UTC().Format(time.RFC3339Nano),
 	}
 }
@@ -592,21 +602,42 @@ func contentMarkerPath(stateDir string, dev, ino uint64) string {
 	return filepath.Join(stateDir, fmt.Sprintf("content-marker-%d-%d.json", dev, ino))
 }
 
-// loadMarker reads and validates the persisted marker for id, returning ok=false when it is absent,
-// unreadable, malformed, or for a different identity/version (start fresh rather than trust it).
-func (u *contentUploader) loadMarker(id transcriptIdentity) (contentMarker, bool) {
+// loadMarker reads and validates the persisted marker for id. A v2 marker may prove finalization;
+// a valid legacy v1 marker supplies only the native/provider identity needed to migrate the bytes.
+// Absent, malformed, foreign-identity, and unknown-version markers are rejected entirely.
+func (u *contentUploader) loadMarker(id transcriptIdentity) (contentMarker, bool, bool) {
 	data, err := os.ReadFile(contentMarkerPath(u.stateDir, id.device, id.inode))
 	if err != nil {
-		return contentMarker{}, false
+		return contentMarker{}, false, false
 	}
 	var m contentMarker
 	if err := json.Unmarshal(data, &m); err != nil {
-		return contentMarker{}, false
+		return contentMarker{}, false, false
 	}
-	if m.Version != contentMarkerVersion || m.Device != id.device || m.Inode != id.inode || m.ContentSHA256 == "" {
-		return contentMarker{}, false
+	if m.Device != id.device || m.Inode != id.inode || m.Size < 0 || !validMarkerContentSHA256(m.ContentSHA256) ||
+		!validContentIdentity(m.NativeSessionID, m.Provider) {
+		return contentMarker{}, false, false
 	}
-	return m, true
+	if m.Version == 1 {
+		// The legacy one-shot route wrote v1 for 2xx and even 409 outcomes.
+		// Retain only its local identity hint so the same bytes can enter the
+		// artifact lifecycle; never seed completion or dedup from it.
+		return m, false, true
+	}
+	if m.Version != contentMarkerVersion || m.ArtifactID == "" || len(m.ArtifactID) > 128 ||
+		!strings.HasPrefix(m.ArtifactKey, "observer-transcript-v1:") || len(m.ArtifactKey) > 256 ||
+		m.ArtifactDigest != "sha256:"+m.ContentSHA256 {
+		return contentMarker{}, false, false
+	}
+	return m, true, true
+}
+
+func validMarkerContentSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // persistMarker atomically writes the last-uploaded marker (temp file → rename, owner-only). It is

@@ -4,6 +4,9 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -53,7 +56,17 @@ func (f *fakeContentSender) PostContent(_ context.Context, r upload.ContentReque
 	if respond != nil {
 		return respond(n, r)
 	}
-	return &upload.ContentResult{StatusCode: 200, GCSessionID: "gcs", ReceiptID: "r", Status: "accepted"}, nil
+	return finalizedContentResult(r), nil
+}
+
+func finalizedContentResult(r upload.ContentRequest) *upload.ContentResult {
+	sum := sha256.Sum256(r.Body)
+	return &upload.ContentResult{
+		StatusCode:  200,
+		ArtifactID:  "art_1",
+		ArtifactKey: "observer-transcript-v1:test-key",
+		Digest:      "sha256:" + hex.EncodeToString(sum[:]),
+	}
 }
 
 func (f *fakeContentSender) count() int {
@@ -230,7 +243,7 @@ func (h *contentHarness) observe(dev, ino uint64, path string, size, mod int64) 
 
 // --- tests --------------------------------------------------------------------
 
-func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
+func TestContentUploadPassesWholeFileAndLocalIdentity(t *testing.T) {
 	h := newContentHarness(t, contentUploaderConfig{})
 	const dev, ino = 7, 42
 	content := "hello\nworld\n"
@@ -249,7 +262,7 @@ func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
 		t.Fatalf("body = %q, want whole file %q", req.Body, content)
 	}
 	if req.NativeSessionID != "sess-1" || req.Provider != "claude" || req.SourcePath != "/abs/s.jsonl" {
-		t.Fatalf("headers wrong: %+v", req)
+		t.Fatalf("content request identity wrong: %+v", req)
 	}
 }
 
@@ -347,11 +360,11 @@ func TestContentUpload501StopsUploads(t *testing.T) {
 }
 
 func TestContentUpload429HonorsRetryAfter(t *testing.T) {
-	sender := &fakeContentSender{respond: func(n int, _ upload.ContentRequest) (*upload.ContentResult, error) {
+	sender := &fakeContentSender{respond: func(n int, request upload.ContentRequest) (*upload.ContentResult, error) {
 		if n == 0 {
 			return &upload.ContentResult{StatusCode: 429, RetryAfter: 10 * time.Second}, nil
 		}
-		return &upload.ContentResult{StatusCode: 200}, nil
+		return finalizedContentResult(request), nil
 	}}
 	h := newContentHarness(t, contentUploaderConfig{sender: sender})
 	const dev, ino = 5, 6
@@ -401,7 +414,7 @@ func TestContentUploadOversizeSkipped(t *testing.T) {
 	}
 }
 
-func TestContentUpload409LogsAndAdvances(t *testing.T) {
+func TestContentUpload409SuppressesHotLoopWithoutPersistingAcceptance(t *testing.T) {
 	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
 		return &upload.ContentResult{StatusCode: 409}, nil
 	}}
@@ -422,6 +435,32 @@ func TestContentUpload409LogsAndAdvances(t *testing.T) {
 	h.u.tick(context.Background())
 	if sender.count() != 1 {
 		t.Fatalf("409 hot-looped: %d", sender.count())
+	}
+	markerPath := contentMarkerPath(h.stateDir, dev, ino)
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("409 conflict was persisted as acceptance: %v", err)
+	}
+
+	// A process restart must re-probe because the server never accepted this snapshot.
+	sender2 := &fakeContentSender{respond: sender.respond}
+	u2, err := newContentUploader(contentUploaderConfig{
+		sender:   sender2,
+		sessions: h.sessions,
+		stateDir: h.stateDir,
+		read:     h.reader.read,
+		now:      h.clock.now,
+		debounce: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("restart newContentUploader: %v", err)
+	}
+	u2.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "s.jsonl", Path: "/p", Device: dev, Inode: ino, Size: 3, ModNanos: 1,
+	})
+	h.clock.advance(31 * time.Second)
+	u2.tick(context.Background())
+	if sender2.count() != 1 {
+		t.Fatalf("restart did not re-probe 409 conflict: %d", sender2.count())
 	}
 }
 
@@ -461,6 +500,107 @@ func TestContentUploadMarkerSurvivesRestart(t *testing.T) {
 	u2.tick(context.Background())
 	if sender2.count() != 0 {
 		t.Fatalf("re-shipped after restart: %d", sender2.count())
+	}
+}
+
+func TestContentUploadLegacyV1MarkerForcesLifecycleAndUpgradesMarker(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 212, 213
+	body := "legacy-marked-body"
+	h.reader.set(dev, ino, body, 7)
+
+	sum := sha256.Sum256([]byte(body))
+	legacy := contentMarker{
+		Version:         1,
+		Device:          dev,
+		Inode:           ino,
+		ContentSHA256:   hex.EncodeToString(sum[:]),
+		Size:            int64(len(body)),
+		ModNanos:        7,
+		NativeSessionID: "legacy-session",
+		Provider:        "codex",
+		UploadedAt:      "2026-07-31T00:00:00Z",
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("marshal legacy marker: %v", err)
+	}
+	markerPath := contentMarkerPath(h.stateDir, dev, ino)
+	if err := os.WriteFile(markerPath, data, 0o600); err != nil {
+		t.Fatalf("write legacy marker: %v", err)
+	}
+
+	// The live session map is deliberately empty. V1 may supply identity only;
+	// it must never suppress the lifecycle as proof of finalization.
+	h.observe(dev, ino, "/p", int64(len(body)), 7)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("legacy marker suppressed artifact lifecycle: uploads=%d", h.sender.count())
+	}
+
+	upgradedBytes, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("read upgraded marker: %v", err)
+	}
+	var upgraded map[string]any
+	if err := json.Unmarshal(upgradedBytes, &upgraded); err != nil {
+		t.Fatalf("decode upgraded marker: %v", err)
+	}
+	if upgraded["version"] != float64(2) || upgraded["artifact_id"] != "art_1" ||
+		upgraded["artifact_key"] != "observer-transcript-v1:test-key" ||
+		upgraded["artifact_digest"] != "sha256:"+hex.EncodeToString(sum[:]) {
+		t.Fatalf("upgraded marker lacks finalized lifecycle proof: %s", upgradedBytes)
+	}
+}
+
+func TestContentUploadDoesNotLogServerArtifactID(t *testing.T) {
+	sender := &fakeContentSender{respond: func(_ int, request upload.ContentRequest) (*upload.ContentResult, error) {
+		result := finalizedContentResult(request)
+		result.ArtifactID = "private-artifact\nlog-canary"
+		return result, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 214, 215
+	h.reader.set(dev, ino, "body", 1)
+	h.sessions.set(dev, ino, "session", "codex")
+	h.observe(dev, ino, "/p", 4, 1)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	for _, line := range h.logLines() {
+		if strings.Contains(line, "private-artifact") || strings.Contains(line, "log-canary") {
+			t.Fatalf("server artifact ID reached logs: %q", line)
+		}
+	}
+}
+
+func TestContentUploadIncompleteFinalizationNeverPersistsMarker(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*upload.ContentResult)
+	}{
+		{name: "missing artifact id", mutate: func(result *upload.ContentResult) { result.ArtifactID = "" }},
+		{name: "missing artifact key", mutate: func(result *upload.ContentResult) { result.ArtifactKey = "" }},
+		{name: "wrong digest", mutate: func(result *upload.ContentResult) { result.Digest = "sha256:wrong" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sender := &fakeContentSender{respond: func(_ int, request upload.ContentRequest) (*upload.ContentResult, error) {
+				result := finalizedContentResult(request)
+				tt.mutate(result)
+				return result, nil
+			}}
+			h := newContentHarness(t, contentUploaderConfig{sender: sender})
+			const dev, ino = 216, 217
+			h.reader.set(dev, ino, "body", 1)
+			h.sessions.set(dev, ino, "session", "codex")
+			h.observe(dev, ino, "/p", 4, 1)
+			h.clock.advance(31 * time.Second)
+			h.u.tick(context.Background())
+			if _, err := os.Stat(contentMarkerPath(h.stateDir, dev, ino)); !os.IsNotExist(err) {
+				t.Fatalf("invalid finalization persisted marker: %v", err)
+			}
+		})
 	}
 }
 
@@ -531,7 +671,7 @@ func TestContentUploadEndToEndThroughRealWatcher(t *testing.T) {
 		t.Fatalf("uploaded body = %q, want the whole real file %q", req.Body, body)
 	}
 	if req.NativeSessionID != "native-xyz" || req.Provider != "codex" || req.SourcePath != path {
-		t.Fatalf("provenance headers wrong: %+v", req)
+		t.Fatalf("content request identity wrong: %+v", req)
 	}
 }
 
@@ -773,11 +913,11 @@ func TestContentUploadInodeReuseUsesNewSession(t *testing.T) {
 // Theme G: a 429 shed recorded while processing the first job in a tick stops the remaining jobs in
 // that same tick (the hold is re-checked before each POST, not only at tick entry).
 func TestContentUploadMidTickShedStopsRemaining(t *testing.T) {
-	sender := &fakeContentSender{respond: func(n int, _ upload.ContentRequest) (*upload.ContentResult, error) {
+	sender := &fakeContentSender{respond: func(n int, request upload.ContentRequest) (*upload.ContentResult, error) {
 		if n == 0 {
 			return &upload.ContentResult{StatusCode: 429, RetryAfter: 60 * time.Second}, nil
 		}
-		return &upload.ContentResult{StatusCode: 200}, nil
+		return finalizedContentResult(request), nil
 	}}
 	h := newContentHarness(t, contentUploaderConfig{sender: sender})
 	for i, id := range []uint64{81, 82} {

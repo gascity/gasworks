@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gascity/gasworks/internal/observer/artifactapi"
 	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
@@ -305,11 +306,12 @@ type Config struct {
 // the credential fresh on each request, and decodes typed responses against the wire
 // contract.
 type Client struct {
-	http     *http.Client
-	content  *http.Client
-	base     *url.URL
-	sourceID string
-	cred     CredentialSource
+	http      *http.Client
+	content   *http.Client
+	artifacts *artifactapi.ClientWithResponses
+	base      *url.URL
+	sourceID  string
+	cred      CredentialSource
 }
 
 // NewClient validates the configuration and builds the client. It fails closed on an
@@ -361,13 +363,23 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	base := *cfg.Endpoint
 	base.Path = strings.TrimRight(base.Path, "/")
-	return &Client{
+	client := &Client{
 		http:     transport,
 		content:  contentClient,
 		base:     &base,
 		sourceID: cfg.SourceID,
 		cred:     cfg.Credential,
-	}, nil
+	}
+	artifacts, err := artifactapi.NewClientWithResponses(
+		base.String(),
+		artifactapi.WithHTTPClient(artifactResponseDoer{metadata: transport, content: contentClient}),
+		artifactapi.WithRequestEditorFn(client.authorizeArtifactRequest),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("observer upload: build artifact client: %w", err)
+	}
+	client.artifacts = artifacts
+	return client, nil
 }
 
 // checkScheme enforces the HTTPS floor. Plain HTTP is permitted only for a loopback host
@@ -609,8 +621,12 @@ func strictDecodeResponse(data []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if dec.More() {
-		return errors.New("unexpected trailing data")
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("unexpected trailing data")
+		}
+		return fmt.Errorf("unexpected trailing data: %w", err)
 	}
 	return nil
 }
@@ -671,6 +687,9 @@ func classifyDo(err error) error {
 		return err
 	}
 	if errors.Is(err, ErrUnsupportedContentEncoding) {
+		return err
+	}
+	if errors.Is(err, ErrArtifactResponseTooLarge) {
 		return err
 	}
 	// A url.Error wrapping our CheckRedirect error still matches via errors.Is above; any

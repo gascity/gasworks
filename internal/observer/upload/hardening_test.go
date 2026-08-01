@@ -267,6 +267,7 @@ func TestBadAckBodyHeldEndToEnd(t *testing.T) {
 	}{
 		{"unknown field", []byte(`{"source_id":"` + testSourceID + `","acknowledged_through_sequence":4,"accepted":4,"duplicates":0,"surprise":true}`)},
 		{"trailing non-whitespace", []byte(validAck + "garbage")},
+		{"second top-level value", []byte(validAck + `{}`)},
 		{"truncated json", []byte(`{"source_id":"` + testSourceID + `","acknowledged_through_sequence":4,`)},
 		{"empty body", []byte(``)},
 		// Oversized: a valid ack followed by >maxResponseBytes of non-whitespace, so the
