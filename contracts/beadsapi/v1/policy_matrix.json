@@ -1,0 +1,1016 @@
+{
+  "schema_version": "beads-team-server/api-policy-matrix/1",
+  "description": "Checked API-policy matrix for the canonical /api/v1 contract. One row per public operation; this is the only policy table in the repository and the row-set authority for api/v1/openapi.yaml.",
+  "provenance": {
+    "decomposition_run": "20260730T013144Z-58268be5",
+    "design_task": "API-1.2.design",
+    "design_document": ".decompose/authenticated-api/runs/20260730T013144Z-58268be5/clean/execution/frontier-3/API-1.2_canonical_contract_design.md",
+    "design_document_sha256": "sha256:9bf45dea58d3b3f0bbada6149aeec395a038ccb37793f7f4432be388ba6ca156",
+    "upstream_artifact": ".decompose/authenticated-api/runs/20260730T013144Z-58268be5/candidate/operation_matrix_v6.json",
+    "candidate_digest": "sha256:2e136ab8651b0c4db7338196a541c7a1829e44fcb90fba8063655305b83f0b0d"
+  },
+  "digest_algorithm": "sha256 of the UTF-8 canonical JSON encoding of {\"rows\":<rows>,\"schema\":<schema>} with lexicographically sorted object keys, \",\" and \":\" separators, no insignificant whitespace, and non-ASCII emitted literally.",
+  "operation_matrix_digest": "sha256:65f5f0fc3bae0f23a7bd4058b7b50f9513317d9247ea6804fca806c400abaad0",
+  "required_group_counts": {
+    "artifact": 8,
+    "beads_event": 2,
+    "city": 5,
+    "inference": 3,
+    "project_issue_children_mutation": 7,
+    "provisioning": 3,
+    "run_session_transcript": 11
+  },
+  "schema": [
+    "group",
+    "method",
+    "path",
+    "operationId",
+    "audience",
+    "public_scope",
+    "profiles",
+    "auth_classes",
+    "tenant_resolver",
+    "source_rule",
+    "idempotency_policy",
+    "content_class",
+    "internal_audience",
+    "internal_category",
+    "storage_verb",
+    "compatibility_aliases",
+    "owning_handler_service"
+  ],
+  "rows": [
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "provisioning",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listBeadsBackends",
+      "owning_handler_service": "BTS.ProvisioningService.listBackends",
+      "path": "/api/v1/beads/backends",
+      "profiles": [
+        "provisioning"
+      ],
+      "public_scope": "beads:backends.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "provisioning",
+      "idempotency_policy": "human_create_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "createBeadsProject",
+      "owning_handler_service": "BTS.ProvisioningService.createProject",
+      "path": "/api/v1/beads/projects",
+      "profiles": [
+        "provisioning"
+      ],
+      "public_scope": "beads:projects.create",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "provisioning",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getBeadsProjectStatus",
+      "owning_handler_service": "BTS.ProvisioningService.getProjectStatus",
+      "path": "/api/v1/beads/projects/{project}/status",
+      "profiles": [
+        "provisioning"
+      ],
+      "public_scope": "beads:projects.status.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listBeadsProjectIssues",
+      "owning_handler_service": "BTS.BeadsIssueService.list",
+      "path": "/api/v1/beads/projects/{project}/issues",
+      "profiles": [
+        "board_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:issues.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getBeadsProjectIssue",
+      "owning_handler_service": "BTS.BeadsIssueService.get",
+      "path": "/api/v1/beads/projects/{project}/issues/{issue}",
+      "profiles": [
+        "board_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:issues.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listBeadsIssueChildren",
+      "owning_handler_service": "BTS.BeadsIssueService.listChildren",
+      "path": "/api/v1/beads/projects/{project}/issues/{issue}/children",
+      "profiles": [
+        "board_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:issues.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "human_create_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "createBeadsProjectIssue",
+      "owning_handler_service": "BTS.BeadsIssueService.create",
+      "path": "/api/v1/beads/projects/{project}/issues",
+      "profiles": [
+        "board_mutation"
+      ],
+      "public_scope": "beads:issues.create",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "human_create_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "PATCH",
+      "operationId": "updateBeadsProjectIssue",
+      "owning_handler_service": "BTS.BeadsIssueService.update",
+      "path": "/api/v1/beads/projects/{project}/issues/{issue}",
+      "profiles": [
+        "board_mutation"
+      ],
+      "public_scope": "beads:issues.update",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "human_create_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "closeBeadsProjectIssue",
+      "owning_handler_service": "BTS.BeadsIssueService.close",
+      "path": "/api/v1/beads/projects/{project}/issues/{issue}/close",
+      "profiles": [
+        "board_mutation"
+      ],
+      "public_scope": "beads:issues.close",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "project_issue_children_mutation",
+      "idempotency_policy": "human_create_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "reopenBeadsProjectIssue",
+      "owning_handler_service": "BTS.BeadsIssueService.reopen",
+      "path": "/api/v1/beads/projects/{project}/issues/{issue}/reopen",
+      "profiles": [
+        "board_mutation"
+      ],
+      "public_scope": "beads:issues.reopen",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "event_metadata",
+      "group": "beads_event",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listBeadsProjectEvents",
+      "owning_handler_service": "BTS.BeadsEventService.list",
+      "path": "/api/v1/beads/projects/{project}/events",
+      "profiles": [
+        "event_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:events.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "event_metadata",
+      "group": "beads_event",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "streamBeadsProjectEvents",
+      "owning_handler_service": "BTS.BeadsEventService.stream",
+      "path": "/api/v1/beads/projects/{project}/events/stream",
+      "profiles": [
+        "event_stream",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:events.stream",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_project_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "upsertRun",
+      "owning_handler_service": "BTS.RunService.upsert",
+      "path": "/api/v1/runs",
+      "profiles": [
+        "producer_ingest"
+      ],
+      "public_scope": "beads:runs.write",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listRuns",
+      "owning_handler_service": "BTS.RunService.list",
+      "path": "/api/v1/runs",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:runs.read",
+      "source_rule": "optional_source_filter_server_validated",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getRun",
+      "owning_handler_service": "BTS.RunService.get",
+      "path": "/api/v1/runs/{run}",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:runs.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "upsertRunSession",
+      "owning_handler_service": "BTS.SessionService.upsertForRun",
+      "path": "/api/v1/runs/{run}/sessions",
+      "profiles": [
+        "producer_ingest"
+      ],
+      "public_scope": "beads:sessions.write",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listSessions",
+      "owning_handler_service": "BTS.SessionService.list",
+      "path": "/api/v1/sessions",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:sessions.read",
+      "source_rule": "optional_source_filter_server_validated",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getSession",
+      "owning_handler_service": "BTS.SessionService.get",
+      "path": "/api/v1/sessions/{session}",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:sessions.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "finalizeSession",
+      "owning_handler_service": "BTS.SessionService.finalize",
+      "path": "/api/v1/sessions/{session}/finalize",
+      "profiles": [
+        "producer_ingest"
+      ],
+      "public_scope": "beads:sessions.finalize",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "sensitive_content",
+      "group": "run_session_transcript",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "createTranscriptRecord",
+      "owning_handler_service": "BTS.TranscriptService.createRecord",
+      "path": "/api/v1/sessions/{session}/transcript-records",
+      "profiles": [
+        "producer_ingest"
+      ],
+      "public_scope": "beads:transcripts.write",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listTranscriptRecords",
+      "owning_handler_service": "BTS.TranscriptService.listRecords",
+      "path": "/api/v1/sessions/{session}/transcript-records",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:transcripts.read",
+      "source_rule": "optional_source_filter_server_validated",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getTranscriptRecord",
+      "owning_handler_service": "BTS.TranscriptService.getRecord",
+      "path": "/api/v1/sessions/{session}/transcript-records/{record}",
+      "profiles": [
+        "metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:transcripts.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "sensitive_content",
+      "group": "run_session_transcript",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getSessionTranscript",
+      "owning_handler_service": "BTS.TranscriptService.getContent",
+      "path": "/api/v1/sessions/{session}/transcript",
+      "profiles": [
+        "content_read",
+        "analysis_content"
+      ],
+      "public_scope": "beads:transcripts.content.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_metadata",
+      "group": "artifact",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "artifacts",
+      "internal_category": "metadata",
+      "method": "POST",
+      "operationId": "createArtifact",
+      "owning_handler_service": "BTS.ArtifactService.create",
+      "path": "/api/v1/artifacts",
+      "profiles": [
+        "artifact_ingest"
+      ],
+      "public_scope": "beads:artifacts.create",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "create",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_metadata",
+      "group": "artifact",
+      "idempotency_policy": "none",
+      "internal_audience": "artifacts",
+      "internal_category": "metadata",
+      "method": "GET",
+      "operationId": "listArtifacts",
+      "owning_handler_service": "BTS.ArtifactService.list",
+      "path": "/api/v1/artifacts",
+      "profiles": [
+        "artifact_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:artifacts.list",
+      "source_rule": "optional_source_filter_server_validated",
+      "storage_verb": "list",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_metadata",
+      "group": "artifact",
+      "idempotency_policy": "none",
+      "internal_audience": "artifacts",
+      "internal_category": "metadata",
+      "method": "GET",
+      "operationId": "getArtifact",
+      "owning_handler_service": "BTS.ArtifactService.get",
+      "path": "/api/v1/artifacts/{artifact}",
+      "profiles": [
+        "artifact_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:artifacts.read",
+      "source_rule": "none",
+      "storage_verb": "get",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_evidence",
+      "group": "artifact",
+      "idempotency_policy": "none",
+      "internal_audience": "artifacts",
+      "internal_category": "evidence",
+      "method": "GET",
+      "operationId": "getArtifactEvidence",
+      "owning_handler_service": "BTS.ArtifactService.getEvidence",
+      "path": "/api/v1/artifacts/{artifact}/evidence",
+      "profiles": [
+        "artifact_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:artifacts.evidence.read",
+      "source_rule": "none",
+      "storage_verb": "get",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_references",
+      "group": "artifact",
+      "idempotency_policy": "none",
+      "internal_audience": "artifacts",
+      "internal_category": "references",
+      "method": "GET",
+      "operationId": "getArtifactReferences",
+      "owning_handler_service": "BTS.ArtifactService.getReferences",
+      "path": "/api/v1/artifacts/{artifact}/references",
+      "profiles": [
+        "artifact_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:artifacts.references.read",
+      "source_rule": "none",
+      "storage_verb": "get",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_content",
+      "group": "artifact",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "artifacts",
+      "internal_category": "content",
+      "method": "POST",
+      "operationId": "uploadArtifactContent",
+      "owning_handler_service": "BTS.ArtifactService.uploadContent",
+      "path": "/api/v1/artifacts/{artifact}/content",
+      "profiles": [
+        "artifact_ingest"
+      ],
+      "public_scope": "beads:artifacts.content.write",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "write_part",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_metadata",
+      "group": "artifact",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "artifacts",
+      "internal_category": "metadata",
+      "method": "POST",
+      "operationId": "finalizeArtifact",
+      "owning_handler_service": "BTS.ArtifactService.finalize",
+      "path": "/api/v1/artifacts/{artifact}/finalize",
+      "profiles": [
+        "artifact_ingest"
+      ],
+      "public_scope": "beads:artifacts.finalize",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "finalize",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "artifact_content",
+      "group": "artifact",
+      "idempotency_policy": "none",
+      "internal_audience": "artifacts",
+      "internal_category": "content",
+      "method": "GET",
+      "operationId": "getArtifactContent",
+      "owning_handler_service": "BTS.ArtifactService.getContent",
+      "path": "/api/v1/artifacts/{artifact}/content",
+      "profiles": [
+        "artifact_content_read",
+        "analysis_content"
+      ],
+      "public_scope": "beads:artifacts.content.read",
+      "source_rule": "none",
+      "storage_verb": "read_range",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "inference_metadata",
+      "group": "inference",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "createInference",
+      "owning_handler_service": "BTS.InferenceService.create",
+      "path": "/api/v1/inferences",
+      "profiles": [
+        "inference_ingest"
+      ],
+      "public_scope": "beads:inferences.write",
+      "source_rule": "required_enrolled_workspace_source",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "inference_metadata",
+      "group": "inference",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listInferences",
+      "owning_handler_service": "BTS.InferenceService.list",
+      "path": "/api/v1/inferences",
+      "profiles": [
+        "inference_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:inferences.read",
+      "source_rule": "optional_source_filter_server_validated",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "inference_metadata",
+      "group": "inference",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "getInference",
+      "owning_handler_service": "BTS.InferenceService.get",
+      "path": "/api/v1/inferences/{inference}",
+      "profiles": [
+        "inference_metadata_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:inferences.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "machine_bearer"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "city_event_optional_sensitive",
+      "group": "city",
+      "idempotency_policy": "machine_ingest_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "createCityEvent",
+      "owning_handler_service": "BTS.CityEventService.create",
+      "path": "/api/v1/city/{city}/events",
+      "profiles": [
+        "city_event_ingest"
+      ],
+      "public_scope": "beads:city.events.write",
+      "source_rule": "required_city_source_bound_to_path_city",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_city_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "city_event_optional_sensitive",
+      "group": "city",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listCityEvents",
+      "owning_handler_service": "BTS.CityEventService.list",
+      "path": "/api/v1/city/{city}/events",
+      "profiles": [
+        "city_event_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:city.events.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_city_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "city_event_optional_sensitive",
+      "group": "city",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "streamCityEvents",
+      "owning_handler_service": "BTS.CityEventService.stream",
+      "path": "/api/v1/city/{city}/events/stream",
+      "profiles": [
+        "city_event_stream",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:city.events.stream",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_city_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "city",
+      "idempotency_policy": "none",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "GET",
+      "operationId": "listCityBeadsIssues",
+      "owning_handler_service": "BTS.CityBeadsService.listIssues",
+      "path": "/api/v1/city/{city}/beads/issues",
+      "profiles": [
+        "board_read",
+        "analysis_metadata"
+      ],
+      "public_scope": "beads:city.beads.read",
+      "source_rule": "none",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_city_path"
+    },
+    {
+      "audience": "beads",
+      "auth_classes": [
+        "human_bearer",
+        "machine_bearer",
+        "same_origin_browser_session"
+      ],
+      "compatibility_aliases": [],
+      "content_class": "metadata",
+      "group": "city",
+      "idempotency_policy": "human_or_machine_dispatch_v1",
+      "internal_audience": "none",
+      "internal_category": "none",
+      "method": "POST",
+      "operationId": "slingCityWork",
+      "owning_handler_service": "BTS.CitySlingGateway.dispatch",
+      "path": "/api/v1/city/{city}/sling",
+      "profiles": [
+        "city_sling"
+      ],
+      "public_scope": "beads:city.sling",
+      "source_rule": "source_from_signed_policy_when_applicable",
+      "storage_verb": "none",
+      "tenant_resolver": "resolve_org_workspace_then_city_path"
+    }
+  ]
+}

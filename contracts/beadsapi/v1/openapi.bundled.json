@@ -1,0 +1,4455 @@
+{
+  "components": {
+    "headers": {
+      "RequestId": {
+        "description": "Correlation id echoed on every response, success or problem.",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      }
+    },
+    "parameters": {
+      "artifactPath": {
+        "in": "path",
+        "name": "artifact",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "cityPath": {
+        "in": "path",
+        "name": "city",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "cursor": {
+        "description": "Opaque, tenant-bound continuation token from a previous `next_cursor`.",
+        "in": "query",
+        "name": "cursor",
+        "required": false,
+        "schema": {
+          "maxLength": 2048,
+          "type": "string"
+        }
+      },
+      "filterAssignee": {
+        "in": "query",
+        "name": "assignee",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "filterContentStatus": {
+        "in": "query",
+        "name": "content_status",
+        "required": false,
+        "schema": {
+          "items": {
+            "$ref": "#/components/schemas/ContentStatus"
+          },
+          "maxItems": 8,
+          "type": "array"
+        }
+      },
+      "filterEventKind": {
+        "in": "query",
+        "name": "kind",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        }
+      },
+      "filterIncludeClosed": {
+        "in": "query",
+        "name": "include_closed",
+        "required": false,
+        "schema": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "filterIssue": {
+        "in": "query",
+        "name": "issue",
+        "required": false,
+        "schema": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "filterIssueOwner": {
+        "description": "Attribution filter over the read-only `owner` field. Never an authorization or tenancy input.",
+        "in": "query",
+        "name": "issue_owner",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "filterLabel": {
+        "in": "query",
+        "name": "label",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        }
+      },
+      "filterProject": {
+        "in": "query",
+        "name": "project",
+        "required": false,
+        "schema": {
+          "maxLength": 128,
+          "type": "string"
+        }
+      },
+      "filterRole": {
+        "in": "query",
+        "name": "role",
+        "required": false,
+        "schema": {
+          "items": {
+            "$ref": "#/components/schemas/TranscriptRole"
+          },
+          "maxItems": 8,
+          "type": "array"
+        }
+      },
+      "filterSince": {
+        "in": "query",
+        "name": "since",
+        "required": false,
+        "schema": {
+          "format": "date-time",
+          "maxLength": 64,
+          "type": "string"
+        }
+      },
+      "filterSource": {
+        "description": "Logical source filter, validated server-side against the caller's enrolled sources.",
+        "in": "query",
+        "name": "source",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "filterStatus": {
+        "in": "query",
+        "name": "status",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "filterType": {
+        "in": "query",
+        "name": "type",
+        "required": false,
+        "schema": {
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array"
+        }
+      },
+      "filterUpdatedSince": {
+        "in": "query",
+        "name": "updated_since",
+        "required": false,
+        "schema": {
+          "format": "date-time",
+          "maxLength": 64,
+          "type": "string"
+        }
+      },
+      "idempotencyKey": {
+        "description": "Caller-chosen idempotency identity. Required for every operation whose matrix row carries a non-`none` idempotency policy.",
+        "in": "header",
+        "name": "Idempotency-Key",
+        "required": true,
+        "schema": {
+          "maxLength": 255,
+          "minLength": 8,
+          "type": "string"
+        }
+      },
+      "inferencePath": {
+        "in": "path",
+        "name": "inference",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "issuePath": {
+        "in": "path",
+        "name": "issue",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "lastEventId": {
+        "description": "SSE resume point. Streams also accept `cursor`; both resolve to the same sequence position.",
+        "in": "header",
+        "name": "Last-Event-ID",
+        "required": false,
+        "schema": {
+          "maxLength": 2048,
+          "type": "string"
+        }
+      },
+      "limit": {
+        "description": "Page size. Values above the server maximum clamp; they never error into an unbounded read.",
+        "in": "query",
+        "name": "limit",
+        "required": false,
+        "schema": {
+          "default": 50,
+          "maximum": 200,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "projectPath": {
+        "in": "path",
+        "name": "project",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "recordPath": {
+        "in": "path",
+        "name": "record",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "runPath": {
+        "in": "path",
+        "name": "run",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "sessionPath": {
+        "in": "path",
+        "name": "session",
+        "required": true,
+        "schema": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "Problem": {
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        },
+        "description": "RFC 9457 problem document. Absent-versus-foreign is indistinguishable: a problem for\nanother tenant's resource is byte-equivalent to not-found. Upstream bytes are never\nproxied into the problem.\n",
+        "headers": {
+          "X-Request-Id": {
+            "$ref": "#/components/headers/RequestId"
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Artifact": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "artifact_key": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "byte_length": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "digest": {
+            "maxLength": 256,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "media_type": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "finalized",
+              "failed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "artifact_key",
+          "kind",
+          "media_type",
+          "state",
+          "byte_length",
+          "digest",
+          "created_at",
+          "provenance",
+          "links"
+        ],
+        "type": "object"
+      },
+      "ArtifactCategory": {
+        "description": "The closed four-category artifact grammar.",
+        "enum": [
+          "content",
+          "evidence",
+          "metadata",
+          "references"
+        ],
+        "type": "string"
+      },
+      "ArtifactContentPart": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "part_number": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "received_byte_length": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "part_number",
+          "received_byte_length"
+        ],
+        "type": "object"
+      },
+      "ArtifactEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactEvidenceEntry"
+            },
+            "maxItems": 256,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "entries",
+          "links"
+        ],
+        "type": "object"
+      },
+      "ArtifactEvidenceEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "recorded_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "value": {
+            "maxLength": 4096,
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ArtifactList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Artifact"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "ArtifactReference": {
+        "additionalProperties": false,
+        "properties": {
+          "relation": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "target_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "target_kind": {
+            "enum": [
+              "run",
+              "session",
+              "transcript_record",
+              "issue",
+              "inference",
+              "artifact"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "relation",
+          "target_kind",
+          "target_id"
+        ],
+        "type": "object"
+      },
+      "ArtifactReferences": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactReference"
+            },
+            "maxItems": 256,
+            "type": "array"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "references",
+          "links"
+        ],
+        "type": "object"
+      },
+      "BeadsBackend": {
+        "additionalProperties": false,
+        "description": "One offerable substrate combination. The wizard axes (history, zone, residency, tenancy, pitr, deadline, offered tiers) are carried so a client renders exclusively from this list and can never offer a combination the create verb would refuse.",
+        "properties": {
+          "display_name": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "history": {
+            "type": "boolean"
+          },
+          "id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "kind": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "offered_tiers": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "pitr": {
+            "type": "boolean"
+          },
+          "provision_deadline_seconds": {
+            "maximum": 86400,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "residency": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "available",
+              "degraded",
+              "unavailable"
+            ],
+            "type": "string"
+          },
+          "tenancy": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "zone": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "zone_label": {
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "display_name",
+          "status"
+        ],
+        "type": "object"
+      },
+      "BeadsBackendList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BeadsBackend"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sizes": {
+            "items": {
+              "$ref": "#/components/schemas/BeadsSizeTier"
+            },
+            "maxItems": 64,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "BeadsConnection": {
+        "additionalProperties": false,
+        "description": "How to point a local bd at this project. Provisioning-only: there is deliberately no connector, connect or sync member, and none may be added back.",
+        "properties": {
+          "audience": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "backend": {
+            "enum": [
+              "dolt",
+              "postgres"
+            ],
+            "type": "string"
+          },
+          "database": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "gateway_host": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "gateway_port": {
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "org_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "recipe": {
+            "$ref": "#/components/schemas/BeadsConnectionRecipe"
+          },
+          "tls": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "gateway_host",
+          "gateway_port",
+          "tls",
+          "database",
+          "backend",
+          "audience",
+          "org_id",
+          "recipe"
+        ],
+        "type": "object"
+      },
+      "BeadsConnectionRecipe": {
+        "additionalProperties": false,
+        "description": "Vendor-neutral local-bd onboarding. bd runs a configured credential command and authenticates with the short-lived token it prints.",
+        "properties": {
+          "credential_helper": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "env": {
+            "additionalProperties": {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "maxProperties": 32,
+            "type": "object"
+          },
+          "login": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "shell": {
+            "maxLength": 8192,
+            "type": "string"
+          }
+        },
+        "required": [
+          "login",
+          "credential_helper",
+          "env",
+          "shell"
+        ],
+        "type": "object"
+      },
+      "BeadsEvent": {
+        "additionalProperties": false,
+        "description": "Sequence-ordered project event. Dedupe key is (project_id, seq). Identical shape on history and stream.",
+        "properties": {
+          "dependency": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IssueDependency"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "issue": {
+            "description": "Full post-mutation issue. Null only for `delete`.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Issue"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "issue_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "create",
+              "update",
+              "close",
+              "delete",
+              "dep_add",
+              "dep_remove"
+            ],
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ts": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "seq",
+          "ts",
+          "op",
+          "issue_id",
+          "issue",
+          "dependency"
+        ],
+        "type": "object"
+      },
+      "BeadsEventList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BeadsEvent"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "BeadsProject": {
+        "additionalProperties": false,
+        "properties": {
+          "backend_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "connection": {
+            "$ref": "#/components/schemas/BeadsConnection"
+          },
+          "created_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "database": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "issue_prefix": {
+            "maxLength": 32,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "name": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "size": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "provisioning",
+              "ready",
+              "degraded",
+              "unavailable"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "name",
+          "backend_id",
+          "state",
+          "created_at",
+          "links"
+        ],
+        "type": "object"
+      },
+      "BeadsProjectStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "connection": {
+            "$ref": "#/components/schemas/BeadsConnection"
+          },
+          "detail": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "issue_count": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "project_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "provisioning",
+              "ready",
+              "degraded",
+              "unavailable"
+            ],
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "state",
+          "issue_count",
+          "updated_at",
+          "links"
+        ],
+        "type": "object"
+      },
+      "BeadsSizeTier": {
+        "additionalProperties": false,
+        "description": "One row of the size catalog. Residency-independent, so it ships in full alongside every filtered backend page.",
+        "properties": {
+          "max_conns": {
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "storage_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "storage_bytes",
+          "max_conns"
+        ],
+        "type": "object"
+      },
+      "CityEvent": {
+        "additionalProperties": false,
+        "description": "Durable city-ordered event. Historical and stream representations are identical.",
+        "properties": {
+          "city_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "content_status": {
+            "$ref": "#/components/schemas/ContentStatus"
+          },
+          "kind": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": {
+              "maxLength": 8192,
+              "type": "string"
+            },
+            "description": "Bounded string map; optionally sensitive and withheld under the signed content policy.",
+            "maxProperties": 128,
+            "type": "object"
+          },
+          "seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "city_id",
+          "source_id",
+          "seq",
+          "ts",
+          "kind",
+          "content_status",
+          "payload"
+        ],
+        "type": "object"
+      },
+      "CityEventList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CityEvent"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "ContentStatus": {
+        "description": "Sensitive content is omitted from metadata reads; `withheld` records that omission honestly.",
+        "enum": [
+          "present",
+          "withheld",
+          "absent",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "ContributorSummary": {
+        "additionalProperties": false,
+        "description": "Aggregate contributor context. Never a fabricated singular uploader.",
+        "properties": {
+          "principal_count": {
+            "maximum": 100000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_ids": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_ids",
+          "principal_count"
+        ],
+        "type": "object"
+      },
+      "CreateArtifactRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "declared_byte_length": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "declared_digest": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "kind": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "media_type": {
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_key",
+          "kind",
+          "media_type"
+        ],
+        "type": "object"
+      },
+      "CreateBeadsProjectRequest": {
+        "additionalProperties": false,
+        "description": "The tenant is resolved from the caller's credential, never from this body: there is no org or workspace member, so a body cannot select a foreign tenant.",
+        "properties": {
+          "backend_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "issue_prefix": {
+            "maxLength": 32,
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "size": {
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "backend_id"
+        ],
+        "type": "object"
+      },
+      "CreateCityEventRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": {
+              "maxLength": 8192,
+              "type": "string"
+            },
+            "maxProperties": 128,
+            "type": "object"
+          },
+          "seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ts": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "ts",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "CreateInferenceRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "inference_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "model": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "ok",
+              "error",
+              "cancelled",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "session_key": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "token_usage": {
+            "$ref": "#/components/schemas/TokenUsage"
+          }
+        },
+        "required": [
+          "inference_key",
+          "provider",
+          "model",
+          "outcome",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "CreateIssueRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "assignee": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "maxLength": 65536,
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "parent": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "maximum": 4,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "type": "object"
+      },
+      "CreateTranscriptRecordRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "maxLength": 1048576,
+            "type": "string"
+          },
+          "content_status": {
+            "$ref": "#/components/schemas/ContentStatus"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TranscriptRole"
+          },
+          "seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ts": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "ts",
+          "role",
+          "content_status"
+        ],
+        "type": "object"
+      },
+      "FinalizeArtifactRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "byte_length": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "digest": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "byte_length",
+          "digest"
+        ],
+        "type": "object"
+      },
+      "FinalizeSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "record_count": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          }
+        },
+        "required": [
+          "ended_at",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Inference": {
+        "additionalProperties": false,
+        "description": "Inference metadata only. Prompt, completion, and transcript text are never duplicated here.",
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inference_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "inference_key": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "model": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "ok",
+              "error",
+              "cancelled",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "provider": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "token_usage": {
+            "$ref": "#/components/schemas/TokenUsage"
+          }
+        },
+        "required": [
+          "inference_id",
+          "inference_key",
+          "provider",
+          "model",
+          "outcome",
+          "started_at",
+          "ended_at",
+          "provenance",
+          "links"
+        ],
+        "type": "object"
+      },
+      "InferenceList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Inference"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "Issue": {
+        "additionalProperties": false,
+        "description": "The one closed issue DTO. Every operation returning an issue - list row, detail,\ncreate, update, close, reopen, children, and the `issue` field of a Beads event -\nreturns this schema. `description` and `metadata` are populated on detail reads.\n",
+        "properties": {
+          "assignee": {
+            "description": "Attribution only. `null` is the unassigned facet token.",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "dependencies": {
+            "items": {
+              "$ref": "#/components/schemas/IssueDependency"
+            },
+            "maxItems": 256,
+            "type": "array"
+          },
+          "description": {
+            "maxLength": 65536,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "display": {
+            "$ref": "#/components/schemas/IssueDisplay"
+          },
+          "id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "owner": {
+            "description": "Read-only attribution. Never writable and never an authorization or tenancy input.",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preview": {
+            "description": "Server-derived, deterministic, bounded truncation of `description`.",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "priority": {
+            "maximum": 4,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rig": {
+            "description": "Read-only attribution.",
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/IssueSource"
+          },
+          "status": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "preview",
+          "status",
+          "type",
+          "assignee",
+          "owner",
+          "rig",
+          "labels",
+          "priority",
+          "created_at",
+          "updated_at",
+          "closed_at",
+          "dependencies",
+          "parent",
+          "display",
+          "source"
+        ],
+        "type": "object"
+      },
+      "IssueDependency": {
+        "additionalProperties": false,
+        "description": "Canonical direction is containing issue to upstream target. Only `blocks` affects readiness.",
+        "properties": {
+          "target_issue_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "blocks",
+              "related",
+              "parent_child",
+              "discovered_from"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_issue_id",
+          "type"
+        ],
+        "type": "object"
+      },
+      "IssueDisplay": {
+        "additionalProperties": false,
+        "properties": {
+          "is_control_bead": {
+            "type": "boolean"
+          },
+          "is_session_bead": {
+            "type": "boolean"
+          },
+          "is_workflow_work_item": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "is_session_bead",
+          "is_control_bead",
+          "is_workflow_work_item"
+        ],
+        "type": "object"
+      },
+      "IssueList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Issue"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "IssueSource": {
+        "additionalProperties": false,
+        "description": "Mode-stable aggregation context. One issue yields one source triple regardless of which operation returned it.",
+        "properties": {
+          "project_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "project_name": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "rig_name": {
+            "description": "Display attribution only; absent rather than fabricated from an id prefix.",
+            "maxLength": 256,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "project_name"
+        ],
+        "type": "object"
+      },
+      "LifecycleStatus": {
+        "enum": [
+          "running",
+          "finalized",
+          "failed",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "Link": {
+        "additionalProperties": false,
+        "properties": {
+          "href": {
+            "format": "uri-reference",
+            "maxLength": 2048,
+            "type": "string"
+          }
+        },
+        "required": [
+          "href"
+        ],
+        "type": "object"
+      },
+      "Links": {
+        "additionalProperties": false,
+        "description": "Tenant-bound relation map. A link is only mintable from a response the caller was authorized to read.",
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "next": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "run": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "self": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "session": {
+            "$ref": "#/components/schemas/Link"
+          },
+          "transcript": {
+            "$ref": "#/components/schemas/Link"
+          }
+        },
+        "required": [
+          "self"
+        ],
+        "type": "object"
+      },
+      "Metadata": {
+        "additionalProperties": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "description": "Bounded string map. Keys prefixed `gc.` are system keys and stay plain entries.",
+        "maxProperties": 64,
+        "type": "object"
+      },
+      "PatchIssueRequest": {
+        "additionalProperties": false,
+        "description": "Any subset of the drawer-editable fields; a debounced merge may send one field or all of them.",
+        "minProperties": 1,
+        "properties": {
+          "add_labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "assignee": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "maxLength": 65536,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "parent": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "priority": {
+            "maximum": 4,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "remove_labels": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          },
+          "status": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "title": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "Problem": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "detail": {
+            "maxLength": 2048,
+            "type": "string"
+          },
+          "instance": {
+            "format": "uri",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "status": {
+            "maximum": 599,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "title": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "type": {
+            "format": "uri",
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "request_id",
+          "code"
+        ],
+        "type": "object"
+      },
+      "Provenance": {
+        "additionalProperties": false,
+        "description": "Server-derived and immutable. Tenancy, principal, logical source, accepted-record id,\nnormalized schema version, ingestion time, and policy digest are never caller inputs;\nrequest schemas reject them.\n",
+        "properties": {
+          "ingested_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "org_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "policy_digest": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "principal_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "principal_type": {
+            "enum": [
+              "human",
+              "machine"
+            ],
+            "type": "string"
+          },
+          "schema_version": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "source_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "source_kind": {
+            "enum": [
+              "city",
+              "manifold",
+              "custom_orchestrator",
+              "beads"
+            ],
+            "type": "string"
+          },
+          "workspace_id": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "required": [
+          "org_id",
+          "workspace_id",
+          "principal_id",
+          "principal_type",
+          "source_id",
+          "source_kind",
+          "ingested_at",
+          "schema_version",
+          "policy_digest"
+        ],
+        "type": "object"
+      },
+      "Run": {
+        "additionalProperties": false,
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "run_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "run_key": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "source_summary": {
+            "$ref": "#/components/schemas/ContributorSummary"
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          },
+          "title": {
+            "maxLength": 512,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "run_id",
+          "run_key",
+          "status",
+          "started_at",
+          "ended_at",
+          "source_summary",
+          "provenance",
+          "links"
+        ],
+        "type": "object"
+      },
+      "RunList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Run"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "record_count": {
+            "maximum": 100000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "run_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "session_key": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "source_summary": {
+            "$ref": "#/components/schemas/ContributorSummary"
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          }
+        },
+        "required": [
+          "session_id",
+          "session_key",
+          "run_id",
+          "status",
+          "started_at",
+          "ended_at",
+          "source_summary",
+          "provenance",
+          "links"
+        ],
+        "type": "object"
+      },
+      "SessionList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Session"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "SessionTranscript": {
+        "additionalProperties": false,
+        "description": "Rendered transcript for one session; a single sensitive-content read, not a paginated list.",
+        "properties": {
+          "byte_length": {
+            "maximum": 16777216,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "content": {
+            "maxLength": 16777216,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_status": {
+            "$ref": "#/components/schemas/ContentStatus"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "session_id": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "content_status",
+          "content",
+          "byte_length",
+          "links"
+        ],
+        "type": "object"
+      },
+      "SlingDispatch": {
+        "additionalProperties": false,
+        "properties": {
+          "city_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "dispatch_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "formula": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "state": {
+            "enum": [
+              "accepted",
+              "running",
+              "completed",
+              "failed"
+            ],
+            "type": "string"
+          },
+          "target": {
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        "required": [
+          "dispatch_id",
+          "city_id",
+          "target",
+          "formula",
+          "state",
+          "links"
+        ],
+        "type": "object"
+      },
+      "SlingRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "formula": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "target": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "vars": {
+            "additionalProperties": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxProperties": 64,
+            "type": "object"
+          }
+        },
+        "required": [
+          "target",
+          "formula"
+        ],
+        "type": "object"
+      },
+      "TokenUsage": {
+        "additionalProperties": false,
+        "properties": {
+          "cached_input_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
+      "TranscriptRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "description": "Sensitive content. Omitted, with content_status withheld, unless the credential carries the content scope and the signed sensitive-content policy allows the read.",
+            "maxLength": 1048576,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_status": {
+            "$ref": "#/components/schemas/ContentStatus"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          },
+          "record_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/TranscriptRole"
+          },
+          "seq": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "record_id",
+          "session_id",
+          "seq",
+          "ts",
+          "role",
+          "content_status",
+          "content",
+          "provenance"
+        ],
+        "type": "object"
+      },
+      "TranscriptRecordList": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/TranscriptRecord"
+            },
+            "maxItems": 200,
+            "type": "array"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          },
+          "next_cursor": {
+            "maxLength": 2048,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "links"
+        ],
+        "type": "object"
+      },
+      "TranscriptRole": {
+        "enum": [
+          "user",
+          "assistant",
+          "system",
+          "tool",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "UpsertRunRequest": {
+        "additionalProperties": false,
+        "description": "Natural-key upsert. Ownership, principal, and logical source are derived from the credential, never accepted here.",
+        "properties": {
+          "ended_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "run_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          },
+          "title": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_key",
+          "status",
+          "started_at"
+        ],
+        "type": "object"
+      },
+      "UpsertSessionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "session_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LifecycleStatus"
+          }
+        },
+        "required": [
+          "session_key",
+          "status",
+          "started_at"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "beadsBearer": {
+        "bearerFormat": "JWT",
+        "description": "Bearer assertion issued for this deployment with `aud=beads`. Tenancy, principal\nidentity, and logical source are derived from the verified assertion; they are never\nread from the request body, path, or query string. Query-string tokens are rejected.\n",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Every operation is snake_case on the wire, returns closed DTOs (no raw upstream\npassthrough), reports failures as RFC 9457 problem documents carrying `request_id`,\nand paginates through opaque tenant-bound cursors.\n",
+    "summary": "Authenticated, tenant-scoped API for Beads projects, runs, sessions, transcripts, artifacts, inferences, and Gas City aggregation.",
+    "title": "Beads Team Server API",
+    "version": "1.0.0",
+    "x-design-digest": "sha256:9bf45dea58d3b3f0bbada6149aeec395a038ccb37793f7f4432be388ba6ca156",
+    "x-design-task": "API-1.2.design",
+    "x-operation-matrix-digest": "sha256:65f5f0fc3bae0f23a7bd4058b7b50f9513317d9247ea6804fca806c400abaad0"
+  },
+  "openapi": "3.1.1",
+  "paths": {
+    "/api/v1/artifacts": {
+      "get": {
+        "operationId": "listArtifacts",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterLabel"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactList"
+                }
+              }
+            },
+            "description": "Bounded page of artifacts.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.list"
+            ]
+          }
+        ],
+        "summary": "List artifact metadata.",
+        "tags": [
+          "artifact"
+        ]
+      },
+      "post": {
+        "operationId": "createArtifact",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateArtifactRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Artifact"
+                }
+              }
+            },
+            "description": "The created artifact.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.create"
+            ]
+          }
+        ],
+        "summary": "Create artifact metadata and open it for content upload.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact}": {
+      "get": {
+        "operationId": "getArtifact",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Artifact"
+                }
+              }
+            },
+            "description": "The artifact.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.read"
+            ]
+          }
+        ],
+        "summary": "Read artifact metadata.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact}/content": {
+      "get": {
+        "operationId": "getArtifactContent",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          },
+          {
+            "in": "header",
+            "name": "Range",
+            "required": false,
+            "schema": {
+              "maxLength": 128,
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "contentEncoding": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Artifact bytes.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "contentEncoding": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Partial artifact bytes.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.content.read"
+            ]
+          }
+        ],
+        "summary": "Read artifact bytes, optionally by range.",
+        "tags": [
+          "artifact"
+        ]
+      },
+      "post": {
+        "operationId": "uploadArtifactContent",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          },
+          {
+            "in": "query",
+            "name": "part_number",
+            "required": true,
+            "schema": {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "contentEncoding": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactContentPart"
+                }
+              }
+            },
+            "description": "The accepted part.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.content.write"
+            ]
+          }
+        ],
+        "summary": "Upload one content part.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact}/evidence": {
+      "get": {
+        "operationId": "getArtifactEvidence",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactEvidence"
+                }
+              }
+            },
+            "description": "Evidence entries.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.evidence.read"
+            ]
+          }
+        ],
+        "summary": "Read the artifact's evidence entries.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact}/finalize": {
+      "post": {
+        "operationId": "finalizeArtifact",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeArtifactRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Artifact"
+                }
+              }
+            },
+            "description": "The finalized artifact.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.finalize"
+            ]
+          }
+        ],
+        "summary": "Seal the artifact against its declared length and digest.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact}/references": {
+      "get": {
+        "operationId": "getArtifactReferences",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/artifactPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactReferences"
+                }
+              }
+            },
+            "description": "References.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:artifacts.references.read"
+            ]
+          }
+        ],
+        "summary": "Read the artifact's outbound references.",
+        "tags": [
+          "artifact"
+        ]
+      }
+    },
+    "/api/v1/beads/backends": {
+      "get": {
+        "operationId": "listBeadsBackends",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeadsBackendList"
+                }
+              }
+            },
+            "description": "Bounded page of backends.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:backends.read"
+            ]
+          }
+        ],
+        "summary": "List the Beads backends the caller's workspace may provision against.",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/v1/beads/projects": {
+      "post": {
+        "operationId": "createBeadsProject",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBeadsProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeadsProject"
+                }
+              }
+            },
+            "description": "Project accepted for provisioning.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:projects.create"
+            ]
+          }
+        ],
+        "summary": "Provision a Beads project in the caller's workspace.",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/events": {
+      "get": {
+        "operationId": "listBeadsProjectEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeadsEventList"
+                }
+              }
+            },
+            "description": "Bounded page of events.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:events.read"
+            ]
+          }
+        ],
+        "summary": "Read project event history, sequence-ordered.",
+        "tags": [
+          "beads_event"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/events/stream": {
+      "get": {
+        "description": "Server-sent events over an authenticated fetch stream. The credential travels in the\nAuthorization header; query-string tokens are rejected. Each `data:` payload is one\n`BeadsEvent`, byte-identical to the history representation.\n",
+        "operationId": "streamBeadsProjectEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/lastEventId"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeadsEvent"
+                }
+              }
+            },
+            "description": "Event stream.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:events.stream"
+            ]
+          }
+        ],
+        "summary": "Live project event stream with heartbeats and resume.",
+        "tags": [
+          "beads_event"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/issues": {
+      "get": {
+        "operationId": "listBeadsProjectIssues",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/filterStatus"
+          },
+          {
+            "$ref": "#/components/parameters/filterType"
+          },
+          {
+            "$ref": "#/components/parameters/filterLabel"
+          },
+          {
+            "$ref": "#/components/parameters/filterAssignee"
+          },
+          {
+            "$ref": "#/components/parameters/filterIssueOwner"
+          },
+          {
+            "$ref": "#/components/parameters/filterIncludeClosed"
+          },
+          {
+            "$ref": "#/components/parameters/filterUpdatedSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueList"
+                }
+              }
+            },
+            "description": "Bounded page of issues.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.read"
+            ]
+          }
+        ],
+        "summary": "List issues in one project.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      },
+      "post": {
+        "operationId": "createBeadsProjectIssue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Issue"
+                }
+              }
+            },
+            "description": "The created issue.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.create"
+            ]
+          }
+        ],
+        "summary": "Create an issue.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/issues/{issue}": {
+      "get": {
+        "operationId": "getBeadsProjectIssue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/issuePath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Issue"
+                }
+              }
+            },
+            "description": "The issue.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.read"
+            ]
+          }
+        ],
+        "summary": "Read one issue, including description and bounded metadata.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      },
+      "patch": {
+        "operationId": "updateBeadsProjectIssue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/issuePath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchIssueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Issue"
+                }
+              }
+            },
+            "description": "The post-mutation issue, for client reconciliation.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.update"
+            ]
+          }
+        ],
+        "summary": "Update any subset of the editable issue fields.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/issues/{issue}/children": {
+      "get": {
+        "operationId": "listBeadsIssueChildren",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/issuePath"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueList"
+                }
+              }
+            },
+            "description": "Bounded page of child issues.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.read"
+            ]
+          }
+        ],
+        "summary": "List the children of one issue.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/issues/{issue}/close": {
+      "post": {
+        "operationId": "closeBeadsProjectIssue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/issuePath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Issue"
+                }
+              }
+            },
+            "description": "The post-mutation issue.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.close"
+            ]
+          }
+        ],
+        "summary": "Close an issue and return the server-chosen resulting state.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/issues/{issue}/reopen": {
+      "post": {
+        "operationId": "reopenBeadsProjectIssue",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          },
+          {
+            "$ref": "#/components/parameters/issuePath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Issue"
+                }
+              }
+            },
+            "description": "The post-mutation issue.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:issues.reopen"
+            ]
+          }
+        ],
+        "summary": "Reopen an issue and return the server-chosen resulting state.",
+        "tags": [
+          "project_issue_children_mutation"
+        ]
+      }
+    },
+    "/api/v1/beads/projects/{project}/status": {
+      "get": {
+        "operationId": "getBeadsProjectStatus",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/projectPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeadsProjectStatus"
+                }
+              }
+            },
+            "description": "Project status.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:projects.status.read"
+            ]
+          }
+        ],
+        "summary": "Read provisioning and health state for one project.",
+        "tags": [
+          "provisioning"
+        ]
+      }
+    },
+    "/api/v1/city/{city}/beads/issues": {
+      "get": {
+        "description": "Returns the same closed issue DTO as project scope, with `source` populated. There is no city-specific issue shape.",
+        "operationId": "listCityBeadsIssues",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cityPath"
+          },
+          {
+            "$ref": "#/components/parameters/filterStatus"
+          },
+          {
+            "$ref": "#/components/parameters/filterType"
+          },
+          {
+            "$ref": "#/components/parameters/filterLabel"
+          },
+          {
+            "$ref": "#/components/parameters/filterAssignee"
+          },
+          {
+            "$ref": "#/components/parameters/filterIssueOwner"
+          },
+          {
+            "$ref": "#/components/parameters/filterIncludeClosed"
+          },
+          {
+            "$ref": "#/components/parameters/filterUpdatedSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueList"
+                }
+              }
+            },
+            "description": "Bounded page of issues with mode-stable source context.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:city.beads.read"
+            ]
+          }
+        ],
+        "summary": "Aggregate issues across the city's projects.",
+        "tags": [
+          "city"
+        ]
+      }
+    },
+    "/api/v1/city/{city}/events": {
+      "get": {
+        "operationId": "listCityEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cityPath"
+          },
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterEventKind"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CityEventList"
+                }
+              }
+            },
+            "description": "Bounded page of city events.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:city.events.read"
+            ]
+          }
+        ],
+        "summary": "Read durable city event history.",
+        "tags": [
+          "city"
+        ]
+      },
+      "post": {
+        "operationId": "createCityEvent",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cityPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCityEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CityEvent"
+                }
+              }
+            },
+            "description": "The accepted event.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:city.events.write"
+            ]
+          }
+        ],
+        "summary": "Ingest one city event.",
+        "tags": [
+          "city"
+        ]
+      }
+    },
+    "/api/v1/city/{city}/events/stream": {
+      "get": {
+        "description": "Server-sent events over an authenticated fetch stream. The credential travels in the\nAuthorization header; query-string tokens are rejected. Each `data:` payload is one\n`CityEvent`, byte-identical to the history representation.\n",
+        "operationId": "streamCityEvents",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cityPath"
+          },
+          {
+            "$ref": "#/components/parameters/lastEventId"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/CityEvent"
+                }
+              }
+            },
+            "description": "Event stream.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:city.events.stream"
+            ]
+          }
+        ],
+        "summary": "Live city event stream with heartbeats and resume.",
+        "tags": [
+          "city"
+        ]
+      }
+    },
+    "/api/v1/city/{city}/sling": {
+      "post": {
+        "description": "Success is signaled by the status code; the response carries the dispatch record, not an `ok` flag.",
+        "operationId": "slingCityWork",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/cityPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SlingRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SlingDispatch"
+                }
+              }
+            },
+            "description": "The accepted dispatch.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:city.sling"
+            ]
+          }
+        ],
+        "summary": "Dispatch work into the city.",
+        "tags": [
+          "city"
+        ]
+      }
+    },
+    "/api/v1/inferences": {
+      "get": {
+        "operationId": "listInferences",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InferenceList"
+                }
+              }
+            },
+            "description": "Bounded page of inferences.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:inferences.read"
+            ]
+          }
+        ],
+        "summary": "List inference metadata.",
+        "tags": [
+          "inference"
+        ]
+      },
+      "post": {
+        "description": "Metadata only. Prompt, completion, and transcript text are never accepted or returned here.",
+        "operationId": "createInference",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateInferenceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inference"
+                }
+              }
+            },
+            "description": "The accepted inference.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:inferences.write"
+            ]
+          }
+        ],
+        "summary": "Ingest one inference metadata record by natural key.",
+        "tags": [
+          "inference"
+        ]
+      }
+    },
+    "/api/v1/inferences/{inference}": {
+      "get": {
+        "operationId": "getInference",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/inferencePath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inference"
+                }
+              }
+            },
+            "description": "The inference.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:inferences.read"
+            ]
+          }
+        ],
+        "summary": "Read one inference metadata record.",
+        "tags": [
+          "inference"
+        ]
+      }
+    },
+    "/api/v1/runs": {
+      "get": {
+        "operationId": "listRuns",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterStatus"
+          },
+          {
+            "$ref": "#/components/parameters/filterProject"
+          },
+          {
+            "$ref": "#/components/parameters/filterIssue"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunList"
+                }
+              }
+            },
+            "description": "Bounded page of runs.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:runs.read"
+            ]
+          }
+        ],
+        "summary": "List runs visible to the caller's workspace.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      },
+      "post": {
+        "operationId": "upsertRun",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            },
+            "description": "The accepted run.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:runs.write"
+            ]
+          }
+        ],
+        "summary": "Ingest or update a run by natural key.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/runs/{run}": {
+      "get": {
+        "operationId": "getRun",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Run"
+                }
+              }
+            },
+            "description": "The run.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:runs.read"
+            ]
+          }
+        ],
+        "summary": "Read one run.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/runs/{run}/sessions": {
+      "post": {
+        "operationId": "upsertRunSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/runPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "The accepted session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:sessions.write"
+            ]
+          }
+        ],
+        "summary": "Ingest or update a session under one run, by natural key.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterStatus"
+          },
+          {
+            "$ref": "#/components/parameters/filterProject"
+          },
+          {
+            "$ref": "#/components/parameters/filterIssue"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionList"
+                }
+              }
+            },
+            "description": "Bounded page of sessions.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:sessions.read"
+            ]
+          }
+        ],
+        "summary": "List sessions visible to the caller's workspace.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions/{session}": {
+      "get": {
+        "operationId": "getSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "The session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:sessions.read"
+            ]
+          }
+        ],
+        "summary": "Read one session.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions/{session}/finalize": {
+      "post": {
+        "operationId": "finalizeSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "description": "The finalized session.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:sessions.finalize"
+            ]
+          }
+        ],
+        "summary": "Finalize a session.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions/{session}/transcript": {
+      "get": {
+        "description": "Sensitive content. Withheld unless the credential carries the content scope and the signed sensitive-content policy allows the read.",
+        "operationId": "getSessionTranscript",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTranscript"
+                }
+              }
+            },
+            "description": "The transcript.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:transcripts.content.read"
+            ]
+          }
+        ],
+        "summary": "Read the rendered transcript for one session.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions/{session}/transcript-records": {
+      "get": {
+        "operationId": "listTranscriptRecords",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          },
+          {
+            "$ref": "#/components/parameters/filterSource"
+          },
+          {
+            "$ref": "#/components/parameters/filterRole"
+          },
+          {
+            "$ref": "#/components/parameters/filterContentStatus"
+          },
+          {
+            "$ref": "#/components/parameters/filterSince"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptRecordList"
+                }
+              }
+            },
+            "description": "Bounded page of transcript records; content is omitted from metadata reads.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:transcripts.read"
+            ]
+          }
+        ],
+        "summary": "List transcript record metadata for one session.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      },
+      "post": {
+        "operationId": "createTranscriptRecord",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          },
+          {
+            "$ref": "#/components/parameters/idempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTranscriptRecordRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptRecord"
+                }
+              }
+            },
+            "description": "The accepted record.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:transcripts.write"
+            ]
+          }
+        ],
+        "summary": "Ingest one transcript record.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    },
+    "/api/v1/sessions/{session}/transcript-records/{record}": {
+      "get": {
+        "operationId": "getTranscriptRecord",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionPath"
+          },
+          {
+            "$ref": "#/components/parameters/recordPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TranscriptRecord"
+                }
+              }
+            },
+            "description": "The record; content is omitted from this metadata read.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/RequestId"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "security": [
+          {
+            "beadsBearer": [
+              "beads:transcripts.read"
+            ]
+          }
+        ],
+        "summary": "Read one transcript record's metadata.",
+        "tags": [
+          "run_session_transcript"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Same-origin Beads Team Server deployment.",
+      "url": "/"
+    }
+  ],
+  "tags": [
+    {
+      "description": "Beads backend catalogue and project provisioning.",
+      "name": "provisioning"
+    },
+    {
+      "description": "Project-scoped issue reads, children, and mutations.",
+      "name": "project_issue_children_mutation"
+    },
+    {
+      "description": "Project-scoped Beads event history and live stream.",
+      "name": "beads_event"
+    },
+    {
+      "description": "Runs, sessions, and transcript records.",
+      "name": "run_session_transcript"
+    },
+    {
+      "description": "Artifact metadata, content, evidence, and references.",
+      "name": "artifact"
+    },
+    {
+      "description": "Inference metadata ingest, list, and get.",
+      "name": "inference"
+    },
+    {
+      "description": "Gas City aggregation, events, and work dispatch.",
+      "name": "city"
+    }
+  ],
+  "x-bundle": {
+    "generated": true,
+    "note": "Generated by cmd/apicontract-gen from api/v1/openapi.yaml and its x-fragments. Do not edit.",
+    "source": [
+      "openapi.yaml",
+      "components/schemas.yaml",
+      "paths/artifacts.yaml",
+      "paths/beads.yaml",
+      "paths/city.yaml",
+      "paths/inference.yaml",
+      "paths/runs.yaml"
+    ]
+  }
+}

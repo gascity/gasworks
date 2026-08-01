@@ -1,0 +1,17 @@
+{
+  "schema_version": "beads-team-server/api-contract-digests/1",
+  "algorithm": "sha256 over file bytes for each source file; sha256 over canonical JSON (sorted keys, compact separators) of the file-digest map for openapi_source_digest; sha256 over canonical JSON of {rows,schema} for policy_matrix_digest; sha256 over canonical JSON of {openapi_source_digest,policy_matrix_digest} for contract_digest.",
+  "openapi_source_files": {
+    "components/schemas.yaml": "sha256:a2591b14d0100347e3697a575e595c07b357e8c0ea696ea41fbfda2278263c64",
+    "openapi.yaml": "sha256:f59a24890930b6fbb1585783dda8d4800a7ec00b5505d54b02a2dec5b36c214d",
+    "paths/artifacts.yaml": "sha256:6118976e2caa9a618babbfefd9131863f4f3b5ebf2becc9301937303d9342bd7",
+    "paths/beads.yaml": "sha256:836b11c249dd5e725acac7311b6bdfe5ad465fb4cc5fab3e69adeae34dac5895",
+    "paths/city.yaml": "sha256:d86c80adcb49724d6a02fc15d6d250e25fc1891338fcf6b50642fc3508412a49",
+    "paths/inference.yaml": "sha256:2ea0e056c5fd79ac9d21b25f3345eb6e90009c4ff5eca40973a3e04dfb667cc1",
+    "paths/runs.yaml": "sha256:f4d52d6b0e9e38429b56ddc5b87844ae5a95074257c57cc643b3fd9d3a0392d4"
+  },
+  "openapi_source_digest": "sha256:36f38379f6a196362b8307178660e9504d7d259b36b009a4044375643d1c8e1a",
+  "policy_matrix_file": "policy_matrix.json",
+  "policy_matrix_digest": "sha256:65f5f0fc3bae0f23a7bd4058b7b50f9513317d9247ea6804fca806c400abaad0",
+  "contract_digest": "sha256:a9728ca23ec0f0b471d58ded2f52787819d0e54c7bd71c48b2242c1cbab36366"
+}

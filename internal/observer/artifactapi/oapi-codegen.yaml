@@ -1,0 +1,11 @@
+# Complete typed client for the frozen Beads API v1 bundle.
+# The source is mechanically lowered from OpenAPI 3.1.1 to 3.0.3 by generate.go.
+package: artifactapi
+output: client.gen.go
+generate:
+  models: true
+  client: true
+output-options:
+  skip-prune: true
+compatibility:
+  always-prefix-enum-values: true
