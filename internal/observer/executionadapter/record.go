@@ -1,6 +1,5 @@
-// Package executionadapter adapts validated producer execution-event records to
-// the Observer raw-artifact stream. It owns no activation policy; callers must
-// explicitly configure and bootstrap an Adapter before it can publish.
+// Package executionadapter adapts the frozen eventexport producer batch to the
+// Observer raw-artifact stream. It is default-off until explicitly configured.
 package executionadapter
 
 import (
@@ -14,29 +13,26 @@ import (
 )
 
 const (
-	// RecordSchema is the closed producer record schema accepted by this adapter.
-	RecordSchema = "execution-event-envelope"
-	// RecordSchemaVersion is the only producer schema version accepted by this adapter.
+	RecordSchema        = "execution-event-envelope"
 	RecordSchemaVersion = 2
 )
 
-// ErrInvalidRecord marks an untrusted producer record or batch that failed strict validation.
 var ErrInvalidRecord = errors.New("execution-event adapter: invalid producer record")
 
-// Event is the execution-event envelope retained inside the versioned producer record.
-// Formula is deliberately optional; this adapter does not create or infer it.
+// Event mirrors the frozen eventexport envelope. The adapter retains all producer-approved fields
+// but never adds content or derives a formula.
 type Event struct {
 	Seq       uint64 `json:"seq"`
 	Type      string `json:"type"`
 	TS        string `json:"ts"`
+	ActorHash string `json:"actor_hash,omitempty"`
+	Ref       string `json:"ref,omitempty"`
 	RunID     string `json:"run_id,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	StepID    string `json:"step_id,omitempty"`
+	Title     string `json:"title,omitempty"`
 	Formula   string `json:"formula,omitempty"`
 }
-
-// Record is one strict v2 producer record. Payload holds the original record bytes exactly as
-// supplied, rather than a re-marshaled representation, so retry comparisons are byte-for-byte.
 type Record struct {
 	PartitionID string
 	ProducerSeq uint64
@@ -44,13 +40,15 @@ type Record struct {
 	Payload     []byte
 	PayloadHash [sha256.Size]byte
 }
-
-// Batch is a fully validated same-partition, increasing-producer-sequence batch.
 type Batch struct {
 	PartitionID string
 	Records     []Record
 }
-
+type producerBatch struct {
+	CityHash      string  `json:"city_hash"`
+	SchemaVersion int     `json:"schema_version"`
+	Events        []Event `json:"events"`
+}
 type rawRecord struct {
 	Schema        string `json:"schema"`
 	SchemaVersion int    `json:"schema_version"`
@@ -59,125 +57,98 @@ type rawRecord struct {
 	Event         Event  `json:"event"`
 }
 
-// DecodeBatch strictly validates every supplied record before returning any mapped record. Sparse
-// producer sequences are intentional and preserved; only duplicate or descending sequences within
-// one batch are invalid.
-func DecodeBatch(payloads [][]byte) (Batch, error) {
-	batch := Batch{}
-	for i, payload := range payloads {
-		record, err := decodeRecord(payload)
-		if err != nil {
-			return Batch{}, fmt.Errorf("batch record %d: %w", i, err)
-		}
-		if i == 0 {
-			batch.PartitionID = record.PartitionID
-		} else {
-			if record.PartitionID != batch.PartitionID {
-				return Batch{}, fmt.Errorf("batch record %d: %w: partition differs within batch", i, ErrInvalidRecord)
-			}
-			if record.ProducerSeq <= batch.Records[len(batch.Records)-1].ProducerSeq {
-				return Batch{}, fmt.Errorf("batch record %d: %w: producer sequences must increase", i, ErrInvalidRecord)
-			}
-		}
-		batch.Records = append(batch.Records, record)
-	}
-	return batch, nil
-}
-
-func decodeRecord(payload []byte) (Record, error) {
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return Record{}, fmt.Errorf("%w: empty payload", ErrInvalidRecord)
-	}
+// DecodeBatch strictly validates one frozen eventexport batch before unwrapping it. It uses city_hash
+// as the opaque source partition and deterministically emits v2 artifact records with sparse event
+// sequence values preserved as producer_seq.
+func DecodeBatch(payload []byte) (Batch, error) {
+	var input producerBatch
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
-	var raw rawRecord
-	if err := decoder.Decode(&raw); err != nil {
-		return Record{}, fmt.Errorf("%w: decode: %v", ErrInvalidRecord, err)
+	if err := decoder.Decode(&input); err != nil {
+		return Batch{}, fmt.Errorf("%w: decode batch: %v", ErrInvalidRecord, err)
 	}
 	if err := ensureEOF(decoder); err != nil {
-		return Record{}, fmt.Errorf("%w: trailing JSON", ErrInvalidRecord)
+		return Batch{}, fmt.Errorf("%w: trailing batch JSON", ErrInvalidRecord)
 	}
-	if raw.Schema != RecordSchema {
-		return Record{}, fmt.Errorf("%w: schema %q", ErrInvalidRecord, raw.Schema)
+	if input.SchemaVersion != RecordSchemaVersion || !isLowerHex16(input.CityHash) {
+		return Batch{}, fmt.Errorf("%w: batch schema or city_hash", ErrInvalidRecord)
 	}
-	if raw.SchemaVersion != RecordSchemaVersion {
-		return Record{}, fmt.Errorf("%w: schema_version %d", ErrInvalidRecord, raw.SchemaVersion)
+	out := Batch{PartitionID: input.CityHash}
+	for i, event := range input.Events {
+		if err := validateEvent(event); err != nil {
+			return Batch{}, fmt.Errorf("batch event %d: %w", i, err)
+		}
+		if i > 0 && event.Seq <= input.Events[i-1].Seq {
+			return Batch{}, fmt.Errorf("batch event %d: %w: sequences must increase", i, ErrInvalidRecord)
+		}
+		body, err := json.Marshal(rawRecord{Schema: RecordSchema, SchemaVersion: RecordSchemaVersion, PartitionID: input.CityHash, ProducerSeq: event.Seq, Event: event})
+		if err != nil {
+			return Batch{}, fmt.Errorf("encode v2 record: %w", err)
+		}
+		out.Records = append(out.Records, Record{PartitionID: input.CityHash, ProducerSeq: event.Seq, Event: event, Payload: body, PayloadHash: sha256.Sum256(body)})
 	}
-	if !isLowerHex16(raw.PartitionID) {
-		return Record{}, fmt.Errorf("%w: partition_id", ErrInvalidRecord)
-	}
-	if raw.ProducerSeq == 0 || raw.Event.Seq != raw.ProducerSeq {
-		return Record{}, fmt.Errorf("%w: producer_seq must equal event.seq and be positive", ErrInvalidRecord)
-	}
-	if !allowedEventType(raw.Event.Type) {
-		return Record{}, fmt.Errorf("%w: event type", ErrInvalidRecord)
-	}
-	if _, err := time.Parse(time.RFC3339, raw.Event.TS); err != nil {
-		return Record{}, fmt.Errorf("%w: event timestamp", ErrInvalidRecord)
-	}
-	if !opaqueID(raw.Event.RunID) || !opaqueID(raw.Event.SessionID) || !opaqueID(raw.Event.StepID) {
-		return Record{}, fmt.Errorf("%w: event correlation id", ErrInvalidRecord)
-	}
-	if len(raw.Event.Formula) > 256 {
-		return Record{}, fmt.Errorf("%w: formula too long", ErrInvalidRecord)
-	}
-	copyPayload := append([]byte(nil), payload...)
-	return Record{
-		PartitionID: raw.PartitionID,
-		ProducerSeq: raw.ProducerSeq,
-		Event:       raw.Event,
-		Payload:     copyPayload,
-		PayloadHash: sha256.Sum256(copyPayload),
-	}, nil
+	return out, nil
 }
-
-func ensureEOF(decoder *json.Decoder) error {
+func ensureEOF(d *json.Decoder) error {
 	var extra any
-	err := decoder.Decode(&extra)
+	err := d.Decode(&extra)
 	if errors.Is(err, io.EOF) {
 		return nil
 	}
 	if err == nil {
-		return errors.New("extra JSON value")
+		return errors.New("extra JSON")
 	}
 	return err
 }
-
-func isLowerHex16(value string) bool {
-	if len(value) != 16 {
+func validateEvent(e Event) error {
+	if e.Seq == 0 || !allowedEventType(e.Type) {
+		return fmt.Errorf("%w: event sequence or type", ErrInvalidRecord)
+	}
+	if _, err := time.Parse(time.RFC3339, e.TS); err != nil {
+		return fmt.Errorf("%w: event timestamp", ErrInvalidRecord)
+	}
+	if !opaqueID(e.Ref) || !opaqueID(e.RunID) || !opaqueID(e.SessionID) || !opaqueID(e.StepID) {
+		return fmt.Errorf("%w: event opaque id", ErrInvalidRecord)
+	}
+	if e.ActorHash != "" && !isLowerHex16(e.ActorHash) {
+		return fmt.Errorf("%w: actor hash", ErrInvalidRecord)
+	}
+	if len(e.Title) > 256 || len(e.Formula) > 256 {
+		return fmt.Errorf("%w: content length", ErrInvalidRecord)
+	}
+	return nil
+}
+func isLowerHex16(v string) bool {
+	if len(v) != 16 {
 		return false
 	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
+	for i := 0; i < len(v); i++ {
+		c := v[i]
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 			return false
 		}
 	}
 	return true
 }
-
-func opaqueID(value string) bool {
-	if value == "" || len(value) > 64 {
-		return value == ""
+func opaqueID(v string) bool {
+	if v == "" {
+		return true
 	}
-	for i := 0; i < len(value); i++ {
-		c := value[i]
+	if len(v) > 64 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
 			return false
 		}
 	}
-	return value[0] >= 'a' && value[0] <= 'z' || value[0] >= '0' && value[0] <= '9'
+	return (v[0] >= 'a' && v[0] <= 'z') || (v[0] >= '0' && v[0] <= '9')
 }
-
-func allowedEventType(value string) bool {
-	switch value {
-	case "bead.created", "bead.closed", "order.fired", "order.completed", "order.failed",
-		"session.woke", "session.stopped", "session.draining", "session.stranded",
-		"convoy.closed", "controller.started", "events.rotated",
-		"session.drain_acked_with_assigned_work", "session.reset_stalled",
-		"project.identity.stamped", "gc.store.maintenance.done", "mail.sent":
+func allowedEventType(v string) bool {
+	switch v {
+	case "bead.created", "bead.closed", "order.fired", "order.completed", "order.failed", "session.woke", "session.stopped", "session.draining", "session.stranded", "convoy.closed", "controller.started", "events.rotated", "session.drain_acked_with_assigned_work", "session.reset_stalled", "project.identity.stamped", "gc.store.maintenance.done", "mail.sent":
 		return true
-	default:
-		return false
 	}
+	return false
 }
