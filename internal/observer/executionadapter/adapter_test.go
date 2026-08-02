@@ -130,6 +130,40 @@ func TestAdapterSupportsOverlapRestartAndConcurrentAllocation(t *testing.T) {
 	}
 }
 
+func TestAdapterChunksDrainPersistsEachAckAndResumesAfterMidDrainFailure(t *testing.T) {
+	ledger := newMemoryLedger()
+	firstUploader := &memoryUploader{fail: errors.New("second upload unavailable"), failAt: 2}
+	first := newTestAdapter(t, ledger, firstUploader, "one")
+	bootstrap(t, first, 0)
+	seqs := make([]uint64, 1501)
+	for i := range seqs {
+		seqs[i] = uint64(i + 1)
+	}
+
+	if err := first.ProcessRaw(context.Background(), rawRecords(seqs...)); err == nil {
+		t.Fatal("ProcessRaw succeeded after second upload failed")
+	}
+	if got, want := firstUploader.batchSizes(), []int{1000, 501}; !sameInt(got, want) {
+		t.Fatalf("first uploader batch sizes = %v, want %v", got, want)
+	}
+	if got := ledger.ack(testKey); got != 1000 {
+		t.Fatalf("ack after mid-drain failure = %d, want persisted first chunk 1000", got)
+	}
+
+	failoverUploader := &memoryUploader{}
+	restarted := newTestAdapter(t, ledger, failoverUploader, "two")
+	bootstrap(t, restarted, 1000)
+	if err := restarted.ProcessRaw(context.Background(), rawRecords(seqs...)); err != nil {
+		t.Fatalf("failover retry: %v", err)
+	}
+	if got, want := failoverUploader.batchSizes(), []int{501}; !sameInt(got, want) {
+		t.Fatalf("failover batch sizes = %v, want only pending suffix %v", got, want)
+	}
+	if got := ledger.ack(testKey); got != 1501 {
+		t.Fatalf("final ack = %d, want 1501", got)
+	}
+}
+
 func TestAdapterIsDefaultOffAndEmptyFilteredIntervalIsInert(t *testing.T) {
 	ledger := newMemoryLedger()
 	disabled, err := New(Config{})
@@ -364,16 +398,21 @@ func (m *memoryLedger) artifactSequences(k SourceKey) []uint64 {
 type memoryUploader struct {
 	mu       sync.Mutex
 	fail     error
+	failAt   int
+	calls    int
 	uploaded []uint64
+	batches  []int
 }
 
 func (m *memoryUploader) Upload(_ context.Context, _ SourceKey, rows []MappedRecord) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.calls++
+	m.batches = append(m.batches, len(rows))
 	for _, r := range rows {
 		m.uploaded = append(m.uploaded, r.ArtifactSeq)
 	}
-	if m.fail != nil {
+	if m.fail != nil && (m.failAt == 0 || m.calls == m.failAt) {
 		return 0, m.fail
 	}
 	return rows[len(rows)-1].ArtifactSeq, nil
@@ -383,7 +422,23 @@ func (m *memoryUploader) sequences() []uint64 {
 	defer m.mu.Unlock()
 	return append([]uint64(nil), m.uploaded...)
 }
+func (m *memoryUploader) batchSizes() []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]int(nil), m.batches...)
+}
 func sameUint64(a, b []uint64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+func sameInt(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
 	}

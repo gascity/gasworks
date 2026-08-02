@@ -3,6 +3,7 @@ package eventsaxis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -109,6 +110,34 @@ func TestRunner_DisabledNeverDials(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&dialed); n != 0 {
 		t.Fatalf("disabled axis dialed %d times (must never dial)", n)
+	}
+}
+
+func TestRunner_CursorLoadFailureStopsBeforeSource(t *testing.T) {
+	wantErr := errors.New("cursor state corrupt")
+	r := NewRunner(Config{
+		URL:        "https://ingest.example.test/v0/events",
+		Supervisor: "http://127.0.0.1:8372",
+		Cities:     []string{"c1"},
+		Token:      saauth.EnvProvider("events-bearer"),
+		Salt:       testSalt,
+		StatePath:  "/unused/cursors.json",
+	}, nil)
+	r.loadCur = func(string) (map[string]uint64, error) { return nil, wantErr }
+	sourceBuilt := false
+	r.newSource = func(context.Context, Config, *http.Client, map[string]uint64, func(string, ...any)) eventexport.Source {
+		sourceBuilt = true
+		return canceledSource{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := r.Run(ctx)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run cursor load failure = %v, want %v", err, wantErr)
+	}
+	if sourceBuilt {
+		t.Fatal("cursor load failure built the SSE source")
 	}
 }
 
@@ -265,8 +294,8 @@ func TestRunner_ProjectsRedactsAndAdvancesCursor(t *testing.T) {
 	var types []string
 	var sawSeq2 bool
 	for _, b := range batches {
-		if b.CityID != "c1" {
-			t.Fatalf("batch city_id = %q, want c1", b.CityID)
+		if want := eventexport.CityHash(testSalt, "c1"); b.CityHash != want {
+			t.Fatalf("batch city_hash = %q, want %q", b.CityHash, want)
 		}
 		if b.SchemaVersion != eventexport.SchemaVersion {
 			t.Fatalf("batch schema_version = %d, want %d", b.SchemaVersion, eventexport.SchemaVersion)
@@ -326,7 +355,10 @@ func TestRunner_ProjectsRedactsAndAdvancesCursor(t *testing.T) {
 	}
 
 	// The cursor file must persist progress to 4.
-	cur := eventexport.LoadCursors(cfg.StatePath)
+	cur, err := eventexport.LoadCursors(cfg.StatePath)
+	if err != nil {
+		t.Fatalf("LoadCursors: %v", err)
+	}
 	if cur["c1"] != 4 {
 		t.Fatalf("persisted cursor for c1 = %d, want 4", cur["c1"])
 	}
@@ -510,3 +542,9 @@ func mustTime(s string) time.Time {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type canceledSource struct{}
+
+func (canceledSource) Next(ctx context.Context) (eventexport.TaggedEvent, error) {
+	return eventexport.TaggedEvent{}, ctx.Err()
+}

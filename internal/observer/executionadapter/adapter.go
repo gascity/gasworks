@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const maxUploadRecords = 1000
+
 var (
 	// ErrDisabled reports an adapter that was intentionally left wholly unconfigured. Processing
 	// fails closed so no caller can mistake the default-off state for a producer acknowledgement.
@@ -52,7 +54,8 @@ type Ledger interface {
 }
 
 // Uploader sends exactly the durable records supplied, in artifact-sequence order, and returns the
-// Observer durable acknowledgement. It must never acknowledge a record it did not durably receive.
+// Observer durable acknowledgement. It must never acknowledge a record it did not durably receive,
+// and it must honor context cancellation so a lost upload lease stops the in-flight request.
 type Uploader interface {
 	Upload(context.Context, SourceKey, []MappedRecord) (uint64, error)
 }
@@ -111,7 +114,7 @@ func (a *Adapter) key() SourceKey {
 }
 
 // Bootstrap records the authoritative source acknowledgement. A fresh map can start only at zero;
-// a restart succeeds only when the supplied remote acknowledgement matches durable state.
+// a restart may reconcile an acknowledgement within the durable mapped prefix, but never regress it.
 func (a *Adapter) Bootstrap(ctx context.Context, observerAcknowledgedThrough uint64) error {
 	if !a.Enabled() {
 		return nil
@@ -174,7 +177,10 @@ func (a *Adapter) drain(ctx context.Context) error {
 		if len(pending) == 0 {
 			return nil
 		}
-		ack, err := a.cfg.Uploader.Upload(ctx, a.key(), pending)
+		if len(pending) > maxUploadRecords {
+			pending = pending[:maxUploadRecords]
+		}
+		ack, err := a.uploadWithLease(ctx, pending)
 		if err != nil {
 			return err
 		}
@@ -184,6 +190,49 @@ func (a *Adapter) drain(ctx context.Context) error {
 		}
 		if err := a.cfg.Ledger.Acknowledge(ctx, a.key(), a.cfg.Owner, ack); err != nil {
 			return err
+		}
+	}
+}
+
+func (a *Adapter) uploadWithLease(ctx context.Context, pending []MappedRecord) (uint64, error) {
+	type result struct {
+		ack uint64
+		err error
+	}
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	completed := make(chan result, 1)
+	go func() {
+		ack, err := a.cfg.Uploader.Upload(uploadCtx, a.key(), pending)
+		completed <- result{ack: ack, err: err}
+	}()
+
+	interval := a.cfg.LeaseTTL / 3
+	if interval <= 0 {
+		interval = a.cfg.LeaseTTL
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case uploaded := <-completed:
+			if uploaded.err != nil {
+				return 0, uploaded.err
+			}
+			if err := a.cfg.Ledger.RenewLease(ctx, a.key(), a.cfg.Owner, a.cfg.Now(), a.cfg.LeaseTTL); err != nil {
+				return 0, err
+			}
+			return uploaded.ack, nil
+		case <-ticker.C:
+			if err := a.cfg.Ledger.RenewLease(ctx, a.key(), a.cfg.Owner, a.cfg.Now(), a.cfg.LeaseTTL); err != nil {
+				cancel()
+				<-completed
+				return 0, err
+			}
+		case <-ctx.Done():
+			cancel()
+			<-completed
+			return 0, ctx.Err()
 		}
 	}
 }

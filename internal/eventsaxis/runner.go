@@ -36,7 +36,7 @@ type Runner struct {
 
 	// seams for tests
 	newSource func(ctx context.Context, cfg Config, client *http.Client, cursors map[string]uint64, logf func(string, ...any)) eventexport.Source
-	loadCur   func(path string) map[string]uint64
+	loadCur   func(path string) (map[string]uint64, error)
 	saveCur   func(path string, cursors map[string]uint64) error
 }
 
@@ -113,7 +113,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("events: GASWORKS_EVENTS_SALT must be >= 16 bytes (the actor hash is brute-forceable below that; events would be silently dropped)")
 	}
 
-	cursors := r.loadCur(r.cfg.StatePath)
+	cursors, err := r.loadCur(r.cfg.StatePath)
+	if err != nil {
+		return fmt.Errorf("events: load cursors: %w", err)
+	}
 
 	exp := eventexport.New(eventexport.Config{
 		Endpoint:      r.cfg.URL,
@@ -122,7 +125,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		ExportRef:     r.cfg.ExportRef,
 		// Correlation ids (opaque run_id/session_id/step_id) ride the envelope and are
 		// independent of the free-form content opt-in — they have their own gate.
-		EmitContent:     r.cfg.EmitContent,
 		EmitCorrelation: r.cfg.EmitCorrelation,
 		BatchMax:        r.cfg.BatchMax,
 		BatchInterval:   r.cfg.BatchInterval,
