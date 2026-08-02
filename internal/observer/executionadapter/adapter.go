@@ -9,8 +9,8 @@ import (
 )
 
 var (
-	// ErrDisabled reports an adapter that was intentionally left unconfigured. Process methods are
-	// no-ops while disabled, preserving the producer's existing default-off behavior.
+	// ErrDisabled reports an adapter that was intentionally left wholly unconfigured. Processing
+	// fails closed so no caller can mistake the default-off state for a producer acknowledgement.
 	ErrDisabled = errors.New("execution-event adapter: disabled")
 	// ErrBootstrapRequired reports a source whose Observer cursor cannot be safely derived.
 	ErrBootstrapRequired = errors.New("execution-event adapter: bootstrap evidence required")
@@ -77,18 +77,19 @@ type Adapter struct {
 	bootstrapped bool
 }
 
-// New constructs an Adapter. Missing endpoint or source intentionally produces a disabled no-op;
+// New constructs an Adapter. Only a wholly absent configuration produces a disabled adapter;
 // partial configured state is rejected rather than accidentally permitting egress without durability.
 func New(cfg Config) (*Adapter, error) {
 	cfg.Endpoint = strings.TrimRight(strings.TrimSpace(cfg.Endpoint), "/")
 	cfg.TenantID = strings.TrimSpace(cfg.TenantID)
 	cfg.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
 	cfg.SourceID = strings.TrimSpace(cfg.SourceID)
-	if cfg.Endpoint == "" || cfg.SourceID == "" {
+	if cfg.Endpoint == "" && cfg.TenantID == "" && cfg.WorkspaceID == "" && cfg.SourceID == "" &&
+		cfg.Ledger == nil && cfg.Uploader == nil && cfg.Owner == "" && cfg.LeaseTTL == 0 && cfg.Now == nil {
 		return &Adapter{cfg: cfg}, nil
 	}
-	if cfg.TenantID == "" || cfg.WorkspaceID == "" || cfg.Ledger == nil || cfg.Uploader == nil {
-		return nil, fmt.Errorf("execution-event adapter: configured endpoint/source requires tenant, workspace, ledger, and uploader")
+	if cfg.Endpoint == "" || cfg.TenantID == "" || cfg.WorkspaceID == "" || cfg.SourceID == "" || cfg.Ledger == nil || cfg.Uploader == nil {
+		return nil, fmt.Errorf("execution-event adapter: configuration requires endpoint, tenant, workspace, source, ledger, and uploader")
 	}
 	if cfg.Owner == "" {
 		return nil, fmt.Errorf("execution-event adapter: configured source requires lease owner")
@@ -125,7 +126,7 @@ func (a *Adapter) Bootstrap(ctx context.Context, observerAcknowledgedThrough uin
 // ProcessRaw validates the complete producer batch before assigning any durable artifact sequence.
 func (a *Adapter) ProcessRaw(ctx context.Context, payload []byte) error {
 	if !a.Enabled() {
-		return nil
+		return ErrDisabled
 	}
 	batch, err := DecodeBatch(payload)
 	if err != nil {
@@ -137,7 +138,10 @@ func (a *Adapter) ProcessRaw(ctx context.Context, payload []byte) error {
 // Process assigns any new records then drains all durable pending rows in order. It returns an error
 // until every mapped row is durably acknowledged, so callers retain their producer cursor on failure.
 func (a *Adapter) Process(ctx context.Context, batch Batch) error {
-	if !a.Enabled() || len(batch.Records) == 0 {
+	if !a.Enabled() {
+		return ErrDisabled
+	}
+	if len(batch.Records) == 0 {
 		return nil
 	}
 	if !a.bootstrapped {

@@ -132,15 +132,15 @@ func TestAdapterSupportsOverlapRestartAndConcurrentAllocation(t *testing.T) {
 
 func TestAdapterIsDefaultOffAndEmptyFilteredIntervalIsInert(t *testing.T) {
 	ledger := newMemoryLedger()
-	disabled, err := New(Config{Ledger: ledger, Uploader: &memoryUploader{}})
+	disabled, err := New(Config{})
 	if err != nil {
 		t.Fatalf("New disabled: %v", err)
 	}
 	if disabled.Enabled() {
 		t.Fatal("adapter enabled without endpoint/source")
 	}
-	if err := disabled.ProcessRaw(context.Background(), rawRecords(1)); err != nil {
-		t.Fatalf("disabled ProcessRaw: %v", err)
+	if err := disabled.ProcessRaw(context.Background(), rawRecords(1)); !errors.Is(err, ErrDisabled) {
+		t.Fatalf("disabled ProcessRaw = %v, want ErrDisabled", err)
 	}
 	if ledger.count(testKey) != 0 {
 		t.Fatal("disabled adapter touched durable ledger")
@@ -153,6 +153,29 @@ func TestAdapterIsDefaultOffAndEmptyFilteredIntervalIsInert(t *testing.T) {
 	}
 	if ledger.count(testKey) != 0 {
 		t.Fatal("empty batch created a mapping")
+	}
+}
+
+func TestAdapterRejectsEveryPartialConfiguration(t *testing.T) {
+	ledger := newMemoryLedger()
+	uploader := &memoryUploader{}
+	partials := map[string]Config{
+		"endpoint":  {Endpoint: "https://observer.test"},
+		"tenant":    {TenantID: testKey.TenantID},
+		"workspace": {WorkspaceID: testKey.WorkspaceID},
+		"source":    {SourceID: testKey.SourceID},
+		"ledger":    {Ledger: ledger},
+		"uploader":  {Uploader: uploader},
+		"owner":     {Owner: "adapter-one"},
+		"lease ttl": {LeaseTTL: time.Minute},
+		"clock":     {Now: time.Now},
+	}
+	for name, cfg := range partials {
+		t.Run(name, func(t *testing.T) {
+			if adapter, err := New(cfg); err == nil {
+				t.Fatalf("New(%+v) = %#v, nil; partial configuration must fail closed", cfg, adapter)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +43,23 @@ func TestHTTPUploaderUsesArtifactSequenceAndHandlerAcksOnlyAfterObserverAck(t *t
 	}
 	if record.ProducerSeq != 41 || record.Event.Seq != 41 {
 		t.Fatalf("record=%+v", record)
+	}
+}
+
+func TestDisabledHandlerNeverAcknowledgesProducerBatch(t *testing.T) {
+	disabled, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, executionEventsPath, strings.NewReader(string(rawRecords(1))))
+	response := httptest.NewRecorder()
+
+	disabled.Handler().ServeHTTP(response, req)
+
+	if response.Code == http.StatusOK {
+		t.Fatalf("disabled handler status = %d, body = %q; producer cursor would advance", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), `"acknowledged":true`) {
+		t.Fatalf("disabled handler acknowledged producer batch: %q", response.Body.String())
 	}
 }
