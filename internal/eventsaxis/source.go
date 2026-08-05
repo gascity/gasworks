@@ -108,25 +108,29 @@ type sseSource struct {
 	supervisor  string
 	cities      []string
 	client      *http.Client
-	cursors     map[string]uint64 // city -> resume seq (last acked)
+	cursor      func(string) uint64 // city -> latest acknowledged resume seq
 	logf        func(format string, args ...any)
 	emitContent bool // when true, lift bead title + gc.* step/formula off the payload
 
 	events chan eventexport.TaggedEvent
 }
 
-// newSSESource starts one tail goroutine per city. cursors seeds each city's
-// resume point (after_seq). The source stops when ctx is cancelled; Next then
-// returns the channel-closed signal once every tail has exited.
-func newSSESource(ctx context.Context, cfg Config, client *http.Client, cursors map[string]uint64, logf func(string, ...any)) *sseSource {
+// newSSESource starts one tail goroutine per city. cursor supplies the current
+// acknowledged resume point for each new connection. The source stops when ctx
+// is cancelled; Next then returns the channel-closed signal once every tail has
+// exited.
+func newSSESource(ctx context.Context, cfg Config, client *http.Client, cursor func(string) uint64, logf func(string, ...any)) *sseSource {
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if cursor == nil {
+		cursor = func(string) uint64 { return 0 }
 	}
 	s := &sseSource{
 		supervisor:  cfg.Supervisor,
 		cities:      append([]string(nil), cfg.Cities...),
 		client:      client,
-		cursors:     cursors,
+		cursor:      cursor,
 		logf:        logf,
 		emitContent: cfg.EmitContent,
 		events:      make(chan eventexport.TaggedEvent, 256),
@@ -178,7 +182,7 @@ func (s *sseSource) tailCity(ctx context.Context, city string) {
 // channel until the connection drops or ctx is cancelled. A successful read resets
 // the caller's backoff implicitly (it returns nil on a clean EOF).
 func (s *sseSource) streamOnce(ctx context.Context, city string) error {
-	cur := s.cursors[city]
+	cur := s.cursor(city)
 	u := fmt.Sprintf("%s%s?after_seq=%d",
 		s.supervisor, fmt.Sprintf(defaultStreamPath, url.PathEscape(city)), cur)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -235,6 +236,9 @@ func TestRunner_ProjectsRedactsAndAdvancesCursor(t *testing.T) {
 		BatchInterval: 15 * time.Millisecond,
 		AllowHTTP:     true, // httptest ingest is plain http on loopback
 	}
+	if err := eventexport.SaveCursors(cfg.StatePath, map[string]uint64{}); err != nil {
+		t.Fatalf("seed cursor state: %v", err)
+	}
 	r := NewRunner(cfg, func(string, ...any) {})
 	r.client = sse.Client()        // SSE tail client (no timeout)
 	r.postClient = ingest.Client() // ingest POST client (distinct, bounded) reaches the capture server
@@ -351,7 +355,7 @@ func TestRunner_UnreadableCursorFailsClosed(t *testing.T) {
 	r.loadCur = func(string) (map[string]uint64, error) {
 		return nil, errors.New("malformed cursor state")
 	}
-	r.newSource = func(context.Context, Config, *http.Client, map[string]uint64, func(string, ...any)) eventexport.Source {
+	r.newSource = func(context.Context, Config, *http.Client, func(string) uint64, func(string, ...any)) eventexport.Source {
 		t.Fatal("source must not start when the cursor cannot be loaded")
 		return nil
 	}
@@ -359,6 +363,106 @@ func TestRunner_UnreadableCursorFailsClosed(t *testing.T) {
 	err := r.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "refusing to start with unreadable cursor state") {
 		t.Fatalf("Run error = %v, want fail-closed cursor-state error", err)
+	}
+}
+
+func TestRunner_MissingCursorFailsClosed(t *testing.T) {
+	cfg := Config{
+		URL:        "http://127.0.0.1/ingest",
+		Supervisor: "http://127.0.0.1:8372",
+		Cities:     []string{"maintainer-city"},
+		Token:      saauth.EnvProvider("test-token"),
+		Salt:       testSalt,
+		StatePath:  t.TempDir() + "/missing-cursors.json",
+		AllowHTTP:  true,
+	}
+	r := NewRunner(cfg, func(string, ...any) {})
+	r.newSource = func(context.Context, Config, *http.Client, func(string) uint64, func(string, ...any)) eventexport.Source {
+		t.Fatal("source must not start without durable cursor state")
+		return nil
+	}
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refusing to start with unreadable cursor state") {
+		t.Fatalf("Run error = %v, want fail-closed missing cursor-state error", err)
+	}
+}
+
+func TestSource_ReconnectUsesLatestExporterCursor(t *testing.T) {
+	var connections atomic.Int32
+	reconnectAfter := make(chan uint64, 1)
+	sse := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection := connections.Add(1)
+		after, err := strconv.ParseUint(r.URL.Query().Get("after_seq"), 10, 64)
+		if err != nil {
+			t.Errorf("parse after_seq: %v", err)
+			return
+		}
+		if connection == 1 {
+			if after != 7 {
+				t.Errorf("initial after_seq = %d, want 7", after)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "data: {\"seq\":8,\"type\":\"session.woke\",\"ts\":\"2026-08-05T00:00:00Z\",\"actor\":\"system\"}\n\n")
+			w.(http.Flusher).Flush()
+			return // force the source to reconnect
+		}
+		select {
+		case reconnectAfter <- after:
+		default:
+		}
+		<-r.Context().Done()
+	}))
+	defer sse.Close()
+
+	posted := make(chan struct{}, 1)
+	ingest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case posted <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ingest.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	initial := map[string]uint64{"c1": 7}
+	exp := eventexport.New(eventexport.Config{
+		Endpoint:      ingest.URL,
+		Salt:          testSalt,
+		BatchMax:      1,
+		BatchInterval: time.Hour,
+		Client:        ingest.Client(),
+	})
+	exp.SetCursors(initial)
+	src := newSSESource(ctx, Config{Supervisor: sse.URL, Cities: []string{"c1"}}, sse.Client(), func(city string) uint64 {
+		return exp.Cursors()[city]
+	}, nil)
+	runDone := make(chan struct{})
+	go func() {
+		_ = exp.Run(ctx, src)
+		close(runDone)
+	}()
+	defer func() {
+		cancel()
+		<-runDone
+	}()
+
+	select {
+	case <-posted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("exporter did not acknowledge the first streamed event")
+	}
+	waitFor(t, time.Second, func() bool { return exp.Cursors()["c1"] == 8 })
+
+	select {
+	case after := <-reconnectAfter:
+		if after != 8 {
+			t.Fatalf("reconnect after_seq = %d, want latest acknowledged cursor 8", after)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("source did not reconnect after the forced disconnect")
 	}
 }
 
@@ -380,7 +484,7 @@ func TestSource_HeartbeatAndMalformedTolerated(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	src := newSSESource(ctx, Config{Supervisor: srv.URL, Cities: []string{"c1"}}, srv.Client(), map[string]uint64{}, nil)
+	src := newSSESource(ctx, Config{Supervisor: srv.URL, Cities: []string{"c1"}}, srv.Client(), func(string) uint64 { return 0 }, nil)
 
 	te, err := src.Next(ctx)
 	if err != nil {
@@ -525,6 +629,9 @@ func TestRunner_EmitsEnvelopeCorrelation(t *testing.T) {
 				EmitCorrelation: tc.emitCorrelation, // EmitContent stays OFF
 				StatePath:       t.TempDir() + "/cursors.json",
 				BatchMax:        100, BatchInterval: 15 * time.Millisecond, AllowHTTP: true,
+			}
+			if err := eventexport.SaveCursors(cfg.StatePath, map[string]uint64{}); err != nil {
+				t.Fatalf("seed cursor state: %v", err)
 			}
 			r := NewRunner(cfg, func(string, ...any) {})
 			r.client = sse.Client()
