@@ -3,10 +3,12 @@ package eventsaxis
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -265,8 +267,8 @@ func TestRunner_ProjectsRedactsAndAdvancesCursor(t *testing.T) {
 	var types []string
 	var sawSeq2 bool
 	for _, b := range batches {
-		if b.CityID != "c1" {
-			t.Fatalf("batch city_id = %q, want c1", b.CityID)
+		if b.CityHash != eventexport.CityHash(cfg.Salt, "c1") {
+			t.Fatalf("batch city_hash = %q, want hash of c1", b.CityHash)
 		}
 		if b.SchemaVersion != eventexport.SchemaVersion {
 			t.Fatalf("batch schema_version = %d, want %d", b.SchemaVersion, eventexport.SchemaVersion)
@@ -326,9 +328,37 @@ func TestRunner_ProjectsRedactsAndAdvancesCursor(t *testing.T) {
 	}
 
 	// The cursor file must persist progress to 4.
-	cur := eventexport.LoadCursors(cfg.StatePath)
+	cur, err := eventexport.LoadCursors(cfg.StatePath)
+	if err != nil {
+		t.Fatalf("LoadCursors: %v", err)
+	}
 	if cur["c1"] != 4 {
 		t.Fatalf("persisted cursor for c1 = %d, want 4", cur["c1"])
+	}
+}
+
+func TestRunner_UnreadableCursorFailsClosed(t *testing.T) {
+	cfg := Config{
+		URL:        "http://127.0.0.1/ingest",
+		Supervisor: "http://127.0.0.1:8372",
+		Cities:     []string{"maintainer-city"},
+		Token:      saauth.EnvProvider("test-token"),
+		Salt:       testSalt,
+		StatePath:  "/unreadable/cursors.json",
+		AllowHTTP:  true,
+	}
+	r := NewRunner(cfg, func(string, ...any) {})
+	r.loadCur = func(string) (map[string]uint64, error) {
+		return nil, errors.New("malformed cursor state")
+	}
+	r.newSource = func(context.Context, Config, *http.Client, map[string]uint64, func(string, ...any)) eventexport.Source {
+		t.Fatal("source must not start when the cursor cannot be loaded")
+		return nil
+	}
+
+	err := r.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refusing to start with unreadable cursor state") {
+		t.Fatalf("Run error = %v, want fail-closed cursor-state error", err)
 	}
 }
 
@@ -416,6 +446,50 @@ func TestDispatch_EnvelopeCorrelation(t *testing.T) {
 			}
 			if te.StepID != tc.wantStep {
 				t.Errorf("StepID = %q, want %q", te.StepID, tc.wantStep)
+			}
+		})
+	}
+}
+
+// TestDispatch_PreservesStepDependencyTriState proves the SSE bridge keeps the
+// execution topology's three wire meanings intact: omitted means unknown, an
+// explicit empty list means a known root, and a populated list names the exact
+// prerequisites. The downstream eventexport projector owns normalization.
+func TestDispatch_PreservesStepDependencyTriState(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		want *[]string
+	}{
+		{
+			name: "omitted dependencies stay unknown",
+			data: `{"seq":1,"type":"execution.step_completed","ts":"2026-08-05T00:00:00Z","actor":"system"}`,
+			want: nil,
+		},
+		{
+			name: "empty dependencies stay known root",
+			data: `{"seq":2,"type":"execution.step_completed","ts":"2026-08-05T00:00:00Z","actor":"system","depends_on_step_ids":[]}`,
+			want: &[]string{},
+		},
+		{
+			name: "nonempty dependencies stay exact",
+			data: `{"seq":3,"type":"execution.step_completed","ts":"2026-08-05T00:00:00Z","actor":"system","depends_on_step_ids":["prepare","review"]}`,
+			want: &[]string{"prepare", "review"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &sseSource{events: make(chan eventexport.TaggedEvent, 1)}
+			if !s.dispatch(context.Background(), "maintainer-city", []byte(tc.data)) {
+				t.Fatal("dispatch returned false without a context cancellation")
+			}
+			got := (<-s.events).DependsOnStepIDs
+			if (got == nil) != (tc.want == nil) {
+				t.Fatalf("DependsOnStepIDs nil = %v, want %v", got == nil, tc.want == nil)
+			}
+			if got != nil && !slices.Equal(*got, *tc.want) {
+				t.Fatalf("DependsOnStepIDs = %#v, want %#v", *got, *tc.want)
 			}
 		})
 	}
