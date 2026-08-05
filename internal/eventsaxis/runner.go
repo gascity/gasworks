@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gastownhall/gascity/pkg/eventexport"
@@ -35,7 +36,7 @@ type Runner struct {
 	postClient *http.Client
 
 	// seams for tests
-	newSource func(ctx context.Context, cfg Config, client *http.Client, cursors map[string]uint64, logf func(string, ...any)) eventexport.Source
+	newSource func(ctx context.Context, cfg Config, client *http.Client, cursor func(string) uint64, logf func(string, ...any)) eventexport.Source
 	loadCur   func(path string) (map[string]uint64, error)
 	saveCur   func(path string, cursors map[string]uint64) error
 }
@@ -50,10 +51,10 @@ func NewRunner(cfg Config, log Logf) *Runner {
 	r := &Runner{
 		cfg: cfg,
 		log: log,
-		newSource: func(ctx context.Context, cfg Config, client *http.Client, cursors map[string]uint64, logf func(string, ...any)) eventexport.Source {
-			return newSSESource(ctx, cfg, client, cursors, logf)
+		newSource: func(ctx context.Context, cfg Config, client *http.Client, cursor func(string) uint64, logf func(string, ...any)) eventexport.Source {
+			return newSSESource(ctx, cfg, client, cursor, logf)
 		},
-		loadCur: eventexport.LoadCursors,
+		loadCur: loadCursors,
 		saveCur: eventexport.SaveCursors,
 	}
 	if cfg.Enabled() {
@@ -61,6 +62,17 @@ func NewRunner(cfg Config, log Logf) *Runner {
 		r.postClient = newPostClient()
 	}
 	return r
+}
+
+// loadCursors rejects an absent path before consulting the generic eventexport
+// loader. This producer cannot safely infer first-run semantics: an empty map
+// could replay retained history or, depending on the source, skip accumulated
+// events. Cursor initialization is therefore an explicit operator action.
+func loadCursors(path string) (map[string]uint64, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("events: stat cursor state %q: %w", path, err)
+	}
+	return eventexport.LoadCursors(path)
 }
 
 // newClient builds the HTTP client for the long-lived SSE tail. It refuses ALL redirects
@@ -138,7 +150,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	})
 	exp.SetCursors(cursors)
 
-	src := r.newSource(ctx, r.cfg, r.client, cursors, func(f string, a ...any) { r.log(f, a...) })
+	src := r.newSource(ctx, r.cfg, r.client, func(city string) uint64 {
+		return exp.Cursors()[city]
+	}, func(f string, a ...any) { r.log(f, a...) })
 
 	r.log("events: start cities=%v supervisor=%s interval=%s", r.cfg.Cities, r.cfg.Supervisor, r.cfg.BatchInterval)
 
