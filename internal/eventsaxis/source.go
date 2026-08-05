@@ -25,15 +25,19 @@ import (
 // Payload itself is decoded ONLY under Config.EmitContent, when liftContent lifts the
 // free-form bead title + run-formula.
 type rawEvent struct {
-	Seq       uint64          `json:"seq"`
-	Type      string          `json:"type"`
-	TS        string          `json:"ts"`
-	Actor     string          `json:"actor"`
-	Subject   string          `json:"subject"`
-	RunID     string          `json:"run_id"`
-	SessionID string          `json:"session_id"`
-	StepID    string          `json:"step_id"`
-	Payload   json.RawMessage `json:"payload"`
+	Seq       uint64 `json:"seq"`
+	Type      string `json:"type"`
+	TS        string `json:"ts"`
+	Actor     string `json:"actor"`
+	Subject   string `json:"subject"`
+	RunID     string `json:"run_id"`
+	SessionID string `json:"session_id"`
+	StepID    string `json:"step_id"`
+	// DependsOnStepIDs preserves the supervisor wire's tri-state execution
+	// topology: nil means unknown, an explicit empty slice is a known root, and
+	// a non-empty slice names the step's exact prerequisites.
+	DependsOnStepIDs *[]string       `json:"depends_on_step_ids"`
+	Payload          json.RawMessage `json:"payload"`
 }
 
 // beadPayload is the minimal slice of a bead.* event payload read under the
@@ -249,6 +253,9 @@ func (s *sseSource) dispatch(ctx context.Context, city string, data []byte) bool
 		RunID:     r.RunID,
 		SessionID: r.SessionID,
 		StepID:    r.StepID,
+		// Preserve the pointer unchanged so eventexport remains the sole owner of
+		// topology validation and normalization.
+		DependsOnStepIDs: r.DependsOnStepIDs,
 	}
 	if s.emitContent {
 		// The ONLY place this axis reads the SSE payload, reached solely under the
