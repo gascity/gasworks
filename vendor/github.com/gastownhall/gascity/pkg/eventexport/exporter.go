@@ -27,10 +27,13 @@ type TaggedEvent struct {
 	Subject   string
 	RunID     string
 	SessionID string
-	StepID    string   // opaque acting-work-bead (run step) id; safeRef-gated at projection (EmitCorrelation)
-	Title     string   // FREE-FORM bead title; emitted only under Options.EmitContent
-	Formula   string   // FREE-FORM run formula name; emitted only under Options.EmitContent
-	_         struct{} // force keyed literals; blocks positional field transposition
+	StepID    string // native execution-step identity (nonblank UTF-8, <=256 bytes; EmitCorrelation)
+	// DependsOnStepIDs is nil when native topology is unknown; an explicit empty
+	// slice represents a known root.
+	DependsOnStepIDs *[]string
+	Title            string   // FREE-FORM bead title; emitted only under the content opt-in (Options.emitContent)
+	Formula          string   // FREE-FORM run formula name; emitted only under the content opt-in (Options.emitContent)
+	_                struct{} // force keyed literals; blocks positional field transposition
 }
 
 // Source yields tagged events in per-city seq order. The real Source wraps the
@@ -49,8 +52,7 @@ type Config struct {
 	TokenProvider     func() (string, error)
 	Salt              []byte
 	ExportRef         bool
-	EmitCorrelation   bool // emit opaque run_id/session_id/step_id (default false)
-	EmitContent       bool // emit free-form title/formula (default false; REVERSES envelope-only — opt-in only)
+	EmitCorrelation   bool // emit run/session correlation plus native step topology (default false)
 	Profile           Profile
 	BatchMax          int           // max events per POST (default 1000)
 	BatchInterval     time.Duration // max time between POSTs (default 5s)
@@ -180,15 +182,18 @@ func (e *Exporter) ingest(te TaggedEvent) {
 		return // already processed (resume overlap)
 	}
 	e.high[te.City] = te.Seq
-	// Correlation ids (run_id/session_id/step_id) and free-form content
-	// (title/formula) are emitted only when their respective Config toggles are set;
-	// both default false so the projection stays envelope-only unless opted in.
+	// Run/session correlation plus native execution-step topology are emitted only
+	// when EmitCorrelation is set (default false), so the projection stays envelope-only
+	// unless opted in. The Exporter intentionally exposes no content (title/formula)
+	// opt-in: the producer path — a reachable Config knob plus the typed source
+	// fields — is staged behind ga-mt1e99, and the projection's content gate
+	// (Options.emitContent) is unexported, so free-form content cannot egress
+	// through the Exporter.
 	opt := Options{
 		Salt:            e.cfg.Salt,
 		ExportRef:       e.cfg.ExportRef,
 		Profile:         e.cfg.Profile,
 		EmitCorrelation: e.cfg.EmitCorrelation,
-		EmitContent:     e.cfg.EmitContent,
 	}
 	env, ok := ProjectEvent(te, opt)
 	if !ok {
@@ -264,7 +269,7 @@ func (e *Exporter) flushCity(ctx context.Context, city string) {
 }
 
 func (e *Exporter) post(ctx context.Context, city string, batch []Envelope) error {
-	body, err := json.Marshal(Batch{CityID: city, SchemaVersion: SchemaVersion, Events: batch})
+	body, err := json.Marshal(Batch{CityHash: CityHash(e.cfg.Salt, city), SchemaVersion: SchemaVersion, Events: batch})
 	if err != nil {
 		return err
 	}
