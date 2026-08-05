@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func setConfigDir(t *testing.T, sub string) string {
@@ -133,6 +134,62 @@ func TestConcurrentUpdatePreservesFields(t *testing.T) {
 	}
 	if len(got.Sessions) != n {
 		t.Errorf("got %d sessions, want %d — a concurrent write was lost", len(got.Sessions), n)
+	}
+}
+
+func TestLoadWaitsForConcurrentUpdate(t *testing.T) {
+	setConfigDir(t, "cfg")
+	if err := Save(&Data{IDToken: "before"}); err != nil {
+		t.Fatal(err)
+	}
+
+	updateEntered := make(chan struct{})
+	releaseUpdate := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- Update(func(data *Data) error {
+			close(updateEntered)
+			<-releaseUpdate
+			data.IDToken = "after"
+			return nil
+		})
+	}()
+	select {
+	case <-updateEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Update did not acquire the store lock")
+	}
+
+	loadStarted := make(chan struct{})
+	loadDone := make(chan struct{})
+	var loaded *Data
+	var loadErr error
+	go func() {
+		close(loadStarted)
+		loaded, loadErr = Load()
+		close(loadDone)
+	}()
+	<-loadStarted
+	select {
+	case <-loadDone:
+		t.Fatal("Load completed while Update held the store lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseUpdate)
+	if err := <-updateDone; err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	select {
+	case <-loadDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Load did not complete after Update released the store lock")
+	}
+	if loadErr != nil {
+		t.Fatalf("Load: %v", loadErr)
+	}
+	if loaded.IDToken != "after" {
+		t.Fatalf("Load read ID token %q, want the completed update", loaded.IDToken)
 	}
 }
 

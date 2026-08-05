@@ -90,14 +90,25 @@ func ensureDir() (string, error) {
 	return d, nil
 }
 
-// Load reads credentials.json. A MISSING file (the logged-out state) or a CORRUPT-JSON file
-// degrades to an empty Data with no error (re-login), matching the Python store's fail-soft
-// contract. Any OTHER read error — the file exists but is unreadable (EACCES, EIO, EINTR,
-// fd exhaustion) — returns a real error instead of empty Data. This is load-bearing for the
-// Update read-modify-write: a transient read failure that silently became &Data{} would
-// then be Save'd back over good credentials, WIPING the user's session. Returning an error
-// makes Update abort without saving, so the on-disk credentials are left intact.
+// Load reads credentials.json under the cross-process lock. This prevents a reader from
+// colliding with an Update's atomic replacement (or its Windows ACL update). A MISSING file
+// (the logged-out state) or a CORRUPT-JSON file degrades to an empty Data with no error
+// (re-login), matching the Python store's fail-soft contract. Any OTHER read error — the
+// file exists but is unreadable (EACCES, EIO, EINTR, fd exhaustion) — returns a real error
+// instead of empty Data.
 func Load() (*Data, error) {
+	unlock, err := lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return load()
+}
+
+// load reads credentials.json while the caller holds the store lock when synchronization is
+// required. Keeping it separate lets Update perform its locked read-modify-write without
+// recursively acquiring the non-reentrant cross-process lock.
+func load() (*Data, error) {
 	raw, err := os.ReadFile(CredsPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -175,7 +186,7 @@ func Update(mutate func(*Data) error) error {
 	}
 	defer unlock()
 
-	d, err := Load()
+	d, err := load()
 	if err != nil {
 		return err
 	}

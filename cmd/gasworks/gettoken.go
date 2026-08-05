@@ -295,6 +295,9 @@ func ensureIDTokenBeforeRefreshTransaction(cfg config.Config, beforeTransaction 
 }
 
 func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCredentialSnapshot, error) {
+	if beforeTransaction != nil {
+		beforeTransaction()
+	}
 	data, err := store.Load()
 	if err != nil {
 		return humanCredentialSnapshot{}, die("could not read credentials: %s", err)
@@ -305,9 +308,6 @@ func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCr
 	}
 
 	var credential humanCredentialSnapshot
-	if beforeTransaction != nil {
-		beforeTransaction()
-	}
 	err = store.Update(func(d *store.Data) error {
 		// Re-check under the cross-process store lock. Another process may have refreshed and
 		// persisted a rotated refresh token after the optimistic read above.
