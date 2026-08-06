@@ -16,6 +16,7 @@ const contentPath = "/v1/artifacts/content"
 // id, records the provider, and retains the source path for operator provenance.
 const (
 	headerNativeSessionID = "X-Observer-Native-Session-Id"
+	headerGCSessionID     = "X-Observer-Gc-Session-Id"
 	headerProvider        = "X-Observer-Provider"
 	headerSourcePath      = "X-Observer-Source-Path"
 )
@@ -26,6 +27,9 @@ const (
 type ContentRequest struct {
 	// NativeSessionID is the transcript's native (provider) session id — the dedup + CASS key.
 	NativeSessionID string
+	// GCSessionID is the optional authoritative Gas City binding read from a transcript sidecar.
+	// Empty means unknown and is deliberately omitted from the request.
+	GCSessionID string
 	// Provider is the lowercase provider label ("claude" or "codex").
 	Provider string
 	// SourcePath is the transcript file path, retained by the server for provenance only.
@@ -68,6 +72,9 @@ func (c *Client) PostContent(ctx context.Context, r ContentRequest) (*ContentRes
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set(headerNativeSessionID, r.NativeSessionID)
+	if r.GCSessionID != "" {
+		req.Header.Set(headerGCSessionID, r.GCSessionID)
+	}
 	req.Header.Set(headerProvider, strings.ToLower(r.Provider))
 	req.Header.Set(headerSourcePath, r.SourcePath)
 

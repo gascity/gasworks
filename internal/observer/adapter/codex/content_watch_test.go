@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // recordingContentObserver records every ContentObservation the watcher fires, and every identity it
@@ -84,6 +85,120 @@ func TestWatcherFiresContentObserverWithStat(t *testing.T) {
 	got2, _ := obs.last()
 	if got2.Size != info.Size() {
 		t.Fatalf("second obs size = %d, want %d", got2.Size, info.Size())
+	}
+}
+
+func TestWatcherContentObservationReadsExactGCSessionIDSidecar(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	writeFileString(t, p, msgLine("a")+"\n")
+	writeFileString(t, p+".gcmeta", "gc_authoritative_123")
+
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		ApprovedRoots:   []string{root},
+		StateDir:        state,
+		Sink:            &recordingSink{},
+		Match:           func(name string) bool { return name == "session.jsonl" },
+		ContentObserver: obs,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	got, ok := obs.last()
+	if !ok {
+		t.Fatal("no content observation")
+	}
+	if got.GCSessionID != "gc_authoritative_123" {
+		t.Fatalf("GC session id = %q, want exact sidecar value", got.GCSessionID)
+	}
+}
+
+func TestWatcherContentObservationRejectsUnsafeGCSessionIDSidecars(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "leading whitespace", value: " gc_123"},
+		{name: "trailing newline", value: "gc_123\n"},
+		{name: "control", value: "gc_\x00123"},
+		{name: "format", value: "gc_\u200b123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root, state := t.TempDir(), t.TempDir()
+			p := filepath.Join(root, "session.jsonl")
+			writeFileString(t, p, msgLine("a")+"\n")
+			writeFileString(t, p+".gcmeta", tc.value)
+			obs := &recordingContentObserver{}
+			w := mustWatcher(t, WatchConfig{
+				ApprovedRoots:   []string{root},
+				StateDir:        state,
+				Sink:            &recordingSink{},
+				Match:           func(name string) bool { return name == "session.jsonl" },
+				ContentObserver: obs,
+			})
+			if err := w.Poll(ctx); err != nil {
+				t.Fatalf("poll: %v", err)
+			}
+			got, ok := obs.last()
+			if !ok {
+				t.Fatal("no content observation")
+			}
+			if got.GCSessionID != "" {
+				t.Fatalf("GC session id = %q, want rejected sidecar omitted", got.GCSessionID)
+			}
+		})
+	}
+}
+
+func TestWatcherGCSessionIDSidecarIsNoSymlinkAndBoundedCadence(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	writeFileString(t, p, msgLine("a")+"\n")
+	outside := filepath.Join(t.TempDir(), "binding.gcmeta")
+	writeFileString(t, outside, "gc_outside")
+	if err := os.Symlink(outside, p+".gcmeta"); err != nil {
+		t.Fatalf("symlink sidecar: %v", err)
+	}
+
+	now := time.Unix(1_700_000_000, 0)
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		ApprovedRoots:   []string{root},
+		StateDir:        state,
+		Sink:            &recordingSink{},
+		Match:           func(name string) bool { return name == "session.jsonl" },
+		ContentObserver: obs,
+		Now:             func() time.Time { return now },
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll symlink: %v", err)
+	}
+	if got, _ := obs.last(); got.GCSessionID != "" {
+		t.Fatalf("symlink sidecar GC session id = %q, want omitted", got.GCSessionID)
+	}
+	if err := os.Remove(p + ".gcmeta"); err != nil {
+		t.Fatalf("remove symlink: %v", err)
+	}
+	writeFileString(t, p+".gcmeta", "gc_late")
+
+	// A sidecar is checked at a bounded cadence rather than every 500ms watcher poll.
+	now = now.Add(gcMetaCheckInterval - time.Nanosecond)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll before cadence: %v", err)
+	}
+	if got, _ := obs.last(); got.GCSessionID != "" {
+		t.Fatalf("GC session id before cadence = %q, want cached empty value", got.GCSessionID)
+	}
+	now = now.Add(time.Nanosecond)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll at cadence: %v", err)
+	}
+	if got, _ := obs.last(); got.GCSessionID != "gc_late" {
+		t.Fatalf("GC session id at cadence = %q, want late sidecar", got.GCSessionID)
 	}
 }
 
