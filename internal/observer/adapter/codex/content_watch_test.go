@@ -93,7 +93,8 @@ func TestWatcherContentObservationReadsExactGCSessionIDSidecar(t *testing.T) {
 	root, state := t.TempDir(), t.TempDir()
 	p := filepath.Join(root, "session.jsonl")
 	writeFileString(t, p, msgLine("a")+"\n")
-	writeFileString(t, p+".gcmeta", "gc_authoritative_123")
+	// Gas City's transcriptmeta writer stores one opaque id followed by a record newline.
+	writeFileString(t, p+".gcmeta", "gc_authoritative_123\n")
 
 	obs := &recordingContentObserver{}
 	w := mustWatcher(t, WatchConfig{
@@ -121,7 +122,7 @@ func TestWatcherContentObservationRejectsUnsafeGCSessionIDSidecars(t *testing.T)
 		value string
 	}{
 		{name: "leading whitespace", value: " gc_123"},
-		{name: "trailing newline", value: "gc_123\n"},
+		{name: "extra trailing whitespace", value: "gc_123 \n"},
 		{name: "control", value: "gc_\x00123"},
 		{name: "format", value: "gc_\u200b123"},
 	} {
@@ -183,7 +184,7 @@ func TestWatcherGCSessionIDSidecarIsNoSymlinkAndBoundedCadence(t *testing.T) {
 	if err := os.Remove(p + ".gcmeta"); err != nil {
 		t.Fatalf("remove symlink: %v", err)
 	}
-	writeFileString(t, p+".gcmeta", "gc_late")
+	writeFileString(t, p+".gcmeta", "gc_late\n")
 
 	// A sidecar is checked at a bounded cadence rather than every 500ms watcher poll.
 	now = now.Add(gcMetaCheckInterval - time.Nanosecond)
@@ -199,6 +200,17 @@ func TestWatcherGCSessionIDSidecarIsNoSymlinkAndBoundedCadence(t *testing.T) {
 	}
 	if got, _ := obs.last(); got.GCSessionID != "gc_late" {
 		t.Fatalf("GC session id at cadence = %q, want late sidecar", got.GCSessionID)
+	}
+
+	// Once established, the exact binding is immutable for this transcript identity. A later
+	// sidecar replacement must not silently re-home already uploaded content.
+	writeFileString(t, p+".gcmeta", "gc_replaced\n")
+	now = now.Add(gcMetaCheckInterval)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll after sidecar replacement: %v", err)
+	}
+	if got, _ := obs.last(); got.GCSessionID != "gc_late" {
+		t.Fatalf("GC session id after sidecar replacement = %q, want immutable gc_late", got.GCSessionID)
 	}
 }
 
