@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -147,9 +148,32 @@ type ContentObservation struct {
 	// Size / ModNanos are the current stat, the debounce (stability) signal.
 	Size     int64
 	ModNanos int64
+	// NativeSessionID / Provider are recovered from the canonical provider transcript filename.
+	// They let a fully-consumed transcript remain uploadable after daemon restart without parsing
+	// or rewinding content. They never supply or alter GCSessionID.
+	NativeSessionID string
+	Provider        string
 	// GCSessionID is the authoritative Gas City session binding from the adjacent .gcmeta sidecar.
 	// It is empty when no valid sidecar is present; it is never inferred from the native session id.
 	GCSessionID string
+}
+
+var contentSessionUUIDPattern = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
+
+func contentIdentityFromLocator(locator string) (nativeSessionID, provider string) {
+	base := filepath.Base(locator)
+	match := contentSessionUUIDPattern.FindStringSubmatch(base)
+	if match == nil {
+		return "", ""
+	}
+	switch {
+	case strings.HasPrefix(base, "rollout-"):
+		return match[1], rolloutProvider
+	case base == match[1]+".jsonl":
+		return match[1], claudeProvider
+	default:
+		return "", ""
+	}
 }
 
 // ContentObserver is an optional seam the watcher notifies once per tracked file per poll, right
@@ -560,15 +584,18 @@ func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, mod
 		tf.gcSessionID = readGCSessionIDSidecar(tf.root, tf.locator)
 		tf.gcMetaCheckedAt = w.cfg.Now()
 	}
+	nativeSessionID, provider := contentIdentityFromLocator(tf.locator)
 	w.cfg.ContentObserver.ObserveContent(ctx, ContentObservation{
-		Root:        tf.root,
-		Locator:     tf.locator,
-		Path:        tf.path,
-		Device:      tf.dev,
-		Inode:       tf.ino,
-		Size:        size,
-		ModNanos:    modNanos,
-		GCSessionID: tf.gcSessionID,
+		Root:            tf.root,
+		Locator:         tf.locator,
+		Path:            tf.path,
+		Device:          tf.dev,
+		Inode:           tf.ino,
+		Size:            size,
+		ModNanos:        modNanos,
+		NativeSessionID: nativeSessionID,
+		Provider:        provider,
+		GCSessionID:     tf.gcSessionID,
 	})
 }
 

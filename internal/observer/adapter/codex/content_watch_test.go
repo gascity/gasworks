@@ -88,6 +88,35 @@ func TestWatcherFiresContentObserverWithStat(t *testing.T) {
 	}
 }
 
+func TestWatcherContentObservationCarriesCanonicalFilenameSessionIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, filename, provider string
+	}{
+		{"codex", "rollout-2026-08-06T06-59-20-019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "codex"},
+		{"claude", "019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "claude"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, state := t.TempDir(), t.TempDir()
+			p := filepath.Join(root, tc.filename)
+			writeFileString(t, p, msgLine("content without a session lifecycle")+"\n")
+			obs := &recordingContentObserver{}
+			w := mustWatcher(t, WatchConfig{
+				ApprovedRoots: []string{root}, StateDir: state, Sink: &recordingSink{}, ContentObserver: obs,
+			})
+			if err := w.Poll(context.Background()); err != nil {
+				t.Fatalf("poll: %v", err)
+			}
+			got, ok := obs.last()
+			if !ok {
+				t.Fatal("no content observation")
+			}
+			if got.NativeSessionID != "019fd5de-8d4a-74f3-b1e5-2d8217534c67" || got.Provider != tc.provider {
+				t.Fatalf("filename identity = %q/%q, want exact native session/%q", got.NativeSessionID, got.Provider, tc.provider)
+			}
+		})
+	}
+}
+
 func TestWatcherContentObservationReadsExactGCSessionIDSidecar(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()

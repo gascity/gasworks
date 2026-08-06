@@ -148,6 +148,8 @@ type contentUploader struct {
 type contentState struct {
 	root, locator, path string
 	size, modNanos      int64
+	observedNative      string
+	observedProvider    string
 	// stableSince is when the current (size,modNanos) was first observed; the file is "stable" once
 	// now-stableSince >= debounce. Any size/mtime change resets it.
 	stableSince time.Time
@@ -256,6 +258,7 @@ func (u *contentUploader) ObserveContent(_ context.Context, o codex.ContentObser
 		u.files[id] = st
 	}
 	st.root, st.locator, st.path = o.Root, o.Locator, o.Path
+	st.observedNative, st.observedProvider = o.NativeSessionID, o.Provider
 	if st.gcSessionID != o.GCSessionID {
 		// Metadata can land after the transcript bytes. Re-arm this exact snapshot so it is sent
 		// once with the newly authoritative binding even when its size and hash are unchanged.
@@ -340,6 +343,9 @@ func (u *contentUploader) tick(ctx context.Context) {
 func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *contentState) (native, provider string, ok bool) {
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
+	}
+	if st.observedNative != "" && st.observedProvider != "" {
+		return st.observedNative, st.observedProvider, true
 	}
 	if st.markerNative != "" {
 		return st.markerNative, st.markerProvider, true

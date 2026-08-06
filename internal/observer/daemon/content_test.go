@@ -328,6 +328,29 @@ func TestContentUploadRearmsUnchangedTranscriptWhenGCSessionIDArrives(t *testing
 	}
 }
 
+func TestContentUploadUsesAuthoritativeFilenameIdentityAfterRestart(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 72, 422
+	const body = "already-consumed transcript"
+	h.reader.set(dev, ino, body, 100)
+	h.u.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "rollout.jsonl", Path: "/abs/rollout.jsonl",
+		Device: dev, Inode: ino, Size: int64(len(body)), ModNanos: 100,
+		NativeSessionID: "019fd5de-8d4a-74f3-b1e5-2d8217534c67",
+		Provider:        "codex",
+		GCSessionID:     "mc-wisp-e1c",
+	})
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("uploads = %d, want one recovery upload", h.sender.count())
+	}
+	req := h.sender.at(0)
+	if req.NativeSessionID != "019fd5de-8d4a-74f3-b1e5-2d8217534c67" || req.Provider != "codex" || req.GCSessionID != "mc-wisp-e1c" {
+		t.Fatalf("recovery identity = %+v, want exact native/provider/GC identities", req)
+	}
+}
+
 func TestContentUploadLegacyPlainMarkerStaysDeduplicatedUntilBindingArrives(t *testing.T) {
 	h := newContentHarness(t, contentUploaderConfig{})
 	const dev, ino = 71, 421
