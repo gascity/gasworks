@@ -11,8 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -144,6 +147,9 @@ type ContentObservation struct {
 	// Size / ModNanos are the current stat, the debounce (stability) signal.
 	Size     int64
 	ModNanos int64
+	// GCSessionID is the authoritative Gas City session binding from the adjacent .gcmeta sidecar.
+	// It is empty when no valid sidecar is present; it is never inferred from the native session id.
+	GCSessionID string
 }
 
 // ContentObserver is an optional seam the watcher notifies once per tracked file per poll, right
@@ -170,6 +176,13 @@ const (
 	// burst of appends drains across polls with bounded per-read memory while remaining O(new
 	// bytes) overall.
 	DefaultMaxReadChunk int64 = 1 << 22 // 4 MiB
+	// gcMetaCheckInterval bounds sidecar I/O for an unchanged transcript while still making a
+	// late-written authoritative binding visible promptly. The watcher keeps polling transcript
+	// metadata at its normal cadence; this only limits the small adjacent sidecar read.
+	gcMetaCheckInterval = 5 * time.Second
+	maxGCSessionIDBytes = 256
+	// Gas City's transcriptmeta writer stores the opaque id followed by one LF record delimiter.
+	maxGCSessionMetaBytes = maxGCSessionIDBytes + 1
 )
 
 // WatchConfig is the endpoint-owned configuration a Watcher runs under. Everything the watcher
@@ -217,11 +230,13 @@ type identityKey struct {
 // to a fd on the trusted root, refusing any symlink within the subtree, so drain never re-resolves
 // an absolute path whose parent components an attacker could swap after discovery.
 type trackedFile struct {
-	cursor   *Cursor
-	root     string
-	path     string
-	locator  string
-	dev, ino uint64
+	cursor          *Cursor
+	root            string
+	path            string
+	locator         string
+	dev, ino        uint64
+	gcSessionID     string
+	gcMetaCheckedAt time.Time
 }
 
 func (tf *trackedFile) ref() TranscriptRef {
@@ -269,6 +284,9 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 	}
 	if cfg.Sink == nil {
 		return nil, errors.New("codex watcher: a candidate sink is required")
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
 	}
 	rr := cfg.ReadRange
 	if rr == nil {
@@ -535,15 +553,60 @@ func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, mod
 	if w.cfg.ContentObserver == nil {
 		return
 	}
+	// The sidecar uses the same anchored, no-symlink open discipline as transcript reads. Cache
+	// both a missing and a valid result so an unchanged transcript cannot turn the metadata sidecar
+	// into unbounded I/O at the watcher poll cadence.
+	if tf.gcSessionID == "" && (tf.gcMetaCheckedAt.IsZero() || w.cfg.Now().Sub(tf.gcMetaCheckedAt) >= gcMetaCheckInterval) {
+		tf.gcSessionID = readGCSessionIDSidecar(tf.root, tf.locator)
+		tf.gcMetaCheckedAt = w.cfg.Now()
+	}
 	w.cfg.ContentObserver.ObserveContent(ctx, ContentObservation{
-		Root:     tf.root,
-		Locator:  tf.locator,
-		Path:     tf.path,
-		Device:   tf.dev,
-		Inode:    tf.ino,
-		Size:     size,
-		ModNanos: modNanos,
+		Root:        tf.root,
+		Locator:     tf.locator,
+		Path:        tf.path,
+		Device:      tf.dev,
+		Inode:       tf.ino,
+		Size:        size,
+		ModNanos:    modNanos,
+		GCSessionID: tf.gcSessionID,
 	})
+}
+
+// readGCSessionIDSidecar reads the exact binding emitted by Gas City beside a transcript. It is
+// intentionally tiny and conservative: a missing, replaced, non-regular, symlinked, oversized, or
+// malformed sidecar simply means no authoritative binding for this observation. The raw value is
+// never trimmed or normalized, because either operation could bind content to a different session.
+func readGCSessionIDSidecar(root, locator string) string {
+	f, err := openGCMetaSidecar(root, locator+".gcmeta")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 1 || info.Size() > maxGCSessionMetaBytes {
+		return ""
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxGCSessionMetaBytes+1))
+	if err != nil || len(b) <= 1 || len(b) > maxGCSessionMetaBytes || b[len(b)-1] != '\n' {
+		return ""
+	}
+	id := string(b[:len(b)-1])
+	if !validGCSessionID(id) {
+		return ""
+	}
+	return id
+}
+
+func validGCSessionID(id string) bool {
+	if id == "" || len(id) > maxGCSessionIDBytes || !utf8.ValidString(id) || strings.TrimSpace(id) != id {
+		return false
+	}
+	for _, r := range id {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
 }
 
 // ErrTranscriptTooLarge reports that a transcript exceeds the caller's whole-file content ceiling.
