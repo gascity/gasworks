@@ -181,6 +181,8 @@ const (
 	// metadata at its normal cadence; this only limits the small adjacent sidecar read.
 	gcMetaCheckInterval = 5 * time.Second
 	maxGCSessionIDBytes = 256
+	// Gas City's transcriptmeta writer stores the opaque id followed by one LF record delimiter.
+	maxGCSessionMetaBytes = maxGCSessionIDBytes + 1
 )
 
 // WatchConfig is the endpoint-owned configuration a Watcher runs under. Everything the watcher
@@ -554,7 +556,7 @@ func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, mod
 	// The sidecar uses the same anchored, no-symlink open discipline as transcript reads. Cache
 	// both a missing and a valid result so an unchanged transcript cannot turn the metadata sidecar
 	// into unbounded I/O at the watcher poll cadence.
-	if tf.gcMetaCheckedAt.IsZero() || w.cfg.Now().Sub(tf.gcMetaCheckedAt) >= gcMetaCheckInterval {
+	if tf.gcSessionID == "" && (tf.gcMetaCheckedAt.IsZero() || w.cfg.Now().Sub(tf.gcMetaCheckedAt) >= gcMetaCheckInterval) {
 		tf.gcSessionID = readGCSessionIDSidecar(tf.root, tf.locator)
 		tf.gcMetaCheckedAt = w.cfg.Now()
 	}
@@ -581,14 +583,18 @@ func readGCSessionIDSidecar(root, locator string) string {
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxGCSessionIDBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 1 || info.Size() > maxGCSessionMetaBytes {
 		return ""
 	}
-	b, err := io.ReadAll(io.LimitReader(f, maxGCSessionIDBytes+1))
-	if err != nil || len(b) == 0 || len(b) > maxGCSessionIDBytes || !validGCSessionID(string(b)) {
+	b, err := io.ReadAll(io.LimitReader(f, maxGCSessionMetaBytes+1))
+	if err != nil || len(b) <= 1 || len(b) > maxGCSessionMetaBytes || b[len(b)-1] != '\n' {
 		return ""
 	}
-	return string(b)
+	id := string(b[:len(b)-1])
+	if !validGCSessionID(id) {
+		return ""
+	}
+	return id
 }
 
 func validGCSessionID(id string) bool {
