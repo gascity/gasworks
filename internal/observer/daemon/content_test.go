@@ -228,6 +228,19 @@ func (h *contentHarness) observe(dev, ino uint64, path string, size, mod int64) 
 	})
 }
 
+func (h *contentHarness) observeWithGCSessionID(dev, ino uint64, path string, size, mod int64, gcSessionID string) {
+	h.u.ObserveContent(context.Background(), codex.ContentObservation{
+		Root:        "/root",
+		Locator:     "s.jsonl",
+		Path:        path,
+		Device:      dev,
+		Inode:       ino,
+		Size:        size,
+		ModNanos:    mod,
+		GCSessionID: gcSessionID,
+	})
+}
+
 // --- tests --------------------------------------------------------------------
 
 func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
@@ -250,6 +263,104 @@ func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
 	}
 	if req.NativeSessionID != "sess-1" || req.Provider != "claude" || req.SourcePath != "/abs/s.jsonl" {
 		t.Fatalf("headers wrong: %+v", req)
+	}
+}
+
+func TestContentUploadRearmsUnchangedTranscriptWhenGCSessionIDArrives(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 70, 420
+	h.sessions.set(dev, ino, "native-1", "codex")
+	h.reader.set(dev, ino, "unchanged transcript", 100)
+
+	// The sidecar is absent on the first stable observation, so this remains a plain upload.
+	h.observeWithGCSessionID(dev, ino, "/abs/s.jsonl", int64(len("unchanged transcript")), 100, "")
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 || h.sender.at(0).GCSessionID != "" {
+		t.Fatalf("first upload = %+v, want exactly one plain upload", h.sender.at(0))
+	}
+
+	// A late authoritative sidecar must re-arm the exact same bytes once.
+	h.observeWithGCSessionID(dev, ino, "/abs/s.jsonl", int64(len("unchanged transcript")), 100, "gc_exact_1")
+	h.u.tick(context.Background())
+	if h.sender.count() != 2 {
+		t.Fatalf("uploads after sidecar arrival = %d, want 2", h.sender.count())
+	}
+	if got := h.sender.at(1).GCSessionID; got != "gc_exact_1" {
+		t.Fatalf("second upload GC session id = %q, want authoritative sidecar id", got)
+	}
+
+	// The binding is now durable dedup state: identical bytes + metadata post no further uploads.
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 2 {
+		t.Fatalf("duplicate upload after GC metadata dedup = %d, want 2", h.sender.count())
+	}
+
+	// A restart must recover the GC binding from the durable marker rather than re-send the same
+	// content. This pins the marker schema as part of the dedup key, not merely in-memory state.
+	u2, err := newContentUploader(contentUploaderConfig{
+		sender:   h.sender,
+		sessions: h.sessions,
+		stateDir: h.stateDir,
+		read:     h.reader.read,
+		now:      h.clock.now,
+		debounce: 30 * time.Second,
+		log:      h.appendLog,
+	})
+	if err != nil {
+		t.Fatalf("new restarted uploader: %v", err)
+	}
+	u2.ObserveContent(context.Background(), codex.ContentObservation{
+		Root:        "/root",
+		Locator:     "s.jsonl",
+		Path:        "/abs/s.jsonl",
+		Device:      dev,
+		Inode:       ino,
+		Size:        int64(len("unchanged transcript")),
+		ModNanos:    100,
+		GCSessionID: "gc_exact_1",
+	})
+	h.clock.advance(31 * time.Second)
+	u2.tick(context.Background())
+	if h.sender.count() != 2 {
+		t.Fatalf("restart re-uploaded already bound content: %d, want 2", h.sender.count())
+	}
+}
+
+func TestContentUploadLegacyPlainMarkerStaysDeduplicatedUntilBindingArrives(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 71, 421
+	const body = "legacy transcript"
+	h.sessions.set(dev, ino, "native-legacy", "codex")
+	h.reader.set(dev, ino, body, 100)
+	h.u.persistMarker(transcriptIdentity{device: dev, inode: ino}, contentMarker{
+		Version:         legacyContentMarkerVersion,
+		Device:          dev,
+		Inode:           ino,
+		ContentSHA256:   "c55360d8885a9ca4be51dede54a18cd7fc26711b770e8f966b77a9c0b5830f13",
+		Size:            int64(len(body)),
+		ModNanos:        100,
+		NativeSessionID: "native-legacy",
+		Provider:        "codex",
+		UploadedAt:      h.clock.now().UTC().Format(time.RFC3339Nano),
+	})
+
+	u2, err := newContentUploader(contentUploaderConfig{
+		sender: h.sender, sessions: h.sessions, stateDir: h.stateDir, read: h.reader.read,
+		now: h.clock.now, debounce: 30 * time.Second, log: h.appendLog,
+	})
+	if err != nil {
+		t.Fatalf("new restarted uploader: %v", err)
+	}
+	u2.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "s.jsonl", Path: "/abs/s.jsonl", Device: dev, Inode: ino,
+		Size: int64(len(body)), ModNanos: 100,
+	})
+	h.clock.advance(31 * time.Second)
+	u2.tick(context.Background())
+	if h.sender.count() != 0 {
+		t.Fatalf("legacy plain marker caused re-upload: %d", h.sender.count())
 	}
 }
 
