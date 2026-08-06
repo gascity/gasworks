@@ -344,7 +344,10 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
 	}
-	if st.observedNative != "" && st.observedProvider != "" {
+	// Filename recovery is intentionally gated by an authoritative GC sidecar. It repairs the
+	// exact late-binding case without turning every fully-consumed, markerless transcript into an
+	// implicit historical backfill after restart.
+	if st.gcSessionID != "" && st.observedNative != "" && st.observedProvider != "" {
 		return st.observedNative, st.observedProvider, true
 	}
 	if st.markerNative != "" {

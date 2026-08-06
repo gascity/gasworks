@@ -351,6 +351,24 @@ func TestContentUploadUsesAuthoritativeFilenameIdentityAfterRestart(t *testing.T
 	}
 }
 
+func TestContentUploadDoesNotBackfillFilenameIdentityWithoutGCBinding(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 73, 423
+	const body = "unbound consumed transcript"
+	h.reader.set(dev, ino, body, 100)
+	h.u.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "rollout.jsonl", Path: "/abs/rollout.jsonl",
+		Device: dev, Inode: ino, Size: int64(len(body)), ModNanos: 100,
+		NativeSessionID: "019fd5de-8d4a-74f3-b1e5-2d8217534c67",
+		Provider:        "codex",
+	})
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 0 || h.reader.readCount() != 0 {
+		t.Fatalf("unbound recovery uploads=%d reads=%d, want no broad backfill", h.sender.count(), h.reader.readCount())
+	}
+}
+
 func TestContentUploadLegacyPlainMarkerStaysDeduplicatedUntilBindingArrives(t *testing.T) {
 	h := newContentHarness(t, contentUploaderConfig{})
 	const dev, ino = 71, 421
