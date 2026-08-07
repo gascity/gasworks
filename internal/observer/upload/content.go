@@ -55,9 +55,10 @@ type ContentResult struct {
 
 // contentAck is the decoded 2xx body of a content upload.
 type contentAck struct {
-	GCSessionID string `json:"gc_session_id"`
-	ReceiptID   string `json:"receipt_id"`
-	Status      string `json:"status"`
+	GCSessionID  string `json:"gc_session_id"`
+	TranscriptID string `json:"transcript_id"`
+	ReceiptID    string `json:"receipt_id"`
+	Status       string `json:"status"`
 }
 
 // PostContent uploads one whole-transcript snapshot to the collector's content route. It reads the
