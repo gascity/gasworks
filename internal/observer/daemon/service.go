@@ -19,6 +19,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/local"
 	"github.com/gascity/gasworks/internal/observer/spool"
 	"github.com/gascity/gasworks/internal/observer/upload"
+	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // ErrAlreadyRunning reports that another daemon already owns this state directory. It is returned
@@ -673,9 +674,36 @@ func (u *uploadLoop) drain(ctx context.Context) error {
 			return nil // nothing owed
 		}
 		if err := deliverer.Deliver(ctx, plan); err != nil {
-			return err // hold / retries exhausted / transient: nothing advanced; retried next pass
+			if !isRecoverableSequenceStraddle(err, plan) {
+				return err // hold / retries exhausted / transient: nothing advanced; retried next pass
+			}
+			// A multi-record range can straddle a collector head after an earlier accepted
+			// write lost its local acknowledgement. Re-deliver just its leading durable frame:
+			// an exact historical match gets a normal duplicate acknowledgement, a new frame
+			// gets a normal accepted acknowledgement, and any mismatch remains held. AckState
+			// then shrinks the original in-flight range through its regular partial-ack path.
+			first, firstErr := planner.First()
+			if firstErr != nil {
+				return fmt.Errorf("observer daemon: form sequence recovery prefix: %w", firstErr)
+			}
+			if firstErr = deliverer.Deliver(ctx, first); firstErr != nil {
+				return firstErr
+			}
 		}
 	}
+}
+
+// isRecoverableSequenceStraddle admits only the one ambiguity that can be resolved without a
+// server-side cursor read: a typed sequence conflict on a multi-record in-flight batch. Every
+// other hold, and a conflict on a singleton, stays fail-closed.
+func isRecoverableSequenceStraddle(err error, plan upload.Plan) bool {
+	if plan.Range.FirstSequence >= plan.Range.LastSequence {
+		return false
+	}
+	var held *upload.OperatorError
+	return errors.As(err, &held) &&
+		held.Status == 409 &&
+		held.Code == wire.ObserverErrorBodyCodeSEQUENCECONFLICT
 }
 
 // durationOr returns d when positive, else fallback.
