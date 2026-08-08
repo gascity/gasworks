@@ -89,16 +89,6 @@ func TestDarwinOpenValidatedTranscriptDoesNotBlockOnFIFOReplacement(t *testing.T
 		t.Fatal("file identity unavailable")
 	}
 
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		time.Sleep(250 * time.Millisecond)
-		writer, openErr := os.OpenFile(path, os.O_WRONLY, 0)
-		if openErr == nil {
-			_ = writer.Close()
-		}
-	}()
-
 	start := time.Now()
 	file, _, _, err := openValidatedTranscript(root, "session.jsonl", dev, ino)
 	elapsed := time.Since(start)
@@ -112,5 +102,4 @@ func TestDarwinOpenValidatedTranscriptDoesNotBlockOnFIFOReplacement(t *testing.T
 	if elapsed >= 100*time.Millisecond {
 		t.Fatalf("openValidatedTranscript blocked on FIFO for %v", elapsed)
 	}
-	<-writerDone
 }
