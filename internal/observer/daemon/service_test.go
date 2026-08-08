@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -417,6 +418,139 @@ func TestServiceUploadLoopHold(t *testing.T) {
 	}
 	if ack.AcknowledgedThrough() != 0 {
 		t.Fatalf("acknowledged_through = %d after a hold, want 0 (nothing advanced)", ack.AcknowledgedThrough())
+	}
+}
+
+func TestServiceUploadLoopRecoversOnlyTypedSequenceStraddleByDeliveringLeadingRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	seedWAL(t, stateDir,
+		sealObs(t, runStartedPending(t, "run_recover_1"), 1),
+		sealObs(t, runStartedPending(t, "run_recover_2"), 2),
+		sealObs(t, runStartedPending(t, "run_recover_3"), 3),
+		sealObs(t, runStartedPending(t, "run_recover_4"), 4),
+	)
+
+	var got []wire.SequenceRange
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch wire.ObservationBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Fatalf("decode batch: %v", err)
+		}
+		rng := wire.SequenceRange{FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence}
+		got = append(got, rng)
+		if rng == (wire.SequenceRange{FirstSequence: 1, LastSequence: 4}) || rng == (wire.SequenceRange{FirstSequence: 2, LastSequence: 4}) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"SEQUENCE_CONFLICT","message":"straddle","retryable":false}}`))
+			return
+		}
+		ack := wire.IngestAck{SourceId: testSourceID, AcknowledgedThroughSequence: rng.LastSequence}
+		if rng.LastSequence <= 2 {
+			ack.Duplicates = 1
+		} else {
+			ack.Accepted = rng.LastSequence - rng.FirstSequence + 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ack)
+	}))
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	client, err := upload.NewClient(upload.Config{Endpoint: u, SourceID: testSourceID, Credential: fixedToken{"t"}, AllowLoopbackHTTP: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	svc, err := NewService(ServiceConfig{
+		Dir: stateDir, SourceID: testSourceID, Capacity: permissiveCapacity(),
+		Upload:  &UploadLoopConfig{Sender: client, Interval: time.Hour, Retry: upload.RetryPolicy{MaxAttempts: 1}},
+		PeerUID: euidPeer,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	if err := svc.DrainUploads(context.Background()); err != nil {
+		t.Fatalf("DrainUploads: %v", err)
+	}
+	want := []wire.SequenceRange{{FirstSequence: 1, LastSequence: 4}, {FirstSequence: 1, LastSequence: 1}, {FirstSequence: 2, LastSequence: 4}, {FirstSequence: 2, LastSequence: 2}, {FirstSequence: 3, LastSequence: 4}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivered ranges = %+v, want %+v", got, want)
+	}
+	ack, err := spool.LoadAckState(stateDir, 4, spool.AckOptions{})
+	if err != nil {
+		t.Fatalf("LoadAckState: %v", err)
+	}
+	if ack.AcknowledgedThrough() != 4 {
+		t.Fatalf("acknowledged_through = %d, want 4", ack.AcknowledgedThrough())
+	}
+}
+
+func TestServiceUploadLoopKeepsAckHeldWhenRecoverySingletonConflicts(t *testing.T) {
+	stateDir := t.TempDir()
+	seedWAL(t, stateDir,
+		sealObs(t, runStartedPending(t, "run_conflict_1"), 1),
+		sealObs(t, runStartedPending(t, "run_conflict_2"), 2),
+	)
+
+	var got []wire.SequenceRange
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var batch wire.ObservationBatch
+		if err := json.NewDecoder(r.Body).Decode(&batch); err != nil {
+			t.Fatalf("decode batch: %v", err)
+		}
+		rng := wire.SequenceRange{FirstSequence: batch.FirstSequence, LastSequence: batch.LastSequence}
+		got = append(got, rng)
+		code := wire.ObserverErrorBodyCodeSEQUENCECONFLICT
+		if rng == (wire.SequenceRange{FirstSequence: 1, LastSequence: 1}) {
+			code = wire.ObserverErrorBodyCodeOBSERVATIONCONFLICT
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(wire.ObserverError{Error: wire.ObserverErrorBody{Code: code, Message: "conflict", Retryable: false}})
+	}))
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	client, err := upload.NewClient(upload.Config{Endpoint: u, SourceID: testSourceID, Credential: fixedToken{"t"}, AllowLoopbackHTTP: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	svc, err := NewService(ServiceConfig{
+		Dir: stateDir, SourceID: testSourceID, Capacity: permissiveCapacity(),
+		Upload:  &UploadLoopConfig{Sender: client, Interval: time.Hour, Retry: upload.RetryPolicy{MaxAttempts: 1}},
+		PeerUID: euidPeer,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	err = svc.DrainUploads(context.Background())
+	if !errors.Is(err, upload.ErrHeld) {
+		t.Fatalf("DrainUploads = %v, want ErrHeld", err)
+	}
+	want := []wire.SequenceRange{{FirstSequence: 1, LastSequence: 2}, {FirstSequence: 1, LastSequence: 1}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivered ranges = %+v, want %+v", got, want)
+	}
+	ack, err := spool.LoadAckState(stateDir, 2, spool.AckOptions{})
+	if err != nil {
+		t.Fatalf("LoadAckState: %v", err)
+	}
+	if ack.AcknowledgedThrough() != 0 {
+		t.Fatalf("acknowledged_through = %d, want 0", ack.AcknowledgedThrough())
+	}
+	records, err := (upload.SpoolFrameStore{Dir: stateDir}).ReadRange(1, 2)
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("durable records = %d, want 2 held records", len(records))
 	}
 }
 

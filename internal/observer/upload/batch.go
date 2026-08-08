@@ -21,6 +21,7 @@
 package upload
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -182,6 +183,24 @@ func (p *Planner) Next() (Plan, bool, error) {
 		return Plan{}, false, err
 	}
 	return Plan{Range: r, Body: body}, true, nil
+}
+
+// First returns a one-record prefix of the currently in-flight range. It does not change the
+// in-flight range: a successful delivery of the returned plan is still acknowledged through the
+// ordinary AckState path, which advances only that record and shrinks the remaining in-flight
+// suffix. The daemon uses this only to prove/recover a typed sequence-straddle; it never skips or
+// resequences durable frames.
+func (p *Planner) First() (Plan, error) {
+	r, ok := p.Ack.InFlight()
+	if !ok {
+		return Plan{}, errors.New("observer upload: no in-flight range to prefix")
+	}
+	first := wire.SequenceRange{FirstSequence: r.FirstSequence, LastSequence: r.FirstSequence}
+	body, err := p.encodeRange(first)
+	if err != nil {
+		return Plan{}, err
+	}
+	return Plan{Range: first, Body: body}, nil
 }
 
 // encodeRange re-reads and re-encodes an already-in-flight range, guaranteeing a

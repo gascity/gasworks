@@ -112,6 +112,36 @@ func TestReplayIsByteIdentical(t *testing.T) {
 	}
 }
 
+func TestPrefixOfInFlightPlanIsExactlyOneRecordWithoutChangingTheInFlightRange(t *testing.T) {
+	ack := newAckState(t, 5)
+	p := &Planner{Store: newMemStore(t, 1, 5, 64), Ack: ack, SourceID: testSourceID}
+	whole, ok, err := p.Next()
+	if err != nil || !ok {
+		t.Fatalf("Next: ok=%v err=%v", ok, err)
+	}
+
+	first, err := p.First()
+	if err != nil {
+		t.Fatalf("First: %v", err)
+	}
+	if first.Range != (wire.SequenceRange{FirstSequence: 1, LastSequence: 1}) {
+		t.Fatalf("first range = %+v, want [1,1]", first.Range)
+	}
+	if bytes.Equal(first.Body, whole.Body) {
+		t.Fatal("singleton body unexpectedly equals the full in-flight body")
+	}
+	var batch wire.ObservationBatch
+	if err := json.Unmarshal(first.Body, &batch); err != nil {
+		t.Fatalf("decode singleton: %v", err)
+	}
+	if batch.FirstSequence != 1 || batch.LastSequence != 1 || len(batch.Observations) != 1 {
+		t.Fatalf("singleton batch = first %d last %d obs %d, want 1/1/1", batch.FirstSequence, batch.LastSequence, len(batch.Observations))
+	}
+	if r, in := ack.InFlight(); !in || r != whole.Range {
+		t.Fatalf("in-flight = %+v/%v, want original %+v", r, in, whole.Range)
+	}
+}
+
 func TestNothingOwed(t *testing.T) {
 	ack := newAckState(t, 0) // fresh, no durable frames
 	p := &Planner{Store: newMemStore(t, 1, 0, 0), Ack: ack, SourceID: testSourceID}
