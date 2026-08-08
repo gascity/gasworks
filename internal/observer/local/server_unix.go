@@ -547,16 +547,23 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 			return nil, err
 		}
 	}
+	// Re-derive terminal reserves from the complete pre-compaction WAL before this process can
+	// reclaim any acknowledged segment. The sidecar remains authoritative for starts already
+	// compacted by an earlier process; surviving lifecycle frames close crash windows around its
+	// updates.
+	events, err := spool.ScanRunEvents(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	reserves, err := spool.ReconcileReserves(cfg.Dir, cfg.Capacity.TerminalReserveBytes, events)
+	if err != nil {
+		return nil, err
+	}
 	seg, err := openOrCreateSegment(walDir, cfg, rec.NextSequence, now)
 	if err != nil {
 		return nil, err
 	}
 	ack, err := spool.LoadAckState(cfg.Dir, rec.HighestDurableSequence, spool.AckOptions{})
-	if err != nil {
-		seg.Close()
-		return nil, err
-	}
-	reserves, err := spool.LoadReserves(cfg.Dir, cfg.Capacity.TerminalReserveBytes)
 	if err != nil {
 		seg.Close()
 		return nil, err
@@ -574,6 +581,25 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 		reserves:        reserves,
 		capModel:        capModel,
 	}, nil
+}
+
+// AckState returns the process-local acknowledgement policy shared by the writer and uploader.
+// Sharing it keeps socket health current while the writer raises the durable ceiling and the
+// uploader advances the acknowledged prefix.
+func (w *SpoolWriter) AckState() *spool.AckState { return w.ack }
+
+// CompactAcknowledged reclaims only fully acknowledged inactive WAL segments while excluding a
+// concurrent append or rotation. It retains the WAL while any run is open because Registry is
+// rebuilt from that WAL after restart; once every run is terminal, its ancestry and open-boundary
+// state are no longer needed locally. Boot reconciliation has completed before a SpoolWriter
+// exists, satisfying Compact's reserve-safety ordering contract.
+func (w *SpoolWriter) CompactAcknowledged() (spool.CompactionResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.reserves.OpenRuns()) != 0 {
+		return spool.CompactionResult{}, nil
+	}
+	return spool.Compact(w.dir, w.ack.AcknowledgedThrough())
 }
 
 // openOrCreateSegment selects the active segment for append after recovery. It continues the

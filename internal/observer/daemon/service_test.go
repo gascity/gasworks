@@ -59,6 +59,39 @@ func seedWAL(t *testing.T, dir string, obs ...wire.Observation) {
 	}
 }
 
+// seedSegmentedWAL writes one observation per segment so uploader tests can prove that a
+// fully-acknowledged inactive segment is reclaimed without manufacturing a 64 MiB fixture.
+func seedSegmentedWAL(t *testing.T, dir string, obs ...wire.Observation) {
+	t.Helper()
+	walDir := filepath.Join(dir, "wal")
+	if err := os.MkdirAll(walDir, 0o700); err != nil {
+		t.Fatalf("mkdir wal: %v", err)
+	}
+	for i, o := range obs {
+		seq := int64(i + 1)
+		seg, err := spool.CreateSegment(walDir, spool.SegmentOptions{
+			FormatVersion: 1,
+			SourceID:      testSourceID,
+			FirstSequence: seq,
+		})
+		if err != nil {
+			t.Fatalf("CreateSegment(%d): %v", seq, err)
+		}
+		payload, err := wire.CanonicalBytes(o)
+		if err != nil {
+			_ = seg.Close()
+			t.Fatalf("CanonicalBytes(%d): %v", seq, err)
+		}
+		if err := seg.Append(spool.Frame{Sequence: seq, Payload: payload}); err != nil {
+			_ = seg.Close()
+			t.Fatalf("Append(%d): %v", seq, err)
+		}
+		if err := seg.Close(); err != nil {
+			t.Fatalf("CloseSegment(%d): %v", seq, err)
+		}
+	}
+}
+
 // walKinds reads every durable frame under dir and returns its observation kinds in sequence order.
 // It tolerates a transient torn tail (a frame the writer is mid-appending) by returning an error the
 // caller retries.
@@ -485,6 +518,129 @@ func TestServiceUploadLoopRecoversOnlyTypedSequenceStraddleByDeliveringLeadingRe
 	}
 	if ack.AcknowledgedThrough() != 4 {
 		t.Fatalf("acknowledged_through = %d, want 4", ack.AcknowledgedThrough())
+	}
+}
+
+func TestServiceUploadLoopPublishesLiveAckAndCompactsAcknowledgedInactiveSegments(t *testing.T) {
+	stateDir := t.TempDir()
+	seedSegmentedWAL(t, stateDir,
+		sealObs(t, runStartedPending(t, "run_compact"), 1),
+		sealObs(t, runEndedPending(t, "run_compact"), 2),
+	)
+
+	_, client := newCollector(t, testSourceID)
+	svc, err := NewService(ServiceConfig{
+		Dir: stateDir, SourceID: testSourceID, Capacity: permissiveCapacity(),
+		Upload:  &UploadLoopConfig{Sender: client, Interval: time.Hour},
+		PeerUID: euidPeer,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	before, err := svc.spool.Health()
+	if err != nil {
+		t.Fatalf("Health before drain: %v", err)
+	}
+	if before.OpenRuns != 0 {
+		t.Fatalf("open runs after boot reconciliation = %d, want 0", before.OpenRuns)
+	}
+	if err := svc.DrainUploads(context.Background()); err != nil {
+		t.Fatalf("DrainUploads: %v", err)
+	}
+	after, err := svc.spool.Health()
+	if err != nil {
+		t.Fatalf("Health after drain: %v", err)
+	}
+	if after.AcknowledgedThrough != 2 {
+		t.Fatalf("live acknowledged_through = %d, want 2", after.AcknowledgedThrough)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "wal"))
+	if err != nil {
+		t.Fatalf("ReadDir(wal): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "00000000000000000002.seg" {
+		t.Fatalf("remaining WAL entries = %v, want only active tail sequence 2", entries)
+	}
+}
+
+func TestServiceUploadLoopCompactsPersistedAcknowledgedPrefixWhenNothingIsOwed(t *testing.T) {
+	stateDir := t.TempDir()
+	seedSegmentedWAL(t, stateDir,
+		sealObs(t, runStartedPending(t, "run_already_acked"), 1),
+		sealObs(t, runEndedPending(t, "run_already_acked"), 2),
+	)
+	ack, err := spool.LoadAckState(stateDir, 2, spool.AckOptions{})
+	if err != nil {
+		t.Fatalf("LoadAckState: %v", err)
+	}
+	if err := ack.SetInFlight(wire.SequenceRange{FirstSequence: 1, LastSequence: 2}); err != nil {
+		t.Fatalf("SetInFlight: %v", err)
+	}
+	if err := ack.Acknowledge(2); err != nil {
+		t.Fatalf("Acknowledge: %v", err)
+	}
+
+	_, client := newCollector(t, testSourceID)
+	svc, err := NewService(ServiceConfig{
+		Dir: stateDir, SourceID: testSourceID, Capacity: permissiveCapacity(),
+		Upload:  &UploadLoopConfig{Sender: client, Interval: time.Hour},
+		PeerUID: euidPeer,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	if err := svc.DrainUploads(context.Background()); err != nil {
+		t.Fatalf("DrainUploads: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "wal"))
+	if err != nil {
+		t.Fatalf("ReadDir(wal): %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "00000000000000000002.seg" {
+		t.Fatalf("remaining WAL entries = %v, want only active tail sequence 2", entries)
+	}
+}
+
+func TestServiceUploadLoopRetainsAcknowledgedSegmentsNeededByOpenRun(t *testing.T) {
+	stateDir := t.TempDir()
+	seedSegmentedWAL(t, stateDir,
+		sealObs(t, runStartedPending(t, "run_still_open_1"), 1),
+		sealObs(t, runStartedPending(t, "run_still_open_2"), 2),
+	)
+
+	_, client := newCollector(t, testSourceID)
+	svc, err := NewService(ServiceConfig{
+		Dir: stateDir, SourceID: testSourceID, Capacity: permissiveCapacity(),
+		Upload:  &UploadLoopConfig{Sender: client, Interval: time.Hour},
+		PeerUID: euidPeer,
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	if err := svc.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+
+	if err := svc.DrainUploads(context.Background()); err != nil {
+		t.Fatalf("DrainUploads: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "wal"))
+	if err != nil {
+		t.Fatalf("ReadDir(wal): %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("remaining WAL entry count = %d, want 2 while a run is open", len(entries))
 	}
 }
 
