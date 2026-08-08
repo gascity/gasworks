@@ -90,10 +90,11 @@ func TestWatcherFiresContentObserverWithStat(t *testing.T) {
 
 func TestWatcherContentObservationCarriesCanonicalFilenameSessionIdentity(t *testing.T) {
 	for _, tc := range []struct {
-		name, filename, provider string
+		name, filename, native, provider string
 	}{
-		{"codex", "rollout-2026-08-06T06-59-20-019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "codex"},
-		{"claude", "019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "claude"},
+		{"codex", "rollout-2026-08-06T06-59-20-019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "019fd5de-8d4a-74f3-b1e5-2d8217534c67", "codex"},
+		{"claude", "019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl", "019fd5de-8d4a-74f3-b1e5-2d8217534c67", "claude"},
+		{"claude-agent-is-not-an-identity", "agent-cafe42.jsonl", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, state := t.TempDir(), t.TempDir()
@@ -110,8 +111,8 @@ func TestWatcherContentObservationCarriesCanonicalFilenameSessionIdentity(t *tes
 			if !ok {
 				t.Fatal("no content observation")
 			}
-			if got.NativeSessionID != "019fd5de-8d4a-74f3-b1e5-2d8217534c67" || got.Provider != tc.provider {
-				t.Fatalf("filename identity = %q/%q, want exact native session/%q", got.NativeSessionID, got.Provider, tc.provider)
+			if got.NativeSessionID != tc.native || got.Provider != tc.provider {
+				t.Fatalf("filename identity = %q/%q, want %q/%q", got.NativeSessionID, got.Provider, tc.native, tc.provider)
 			}
 		})
 	}

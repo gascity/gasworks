@@ -42,6 +42,10 @@ func runDaemon(args []string) int {
 	// exactly as before. It reuses the -collector base + -token-file credential (no second endpoint or
 	// credential) and requires the watcher (-approved-root). OBSERVER_CONTENT_UPLOAD=1 sets the default.
 	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and -approved-root)")
+	// This is deliberately separate from -content-upload: an ordinary content-enabled restart
+	// must not retrospectively upload every fully-consumed markerless transcript. When explicitly
+	// enabled, only the canonical UUID/rollout identity already recovered from a filename is used.
+	contentHistoricalRecovery := fs.Bool("content-historical-recovery", false, "allow canonical filename recovery for historical markerless transcript content (requires -content-upload)")
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
@@ -93,7 +97,7 @@ func runDaemon(args []string) int {
 				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root; running metadata-only")
 			} else {
 				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
-				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
+				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client, AllowHistoricalFilenameRecovery: *contentHistoricalRecovery}
 			}
 		}
 	} else if *contentUpload {
