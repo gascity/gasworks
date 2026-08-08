@@ -102,6 +102,31 @@ func TestPostContentSendsWholeBodyWithHeaders(t *testing.T) {
 	}
 }
 
+func TestPostContentDecodesPlatformReceiptShape(t *testing.T) {
+	srv := &contentServer{status: http.StatusOK, respBody: []byte(`{
+		"gc_session_id":"mc-wisp-e1c",
+		"transcript_id":"trn_cass_opaque",
+		"receipt_id":"rcpt_existing",
+		"status":"DUPLICATE_DURABLY_RECORDED"
+	}`)}
+	base := newHTTPServer(t, srv.handler())
+	client := loopbackClient(t, base, staticToken("t"))
+
+	res, err := client.PostContent(context.Background(), ContentRequest{
+		NativeSessionID: "019fd5de-8d4a-74f3-b1e5-2d8217534c67",
+		GCSessionID:     "mc-wisp-e1c",
+		Provider:        "codex",
+		SourcePath:      "/approved/session.jsonl",
+		Body:            []byte("content"),
+	})
+	if err != nil {
+		t.Fatalf("PostContent: %v", err)
+	}
+	if res.GCSessionID != "mc-wisp-e1c" || res.ReceiptID != "rcpt_existing" || res.Status != "DUPLICATE_DURABLY_RECORDED" {
+		t.Fatalf("decoded Platform receipt = %+v", res)
+	}
+}
+
 func TestPostContentOmitsGCSessionIDWhenUnknown(t *testing.T) {
 	srv := &contentServer{}
 	base := newHTTPServer(t, srv.handler())

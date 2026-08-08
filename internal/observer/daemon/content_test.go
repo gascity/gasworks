@@ -53,7 +53,7 @@ func (f *fakeContentSender) PostContent(_ context.Context, r upload.ContentReque
 	if respond != nil {
 		return respond(n, r)
 	}
-	return &upload.ContentResult{StatusCode: 200, GCSessionID: "gcs", ReceiptID: "r", Status: "accepted"}, nil
+	return &upload.ContentResult{StatusCode: 200, GCSessionID: r.GCSessionID, ReceiptID: "r", Status: "accepted"}, nil
 }
 
 func (f *fakeContentSender) count() int {
@@ -402,6 +402,71 @@ func TestContentUploadLegacyPlainMarkerStaysDeduplicatedUntilBindingArrives(t *t
 	u2.tick(context.Background())
 	if h.sender.count() != 0 {
 		t.Fatalf("legacy plain marker caused re-upload: %d", h.sender.count())
+	}
+}
+
+func TestContentUploadRevalidatesLegacyBoundMarker(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 74, 424
+	const body = "legacy transcript"
+	h.sessions.set(dev, ino, "native-legacy-bound", "codex")
+	h.reader.set(dev, ino, body, 100)
+	h.u.persistMarker(transcriptIdentity{device: dev, inode: ino}, contentMarker{
+		Version:         2,
+		Device:          dev,
+		Inode:           ino,
+		ContentSHA256:   "c55360d8885a9ca4be51dede54a18cd7fc26711b770e8f966b77a9c0b5830f13",
+		Size:            int64(len(body)),
+		ModNanos:        100,
+		NativeSessionID: "native-legacy-bound",
+		Provider:        "codex",
+		GCSessionID:     "gc-exact-legacy",
+		UploadedAt:      h.clock.now().UTC().Format(time.RFC3339Nano),
+	})
+	h.sender.respond = func(_ int, r upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 200, GCSessionID: r.GCSessionID, ReceiptID: "r", Status: "DUPLICATE_DURABLY_RECORDED"}, nil
+	}
+
+	u2, err := newContentUploader(contentUploaderConfig{
+		sender: h.sender, sessions: h.sessions, stateDir: h.stateDir, read: h.reader.read,
+		now: h.clock.now, debounce: 30 * time.Second, log: h.appendLog,
+	})
+	if err != nil {
+		t.Fatalf("new restarted uploader: %v", err)
+	}
+	u2.ObserveContent(context.Background(), codex.ContentObservation{
+		Root: "/root", Locator: "s.jsonl", Path: "/abs/s.jsonl", Device: dev, Inode: ino,
+		Size: int64(len(body)), ModNanos: 100, GCSessionID: "gc-exact-legacy",
+	})
+	h.clock.advance(31 * time.Second)
+	u2.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("legacy bound marker uploads = %d, want one compatibility revalidation", h.sender.count())
+	}
+	u2.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("acknowledged binding was not deduplicated: uploads = %d", h.sender.count())
+	}
+}
+
+func TestContentUploadDoesNotPersistUnacknowledgedGCBinding(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+	const dev, ino = 75, 425
+	const body = "bound transcript"
+	h.sessions.set(dev, ino, "native-bound", "codex")
+	h.reader.set(dev, ino, body, 100)
+	h.sender.respond = func(_ int, _ upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 200, ReceiptID: "r", Status: "DURABLY_RECORDED"}, nil
+	}
+
+	h.observeWithGCSessionID(dev, ino, "/abs/s.jsonl", int64(len(body)), 100, "gc-exact")
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("uploads = %d, want one", h.sender.count())
+	}
+	if _, err := os.Stat(contentMarkerPath(h.stateDir, dev, ino)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unacknowledged GC binding persisted a marker: err=%v", err)
 	}
 }
 
