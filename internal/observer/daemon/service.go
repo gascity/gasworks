@@ -157,6 +157,10 @@ type ContentUploadLoopConfig struct {
 	Debounce time.Duration
 	// Interval is the content-loop ticker cadence; 0 selects DefaultContentInterval.
 	Interval time.Duration
+	// AllowHistoricalFilenameRecovery permits a fully-consumed markerless transcript to use the
+	// canonical UUID/rollout identity already derived by the watcher after a daemon restart. It is
+	// default-off because enabling it may upload historical raw content; it never invents agent-* ids.
+	AllowHistoricalFilenameRecovery bool
 }
 
 // WatchLoopConfig configures the Codex transcript watcher and its candidate sink.
@@ -405,14 +409,15 @@ func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAda
 		stateDir = cfg.Watch.StateDir
 	}
 	cu, err := newContentUploader(contentUploaderConfig{
-		sender:   cfg.ContentUpload.Sender,
-		sessions: sink,
-		stateDir: stateDir,
-		maxBytes: cfg.ContentUpload.MaxBytes,
-		debounce: cfg.ContentUpload.Debounce,
-		read:     codex.ReadValidatedTranscript,
-		now:      s.now,
-		log:      s.log,
+		sender:                          cfg.ContentUpload.Sender,
+		sessions:                        sink,
+		stateDir:                        stateDir,
+		maxBytes:                        cfg.ContentUpload.MaxBytes,
+		debounce:                        cfg.ContentUpload.Debounce,
+		allowHistoricalFilenameRecovery: cfg.ContentUpload.AllowHistoricalFilenameRecovery,
+		read:                            codex.ReadValidatedTranscript,
+		now:                             s.now,
+		log:                             s.log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)

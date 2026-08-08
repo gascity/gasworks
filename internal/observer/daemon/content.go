@@ -110,14 +110,15 @@ type transcriptReader func(root, locator string, dev, ino uint64, maxBytes int64
 
 // contentUploaderConfig wires a contentUploader. Sender, Sessions, and StateDir are required.
 type contentUploaderConfig struct {
-	sender   ContentSender
-	sessions sessionLookup
-	stateDir string
-	maxBytes int64
-	debounce time.Duration
-	read     transcriptReader
-	now      func() time.Time
-	log      func(string)
+	sender                          ContentSender
+	sessions                        sessionLookup
+	stateDir                        string
+	maxBytes                        int64
+	debounce                        time.Duration
+	allowHistoricalFilenameRecovery bool
+	read                            transcriptReader
+	now                             func() time.Time
+	log                             func(string)
 }
 
 // contentUploader ships whole-transcript snapshots to the collector's content endpoint as a side
@@ -133,9 +134,14 @@ type contentUploader struct {
 	stateDir string
 	maxBytes int64
 	debounce time.Duration
-	read     transcriptReader
-	now      func() time.Time
-	log      func(string)
+	// allowHistoricalFilenameRecovery is an explicit raw-content egress opt-in. When enabled,
+	// a fully-consumed markerless transcript may use the canonical native identity that the
+	// watcher derived from its filename after a daemon restart. It never parses content for an
+	// identity and therefore cannot recover Claude agent-* filenames.
+	allowHistoricalFilenameRecovery bool
+	read                            transcriptReader
+	now                             func() time.Time
+	log                             func(string)
 
 	mu    sync.Mutex
 	files map[transcriptIdentity]*contentState
@@ -234,15 +240,16 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 	// own distinctly-prefixed temp files.
 	sweepOrphanContentTemps(cfg.stateDir)
 	return &contentUploader{
-		sender:   cfg.sender,
-		sessions: cfg.sessions,
-		stateDir: cfg.stateDir,
-		maxBytes: maxBytes,
-		debounce: debounce,
-		read:     read,
-		now:      now,
-		log:      cfg.log,
-		files:    map[transcriptIdentity]*contentState{},
+		sender:                          cfg.sender,
+		sessions:                        cfg.sessions,
+		stateDir:                        cfg.stateDir,
+		maxBytes:                        maxBytes,
+		debounce:                        debounce,
+		allowHistoricalFilenameRecovery: cfg.allowHistoricalFilenameRecovery,
+		read:                            read,
+		now:                             now,
+		log:                             cfg.log,
+		files:                           map[transcriptIdentity]*contentState{},
 	}, nil
 }
 
@@ -349,10 +356,10 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
 	}
-	// Filename recovery is intentionally gated by an authoritative GC sidecar. It repairs the
-	// exact late-binding case without turning every fully-consumed, markerless transcript into an
-	// implicit historical backfill after restart.
-	if st.gcSessionID != "" && st.observedNative != "" && st.observedProvider != "" {
+	// A GC sidecar proves an exact later attachment and always authorizes the canonical filename
+	// recovery. The separate historical-recovery opt-in extends that same recovery only to the
+	// filename identities the watcher already derived; it never guesses from an agent-* filename.
+	if (st.gcSessionID != "" || u.allowHistoricalFilenameRecovery) && st.observedNative != "" && st.observedProvider != "" {
 		return st.observedNative, st.observedProvider, true
 	}
 	if st.markerNative != "" {

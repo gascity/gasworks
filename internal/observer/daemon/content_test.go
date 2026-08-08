@@ -203,6 +203,7 @@ func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness 
 	if cfg.debounce != 0 {
 		base.debounce = cfg.debounce
 	}
+	base.allowHistoricalFilenameRecovery = cfg.allowHistoricalFilenameRecovery
 	if cfg.sender != nil {
 		base.sender = cfg.sender
 		h.sender = cfg.sender.(*fakeContentSender)
@@ -241,6 +242,20 @@ func (h *contentHarness) observeWithGCSessionID(dev, ino uint64, path string, si
 	})
 }
 
+func (h *contentHarness) observeWithFilenameIdentity(dev, ino uint64, path, native, provider string, size, mod int64) {
+	h.u.ObserveContent(context.Background(), codex.ContentObservation{
+		Root:            "/root",
+		Locator:         "019fd5de-8d4a-74f3-b1e5-2d8217534c67.jsonl",
+		Path:            path,
+		Device:          dev,
+		Inode:           ino,
+		Size:            size,
+		ModNanos:        mod,
+		NativeSessionID: native,
+		Provider:        provider,
+	})
+}
+
 // --- tests --------------------------------------------------------------------
 
 func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
@@ -263,6 +278,47 @@ func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
 	}
 	if req.NativeSessionID != "sess-1" || req.Provider != "claude" || req.SourcePath != "/abs/s.jsonl" {
 		t.Fatalf("headers wrong: %+v", req)
+	}
+}
+
+func TestContentUploadFilenameRecoveryRequiresExplicitHistoricalOptIn(t *testing.T) {
+	const (
+		dev      = 88
+		ino      = 99
+		native   = "019fd5de-8d4a-74f3-b1e5-2d8217534c67"
+		provider = "claude"
+		body     = "already-consumed transcript\n"
+	)
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+		want    int
+	}{
+		{name: "default-off", want: 0},
+		{name: "explicitly-enabled", enabled: true, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newContentHarness(t, contentUploaderConfig{allowHistoricalFilenameRecovery: tc.enabled})
+			h.reader.set(dev, ino, body, 100)
+			// No live SessionFor state: this models a fully-consumed passive transcript after
+			// daemon restart. The watcher already supplied only a canonical filename identity.
+			h.observeWithFilenameIdentity(dev, ino, "/abs/"+native+".jsonl", native, provider, int64(len(body)), 100)
+			h.clock.advance(31 * time.Second)
+			h.u.tick(context.Background())
+
+			if got := h.sender.count(); got != tc.want {
+				t.Fatalf("uploads = %d, want %d", got, tc.want)
+			}
+			if got := h.reader.readCount(); got != tc.want {
+				t.Fatalf("whole-file reads = %d, want %d", got, tc.want)
+			}
+			if tc.want == 1 {
+				req := h.sender.at(0)
+				if req.NativeSessionID != native || req.Provider != provider {
+					t.Fatalf("recovered identity = %q/%q, want %q/%q", req.NativeSessionID, req.Provider, native, provider)
+				}
+			}
+		})
 	}
 }
 
