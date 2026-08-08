@@ -263,6 +263,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 			dir:      cfg.Dir,
 			sourceID: cfg.SourceID,
 			spool:    sp,
+			ack:      sp.AckState(),
 			sender:   cfg.Upload.Sender,
 			caps:     cfg.Upload.Caps,
 			retry:    cfg.Upload.Retry,
@@ -622,6 +623,7 @@ type uploadLoop struct {
 	dir      string
 	sourceID string
 	spool    *local.SpoolWriter
+	ack      *spool.AckState
 	sender   upload.Sender
 	caps     upload.Caps
 	retry    upload.RetryPolicy
@@ -642,23 +644,15 @@ type uploadLoop struct {
 func (u *uploadLoop) drain(ctx context.Context) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	snap, err := u.spool.Health()
-	if err != nil {
-		return fmt.Errorf("observer daemon: spool health: %w", err)
-	}
-	ack, err := spool.LoadAckState(u.dir, snap.HighestDurable, spool.AckOptions{})
-	if err != nil {
-		return fmt.Errorf("observer daemon: load ack state: %w", err)
-	}
 	planner := &upload.Planner{
 		Store:    upload.SpoolFrameStore{Dir: u.dir},
-		Ack:      ack,
+		Ack:      u.ack,
 		Caps:     u.caps,
 		SourceID: u.sourceID,
 	}
 	deliverer := &upload.Deliverer{
 		Sender:   u.sender,
-		Ack:      ack,
+		Ack:      u.ack,
 		SourceID: u.sourceID,
 		Policy:   u.retry,
 	}
@@ -671,7 +665,7 @@ func (u *uploadLoop) drain(ctx context.Context) error {
 			return fmt.Errorf("observer daemon: plan batch: %w", err)
 		}
 		if !ok {
-			return nil // nothing owed
+			return u.compactAcknowledged() // nothing owed; reclaim a prefix acked before restart
 		}
 		if err := deliverer.Deliver(ctx, plan); err != nil {
 			if !isRecoverableSequenceStraddle(err, plan) {
@@ -690,7 +684,17 @@ func (u *uploadLoop) drain(ctx context.Context) error {
 				return firstErr
 			}
 		}
+		if err := u.compactAcknowledged(); err != nil {
+			return err
+		}
 	}
+}
+
+func (u *uploadLoop) compactAcknowledged() error {
+	if _, err := u.spool.CompactAcknowledged(); err != nil {
+		return fmt.Errorf("observer daemon: compact acknowledged spool: %w", err)
+	}
+	return nil
 }
 
 // isRecoverableSequenceStraddle admits only the one ambiguity that can be resolved without a
