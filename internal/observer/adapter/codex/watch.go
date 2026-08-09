@@ -526,7 +526,7 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 						size: info.Size(), mod: info.ModTime().UnixNano(),
 					})
 					if err != nil {
-						return err
+						return fmt.Errorf("sealing %s: %w", path, err)
 					}
 					if isTracked {
 						tf.cursor = cur
@@ -588,13 +588,24 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				if errors.Is(err, errDeferTracking) {
 					return nil
 				}
-				return err
+				// The wrap is load-bearing for the same reason the walk-error wrap above is: the
+				// post-walk check is os.IsNotExist, which does NOT unwrap, and this branch reaches a
+				// sink whose delivery error can be a bare ENOENT PathError. Unwrapped, that error
+				// ended the walk and was then swallowed as "the root is missing", handing the
+				// clean-walk consumers a partial enumeration.
+				return fmt.Errorf("tracking %s: %w", path, err)
 			}
 			w.tracked[key] = &trackedFile{cursor: cur, root: root, path: path, locator: locator, dev: dev, ino: ino, policy: policy, forwardBaseline: forwardBaseline}
 			return nil
 		})
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("scanning transcript root %s: %w", root, err)
+		if err != nil {
+			// A walk that ended early enumerated only part of the root, so nothing below may read
+			// this poll as evidence of what is missing under it — whether the error is fatal here or
+			// tolerated as a root that does not exist yet.
+			rootWalkFailed[root] = true
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("scanning transcript root %s: %w", root, err)
+			}
 		}
 		// Activation commits only over a walk that actually saw the root: a missing or unreadable
 		// root enumerates nothing, and committing there would record zero baselines and hand every
@@ -713,7 +724,7 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 	}
 	cur, err := LoadScopedCursor(w.cfg.StateDir, d.dev, d.ino, d.size, d.mod, w.cfg.MaxPartialLine, policy.scope)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("loading the scoped cursor for %s: %w", d.locator, err)
 	}
 	if policy.record.Mode != rootpolicy.ForwardOnly {
 		return cur, false, nil
@@ -725,7 +736,7 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 		cur.SealAt(d.size)
 		cur.observe(d.size, d.mod)
 		if err := cur.Save(); err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("saving the activation seal for %s: %w", d.locator, err)
 		}
 		return cur, true, nil
 	}
@@ -763,7 +774,7 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 		cur.SealAt(floor)
 		cur.observe(d.size, d.mod)
 		if err := cur.Save(); err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("saving the recovered floor for %s: %w", d.locator, err)
 		}
 	}
 	return cur, baseline, nil
@@ -845,9 +856,14 @@ func (w *Watcher) resealReplacement(ctx context.Context, policy *rootPolicyState
 
 // reportSealReplacement delivers the replacement diagnostic BEFORE the floor it describes is
 // recorded, matching drain's ordering: a delivery failure fails the poll with nothing yet committed,
-// and the next poll re-derives the same decision from the same lineage.
+// and the next poll re-derives the same decision from the same lineage. The failure is wrapped where
+// it is raised: a sink error is an arbitrary error value, and one that happens to look like ENOENT
+// must not be mistaken for a filesystem answer by anything it passes through on the way out.
 func (w *Watcher) reportSealReplacement(ctx context.Context, d discovered, outcome sealReplacement, floor, size int64) error {
-	return w.cfg.Sink.DeliverCandidates(ctx, d.ref(), []*Candidate{sealReplacementDiagnostic(outcome, floor, size)})
+	if err := w.cfg.Sink.DeliverCandidates(ctx, d.ref(), []*Candidate{sealReplacementDiagnostic(outcome, floor, size)}); err != nil {
+		return fmt.Errorf("reporting the replacement of sealed transcript %s: %w", d.locator, err)
+	}
+	return nil
 }
 
 // drain reads and parses the bytes appended to one tracked file since its cursor offset and

@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
@@ -245,5 +246,66 @@ func TestMidWalkVanishedEntryDefersLineageRetirement(t *testing.T) {
 	}
 	if _, ok := w.rootPolicies[root].control.Lineages["session.jsonl"]; ok {
 		t.Fatalf("lineages = %+v, want retirement once the walks are complete again", w.rootPolicies[root].control.Lineages)
+	}
+}
+
+// TestSinkFailureDuringSealReplacementLeavesAbsenceEvidenceUntouched is the bd-main-t4o proof. A
+// delivery error on the seal-replacement path escaped the reconcile unwrapped, so a bare ENOENT from
+// the sink aborted the walk mid-root and then passed the walk's own os.IsNotExist tolerance: the
+// partial walk was treated as complete and clean, and every file past the abort point was accounted
+// missing - lineages retired over locators the walk never reached, absent-poll counters advanced for
+// files that were sitting right there. An error that ends a walk is not evidence about what the walk
+// never got to.
+func TestSinkFailureDuringSealReplacementLeavesAbsenceEvidenceUntouched(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	first, last := filepath.Join(root, "a.jsonl"), filepath.Join(root, "z.jsonl")
+	writeFileString(t, first, msgLine("pre-consent-first")+"\n")
+	writeFileString(t, last, msgLine("pre-consent-last-and-never-reached")+"\n")
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	sealedLast := mustBaseline(t, readRootControl(t, state, root), last)
+	dev, ino := identityOf(t, last)
+
+	// The walk's first file is replaced by a diverged one, so reconciling it reports the replacement
+	// to the sink - which fails with the error shape that used to be swallowed whole.
+	replaceViaRename(t, first, msgLine("a-completely-different-record-written-by-the-rewrite")+"\n")
+	sink.failNext = true
+	sink.failErr = &os.PathError{Op: "deliver", Path: "sink", Err: syscall.ENOENT}
+	if err := w.Poll(ctx); err == nil {
+		t.Fatal("poll succeeded despite a sink failure that ended the walk before its last file")
+	}
+
+	control := w.rootPolicies[root].control
+	if _, ok := control.Lineages["z.jsonl"]; !ok {
+		t.Fatalf("lineages = %+v, want the fence of a file the aborted walk never reached", control.Lineages)
+	}
+	if got, ok := control.Baselines[identityString(dev, ino)]; !ok || got != sealedLast {
+		t.Fatalf("baseline for the unreached file = %+v/%v, want the sealed floor %+v", got, ok, sealedLast)
+	}
+	tf, ok := w.tracked[identityKey{dev: dev, ino: ino}]
+	if !ok {
+		t.Fatal("the file past the abort point was dropped from tracking")
+	}
+	if tf.absentPolls != 0 {
+		t.Fatalf("absentPolls = %d for a present file the aborted walk never reached, want 0", tf.absentPolls)
+	}
+
+	// Nothing was committed on the failed path, so the next poll re-derives the same decision.
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("recovery poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want no pre-consent bytes from either file", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 1 {
+		t.Fatalf("diagnostics = %d, want the replacement reported exactly once after recovery", len(got))
 	}
 }
