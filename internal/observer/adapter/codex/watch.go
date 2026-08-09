@@ -652,10 +652,10 @@ func (w *Watcher) scanRoot(root string, forwardActivating bool, dirsRead map[str
 }
 
 // corroborated reports a walk that read the whole root, hit no error, and lost no entry between
-// readdir and stat. It is the evidence standard every un-fencing step runs on: releasing a tracked
-// identity, retiring a locator's lineage, and vacating a fence the walk believes a file moved away
-// from. Anything less is what a rotation in flight looks like from the outside, so a walk below this
-// bar may add fences and observations but must never remove one (bd-main-ikh).
+// readdir and stat. It is the evidence standard both un-fencing steps run on: releasing a tracked
+// identity and retiring a locator's lineage. Anything less is what a rotation in flight looks like
+// from the outside, so a walk below this bar may add fences and observations but must never remove
+// one (bd-main-ikh).
 func (s *rootScan) corroborated() bool {
 	return s.enumerated && !s.failed && !s.vanished
 }
@@ -673,25 +673,12 @@ func (s *rootScan) locatorsOf(dev, ino uint64) []string {
 // order, and returns the locators it found occupied. Every error it returns ends the poll, because a
 // reconcile that stopped part way through leaves an account of the root that nothing may treat as
 // complete.
-func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPolicyState, forwardActivating bool, scan *rootScan, present map[identityKey]struct{}) (_ map[string]struct{}, retErr error) {
+func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPolicyState, forwardActivating bool, scan *rootScan, present map[identityKey]struct{}) (map[string]struct{}, error) {
 	// seenLocators records every locator under this root the walk found occupied. It is the evidence
 	// retireAbsentLineages needs to tell a deleted transcript (path left empty) from a replaced one
 	// (path never empty), and it is collected for refused files too: a path holding something the
 	// watcher declines to read is still an occupied path.
 	seenLocators := map[string]struct{}{}
-	// Fence relocations are staged as they are discovered and applied together here, so that moves
-	// which cross over each other all land. The deferred form is deliberate: a reconcile that ends
-	// early still has to put back the fences it took up, or a poll that failed would leave a locator
-	// unfenced.
-	//
-	// Only the HOLDS survive an errored reconcile, though. A scan that stopped part way through knows
-	// the file it staged a vacate FOR moved, but not what took the locator it left: two sealed files
-	// exchanging paths stage the first half of the exchange and then error before the second, and
-	// applying that vacate released the fence over the counterpart now sitting there (bd-main-ikh).
-	// Holding a locator only ever adds a fence, so it is safe on any evidence; releasing one is not.
-	if policy != nil {
-		defer func() { policy.applyLineageShifts(retErr == nil) }()
-	}
 	for _, f := range scan.files {
 		key := identityKey{dev: f.dev, ino: f.ino}
 		// A tracked identity that is here again after being missed by an earlier walk RESUMES from its
@@ -771,17 +758,15 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 		seenLocators[locator] = struct{}{}
 		present[key] = struct{}{}
 		if isTracked {
-			// A rename kept the identity and the cursor; only path/root/locator move - and with them
-			// the seal lineage, so the fence follows the sealed bytes to their new path. A file living
-			// at several locators at once is NOT a rename, though: it is hard-linked, the path it is
-			// being seen at second is as real as the first, and moving the fence off the first would
-			// unfence bytes that are still sitting there under the other name.
+			// A rename kept the identity and the cursor; only path/root/locator move, and the fence is
+			// COPIED to the path the sealed bytes are now at rather than moved off the one they left.
+			// Releasing a locator is retirement's job alone: vacating on the strength of one walk left
+			// the old name unfenced AND deleted the fingerprint that would have caught an edited copy
+			// put back there, so the whole edited history published from byte zero (bd-main-37y). The
+			// hold is also the right answer for a file living at several locators at once - a hard link
+			// is not a rename, and the name it is seen at second is as real as the first.
 			if policy != nil {
-				if len(scan.locatorsOf(f.dev, f.ino)) > 1 {
-					policy.holdLineage(locator, f.dev, f.ino)
-				} else {
-					policy.moveLineage(tf.locator, locator, f.dev, f.ino, scan.corroborated())
-				}
+				policy.holdLineage(locator, f.dev, f.ino)
 			}
 			tf.root = root
 			tf.path = f.path
@@ -951,22 +936,23 @@ func (w *Watcher) inheritSealLineage(ctx context.Context, policy *rootPolicyStat
 	// What that does NOT establish is that the file standing at the locator they left is new. `sed
 	// -i.bak` produces this exact picture — the untouched original moves to the .bak name and the
 	// EDITED history takes its place — and so does any rotation the watcher was not running for. So
-	// the vacated locator is resealed at its own EOF: displacement relocates a fence, it never lifts
-	// one (A1-v2, bd-main-x6u F1). A file whose own bytes demonstrably ARE the sealed prefix never
-	// reaches the question: the corroborated window inherits the floor where it is found.
+	// the locator they left is resealed at its own EOF: displacement ADDS a fence where the bytes went
+	// and lifts none from where they were (A1-v2, bd-main-x6u F1, bd-main-37y). A file whose own bytes
+	// demonstrably ARE the sealed prefix never reaches the question: the corroborated window inherits
+	// the floor where it is found.
 	//
-	// A genuinely new session at the vacated locator is captured in full a poll later, through the one
-	// step that un-fences a locator at all: retirement, once absenceEvictionPolls consecutive
-	// corroborated walks have found it empty. Deciding it here on a SINGLE empty observation was the
-	// one-walk standard retirement itself refuses, and one empty walk was all a redact-and-restore
-	// needed to have the owner's edited pre-consent history published from byte zero (bd-main-ikh).
-	// Resealing the head of a rotated-into session instead is bounded, diagnosed and backfillable.
+	// A genuinely new session at that locator is captured in full once the one step that un-fences a
+	// locator at all has run: retirement, after absenceEvictionPolls consecutive corroborated walks
+	// have found it empty. Deciding it here on a SINGLE empty observation was the one-walk standard
+	// retirement itself refuses, and one empty walk was all a redact-and-restore needed to have the
+	// owner's edited pre-consent history published from byte zero (bd-main-ikh). Resealing the head of
+	// a rotated-into session instead is bounded, diagnosed and backfillable.
 	//
 	// An identity found alive at SEVERAL locators names no single place the sealed bytes went, so it
-	// is not usable as displacement evidence at all; it takes the same reseal, without moving anything.
+	// is not usable as displacement evidence at all; it takes the same reseal, holding nothing.
 	if to, displaced, ambiguous := w.displacedLineageLocator(scan, lin, d); (displaced || ambiguous) && !corroborated {
 		if displaced {
-			policy.moveLineage(d.locator, to, lin.Device, lin.Inode, scan.corroborated())
+			policy.holdLineage(to, lin.Device, lin.Inode)
 		}
 		return w.resealReplacement(ctx, policy, d, size, sealReplacedDisplaced, rec.Floor)
 	}

@@ -637,6 +637,11 @@ func TestRotationOutOfTheRootIngestsFromZeroOnlyAfterCorroboratedEmptyWalks(t *t
 // unrelated error before reaching the second, and released the fence over the locator the counterpart
 // had just moved INTO. A vacate is only ever justified by what the rest of the walk found; a walk that
 // did not finish has not found it. Holds still land: adding a fence needs no evidence.
+//
+// bd-main-37y removed the vacate entirely - a rename copies its fence to the destination and leaves
+// the source lineage to retirement - so what this now holds is the property that made vacates
+// unstageable in the first place: an errored reconcile leaves every fence standing, and the next
+// complete walk still converges each one onto the locator its file occupies. Kept unmodified.
 func TestErroredReconcileKeepsEveryStagedVacate(t *testing.T) {
 	ctx := context.Background()
 	root, state, scratch := t.TempDir(), t.TempDir(), t.TempDir()
@@ -711,6 +716,176 @@ func TestErroredReconcileKeepsEveryStagedVacate(t *testing.T) {
 	}
 	if got := sink.messages(); len(got) != 1 || got[0] != "appended-by-the-rewrite" {
 		t.Fatalf("messages = %v, want only the record appended above a's inherited floor", got)
+	}
+}
+
+// TestRenameThenEditedCopyBackNeverPublishesTheEditedHistory is the bd-main-37y probe. Renaming a
+// sealed transcript inside the root used to VACATE the fence at the name it left after a SINGLE
+// corroborated poll - the last un-fencing that did not take retirement-grade evidence - and the
+// lineage's fingerprint was deleted with it. An owner who then wrote an edited copy of the
+// pre-consent history back at the sealed name met a locator no lineage covered, and the whole edited
+// history was published from byte zero: the one record that could have refuted it was gone. A rename
+// COPIES the fence now - the destination is fenced, the source keeps everything it had until
+// retirement clears it - so the copy-back faces the ordinary fingerprint fence and reseals.
+func TestRenameThenEditedCopyBackNeverPublishesTheEditedHistory(t *testing.T) {
+	pre := msgLine("pre-consent-secret-one") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	edited := msgLine("pre-consent-secret-one") + "\n" + msgLine("redacted-and-longer-than-the-line-it-replaced") + "\n"
+
+	// Both orders a live daemon can observe the sequence in. The one-poll vacate made the second one
+	// publish; the first was saved only by the relocation being staged until the end of the walk.
+	for _, tc := range []struct {
+		name            string
+		pollAfterRename bool
+	}{
+		{name: "copy back inside the same poll window", pollAfterRename: false},
+		{name: "copy back a poll after the rename is observed", pollAfterRename: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			root, state := t.TempDir(), t.TempDir()
+			p := filepath.Join(root, "session.jsonl")
+			// The new name sorts AFTER the sealed one, so the walk reaches the copy-back before it has
+			// seen where the sealed identity went.
+			renamed := filepath.Join(root, "zz-renamed.jsonl")
+			writeFileString(t, p, pre)
+
+			var reads [][2]int64
+			sink := &recordingSink{}
+			w := mustWatcher(t, WatchConfig{
+				RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+				StateDir:     state, Sink: sink,
+				ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+					reads = append(reads, [2]int64{off, n})
+					return readRangeAt(f, off, n)
+				},
+			})
+			if err := w.Poll(ctx); err != nil {
+				t.Fatalf("activation poll: %v", err)
+			}
+			sealedDev, sealedIno := identityOf(t, p)
+			if got := w.rootPolicies[root].control.Lineages["session.jsonl"]; got.FingerprintLen == 0 {
+				t.Fatalf("staging error: lineage %+v carries no fingerprint for the copy-back to diverge from", got)
+			}
+
+			if err := os.Rename(p, renamed); err != nil {
+				t.Fatal(err)
+			}
+			if tc.pollAfterRename {
+				if err := w.Poll(ctx); err != nil {
+					t.Fatalf("post-rename poll: %v", err)
+				}
+			}
+			writeFileString(t, p, edited)
+			if err := w.Poll(ctx); err != nil {
+				t.Fatalf("copy-back poll: %v", err)
+			}
+			if len(reads) != 0 {
+				t.Fatalf("reads = %v, want nothing read from an edited copy of the sealed history", reads)
+			}
+			if got := sink.messages(); len(got) != 0 {
+				t.Fatalf("messages = %v, want no pre-consent-derived record published from byte zero", got)
+			}
+			if got := diagnostics(sink.all()); len(got) != 1 {
+				t.Fatalf("diagnostics = %d, want exactly one ingestion-loss diagnostic for the resealed locator", len(got))
+			}
+			control := readRootControl(t, state, root)
+			if got, ok := control.Lineages["zz-renamed.jsonl"]; !ok || got.Floor != int64(len(pre)) {
+				t.Fatalf("lineage at zz-renamed.jsonl = %+v/%v, want the sealed floor %d held where the file went", got, ok, len(pre))
+			}
+			if got, ok := control.Baselines[identityString(sealedDev, sealedIno)]; !ok || got.Floor != int64(len(pre)) {
+				t.Fatalf("renamed baseline = %+v/%v, want its floor %d intact", got, ok, len(pre))
+			}
+			editedDev, editedIno := identityOf(t, p)
+			if got, ok := control.Baselines[identityString(editedDev, editedIno)]; !ok || got.Floor != int64(len(edited)) {
+				t.Fatalf("copy-back baseline = %+v/%v, want a reseal at its EOF %d", got, ok, len(edited))
+			}
+
+			// The reseal is a fence, not a stop.
+			appendString(t, p, msgLine("written-after-the-copy-back")+"\n")
+			if err := w.Poll(ctx); err != nil {
+				t.Fatalf("post-copy-back append poll: %v", err)
+			}
+			if got := sink.messages(); len(got) != 1 || got[0] != "written-after-the-copy-back" {
+				t.Fatalf("messages = %v, want only what was written after the reseal", got)
+			}
+		})
+	}
+}
+
+// TestRenamedTranscriptKeepsItsFenceAtItsNewLocator is the other half of bd-main-37y: copying the
+// fence to the destination must fence the destination as completely as a move did. The renamed file
+// delivers everything appended above its floor and nothing beneath it, an atomic rewrite at its new
+// name inherits that floor rather than republishing the sealed prefix, and the name it left keeps its
+// own lineage until the ordinary retirement streak - not the rename - clears it.
+func TestRenamedTranscriptKeepsItsFenceAtItsNewLocator(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	renamed := filepath.Join(root, "zz-renamed.jsonl")
+	pre := msgLine("pre-consent-secret-one") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	if err := os.Rename(p, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rename poll: %v", err)
+	}
+	policy := w.rootPolicies[root]
+	if got, ok := policy.control.Lineages["zz-renamed.jsonl"]; !ok || got.Floor != int64(len(pre)) {
+		t.Fatalf("lineage at zz-renamed.jsonl = %+v/%v, want the sealed floor %d held where the file went", got, ok, len(pre))
+	}
+	if _, ok := policy.control.Lineages["session.jsonl"]; !ok {
+		t.Fatalf("lineages = %+v, want the name the file left still fenced one walk into its retirement", policy.control.Lineages)
+	}
+	if got := policy.absentLineagePolls["session.jsonl"]; got != 1 {
+		t.Fatalf("empty-walk streak = %d for the vacated name, want the rename to leave it to ordinary retirement", got)
+	}
+
+	post := msgLine("appended-after-the-rename") + "\n"
+	appendString(t, renamed, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-rename append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes appended above the renamed file's floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "appended-after-the-rename" {
+		t.Fatalf("messages = %v, want the renamed file's sealed prefix still fenced", got)
+	}
+	if _, ok := policy.control.Lineages["session.jsonl"]; ok {
+		t.Fatalf("lineages = %+v, want the name the file left retired once two corroborated walks agree", policy.control.Lineages)
+	}
+
+	// The fence at the new name is real: an atomic rewrite there inherits the floor.
+	rewritten := pre + msgLine("appended-by-the-rewrite") + "\n"
+	replaceViaRename(t, renamed, rewritten)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rewrite poll: %v", err)
+	}
+	if len(reads) != 2 || reads[1] != [2]int64{int64(len(pre)), int64(len(rewritten) - len(pre))} {
+		t.Fatalf("reads = %v, want the rewrite read only above the inherited floor", reads)
+	}
+	if got := sink.messages(); len(got) != 2 || got[1] != "appended-by-the-rewrite" {
+		t.Fatalf("messages = %v, want only the record the rewrite appended above the inherited floor", got)
+	}
+	for _, r := range reads {
+		if r[0] < int64(len(pre)) {
+			t.Fatalf("reads = %v, want no read to start below the floor %d", reads, len(pre))
+		}
 	}
 }
 

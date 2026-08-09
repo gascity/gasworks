@@ -120,17 +120,6 @@ type rootPolicyState struct {
 	// this process gathered, and a restart re-gathers it rather than retiring a fence on a
 	// predecessor's word.
 	absentLineagePolls map[string]int
-	// pendingShifts holds the fence relocations one walk discovered, applied together once the whole
-	// walk has been reconciled. See applyLineageShifts.
-	pendingShifts []lineageShift
-}
-
-// lineageShift is one staged fence relocation: release the locator a sealed identity left (vacate,
-// empty when it left nothing) and fence the locator it now holds (hold).
-type lineageShift struct {
-	vacate string
-	hold   string
-	lin    sealLineage
 }
 
 func rootPolicyID(root string) string {
@@ -249,53 +238,27 @@ func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baseline
 // dropBaseline releases one identity's floor while deliberately LEAVING the locator's lineage in
 // place. An identity that leaves a path something else already occupies has been REPLACED, and the
 // replacement inherits through exactly that lineage; a lineage whose locator is genuinely empty is
-// dropped by forgetAbsentLineages instead, on the evidence of a complete walk.
+// dropped by retireAbsentLineages instead, on the evidence of consecutive complete walks.
 func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
 	delete(s.control.Baselines, identityString(dev, ino))
 	s.dirty = true
 }
 
-// moveLineage follows a renamed transcript. The sealed content the lineage describes moved with the
-// file, so afterwards a new inode at the OLD path is a rewrite candidate no longer, while one at the
-// new path is.
+// holdLineage fences the locator a sealed identity occupies, and is the only way a locator's fence is
+// established outside the seal walk itself. Nothing is released in exchange, which is what makes it
+// safe to apply the moment it is discovered:
 //
-// The move is STAGED rather than applied, because one walk can report several moves whose sources and
-// destinations are each other's: two files that exchange names produce exactly that, and applying each
-// move as it is discovered let the second overwrite the destination the first had just written, whose
-// identity guard then rejected it and dropped a fence on the floor (bd-main-x6u F2). Staging also lets
-// a locator that a reseal has since taken over keep its new fence: applyLineageShifts releases a
-// vacated locator only if it still carries the very lineage that left it.
+//   - A hard link gives ONE identity two live locators at once, and treating the second as a rename of
+//     the first retired the fence at a path that still holds the sealed bytes (bd-main-x6u F2).
+//   - A rename is a COPY of the fence, not a move (bd-main-37y). The name a sealed file leaves keeps
+//     its own lineage, fingerprint and all, and clears through ordinary retirement once corroborated
+//     walks find it empty — so a file put back at that name inside the window still answers to the
+//     fingerprint fence instead of being published from byte zero.
 //
-// corroborated is the walk's own standard (rootScan.corroborated). Releasing the old locator is an
-// un-fencing, so it takes the same evidence retirement and cursor-state GC take; a walk that lost an
-// entry mid-flight saw an identity at one of its names and simply missed the others, which is exactly
-// how a hard link's second fence used to be vacated while it still held the sealed bytes
-// (bd-main-ikh). Below the bar the move degrades to a hold: the new locator is fenced, the old one
-// keeps what it has, and the next corroborated walk relocates it properly.
-func (s *rootPolicyState) moveLineage(oldLocator, newLocator string, dev, ino uint64, corroborated bool) {
-	if oldLocator == "" || oldLocator == newLocator {
-		return
-	}
-	if !corroborated {
-		s.holdLineage(newLocator, dev, ino)
-		return
-	}
-	lin, ok := s.control.Lineages[oldLocator]
-	if !ok || lin.Device != dev || lin.Inode != ino {
-		// The old locator no longer carries this identity's fence — a file left in its place has
-		// already resealed onto it this poll. The identity is still sealed, so the floor it carries
-		// still has to fence wherever it has gone; there is simply nothing to release behind it.
-		s.holdLineage(newLocator, dev, ino)
-		return
-	}
-	s.pendingShifts = append(s.pendingShifts, lineageShift{vacate: oldLocator, hold: newLocator, lin: lin})
-	s.dirty = true
-}
-
-// holdLineage fences a locator a sealed identity occupies without releasing anything, for the case
-// where the identity did not move away from anywhere: a second hard link to a sealed file gives one
-// identity two live locators at once, and treating the second as a rename of the first retired the
-// fence at a path that still holds the sealed bytes.
+// Holding only ever ADDS a fence, so it needs no evidence beyond having seen the identity here, and no
+// two holds in one walk can contend: each names the locator its own file occupies. That is what the
+// deferred staging this replaced was for — with no vacates left there is nothing to order, nothing to
+// hold back from a walk that ended early, and nothing left in memory by a panic mid-walk.
 func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
 	if locator == "" {
 		return
@@ -315,45 +278,13 @@ func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
 	if cur, known := s.control.Lineages[locator]; known && cur == lin {
 		return
 	}
-	s.pendingShifts = append(s.pendingShifts, lineageShift{hold: locator, lin: lin})
+	if s.control.Lineages == nil {
+		s.control.Lineages = map[string]sealLineage{}
+	}
+	// Deliberately not subject to maxSealLineages: the cap declines to admit fences for locators
+	// nothing has fenced yet, and must never drop one that is already established.
+	s.control.Lineages[locator] = lin
 	s.dirty = true
-}
-
-// applyLineageShifts commits one walk's staged fence relocations: every vacated locator is released
-// first, then every held locator is fenced. Doing it in that order — and only after the whole walk has
-// been reconciled — is what lets fences cross over each other without either being lost. A vacated
-// locator whose lineage is no longer the one that left it has been taken over since (a replacement
-// resealed onto it), and is kept.
-//
-// reconciled says whether the walk that staged these shifts finished. A reconcile that ended early
-// staged whatever it had reached and nothing it had not, so its vacates are half an account: the file
-// whose arrival at a vacated locator would have kept that locator fenced may be the one the scan never
-// got to. The holds still apply — they only ever add a fence — and the vacates wait for a walk that
-// completes (bd-main-ikh).
-func (s *rootPolicyState) applyLineageShifts(reconciled bool) {
-	if len(s.pendingShifts) == 0 {
-		return
-	}
-	for _, sh := range s.pendingShifts {
-		if sh.vacate == "" || !reconciled {
-			continue
-		}
-		if cur, ok := s.control.Lineages[sh.vacate]; ok && cur == sh.lin {
-			delete(s.control.Lineages, sh.vacate)
-		}
-	}
-	for _, sh := range s.pendingShifts {
-		if sh.hold == "" {
-			continue
-		}
-		if s.control.Lineages == nil {
-			s.control.Lineages = map[string]sealLineage{}
-		}
-		// Deliberately not subject to maxSealLineages: the cap declines to admit fences for locators
-		// nothing has fenced yet, and must never drop one that is already established.
-		s.control.Lineages[sh.hold] = sh.lin
-	}
-	s.pendingShifts = s.pendingShifts[:0]
 }
 
 // lineage returns the sealed floor a new identity discovered at locator may inherit. Like baseline
@@ -377,7 +308,8 @@ func (s *rootPolicyState) lineage(locator string) (sealLineage, bool) {
 // replacement the walks never saw the path empty for - which is precisely what an atomic
 // temp-write+rename produces - inherits a floor.
 //
-// Retirement is the one step that un-fences a locator, so it is held to the same corroboration
+// Retirement is the ONLY step that un-fences a locator - no rename, no replacement and no walk-order
+// accident releases one (bd-main-37y) - so it is held to the same corroboration
 // standard as cursor-state GC (A1-v2): one walk finding a path empty is indistinguishable from a
 // rotation caught in flight, and retiring on that evidence would republish a sealed prefix to the
 // very next file created there. Callers must pass the locators of a walk that enumerated the whole
