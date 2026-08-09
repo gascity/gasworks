@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -65,7 +66,8 @@ func Load(path string) ([]Record, error) {
 	if err := dec.Decode(&d); err != nil {
 		return nil, fmt.Errorf("decode root policy: %w", err)
 	}
-	if dec.More() {
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		return nil, fmt.Errorf("decode root policy: trailing JSON value")
 	}
 	if d.Schema != Schema {

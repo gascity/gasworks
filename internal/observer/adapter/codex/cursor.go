@@ -62,6 +62,7 @@ const (
 // single-threaded.
 type Cursor struct {
 	statePath string // absolute path of this cursor's atomic state file
+	scope     string // empty for legacy roots; canonical-root + generation for policy roots
 
 	dev, ino uint64 // filesystem identity: authoritative for replacement/rotation
 	size     int64  // last observed size (corroborating change signal, not authoritative)
@@ -74,6 +75,7 @@ type Cursor struct {
 	anchor     []byte // in-memory: last <=anchorLen consumed bytes (nil after a resume until a commit)
 	anchorHash uint64 // FNV hash of the anchor window ending at consumed (persisted fingerprint)
 	anchorSize int    // length of the anchor window the hash covers (<= anchorLen)
+	sealed     bool   // forward-only baseline; never corroborate pre-consent bytes
 
 	maxPartialLine int
 }
@@ -92,6 +94,8 @@ type persistedCursor struct {
 	Skip       bool   `json:"skipping_partial"`
 	AnchorHash uint64 `json:"anchor_hash"` // FNV of the anchorSize bytes ending at consumed
 	AnchorSize int    `json:"anchor_size"` // length of the fingerprinted window (0 = none)
+	Scope      string `json:"scope,omitempty"`
+	Sealed     bool   `json:"sealed,omitempty"`
 }
 
 // fileIdentityOf extracts the device and inode of a stat result. ok is false only when the
@@ -124,6 +128,20 @@ func cursorStatePath(stateDir string, dev, ino uint64) string {
 // (the endpoint deduplicates), whereas resuming the wrong file would silently skip its leading
 // records. liveSize/liveModNanos come from the caller's stat of the live file.
 func LoadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, maxPartialLine int) (*Cursor, error) {
+	return loadCursor(stateDir, dev, ino, liveSize, liveModNanos, maxPartialLine, "")
+}
+
+// LoadScopedCursor is the consent-policy variant of LoadCursor. The supplied scope is a stable
+// canonical-root and generation identity, so a cursor from one consent interval can never be
+// resumed by another root or generation.
+func LoadScopedCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, maxPartialLine int, scope string) (*Cursor, error) {
+	if scope == "" {
+		return nil, fmt.Errorf("codex cursor scope is required")
+	}
+	return loadCursor(filepath.Join(stateDir, "root-cursors", scope), dev, ino, liveSize, liveModNanos, maxPartialLine, scope)
+}
+
+func loadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, maxPartialLine int, scope string) (*Cursor, error) {
 	if maxPartialLine <= 0 {
 		maxPartialLine = DefaultMaxPartialLine
 	}
@@ -134,6 +152,7 @@ func LoadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 		size:           liveSize,
 		modNanos:       liveModNanos,
 		maxPartialLine: maxPartialLine,
+		scope:          scope,
 	}
 	data, err := os.ReadFile(c.statePath)
 	if err != nil {
@@ -146,7 +165,7 @@ func LoadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("decoding codex cursor state %s: %w", c.statePath, err)
 	}
-	if p.Version != cursorStateVersion || p.Device != dev || p.Inode != ino {
+	if p.Version != cursorStateVersion || p.Device != dev || p.Inode != ino || p.Scope != scope {
 		return c, nil // stale/foreign record: start fresh rather than resume the wrong file
 	}
 	// Corroborate the persisted offset against the live file. A reused inode (or an in-place
@@ -164,6 +183,7 @@ func LoadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 	// hash against a fresh read of the file before trusting the offset.
 	c.anchorHash = p.AnchorHash
 	c.anchorSize = p.AnchorSize
+	c.sealed = p.Sealed
 	return c, nil
 }
 
@@ -245,7 +265,26 @@ func (c *Cursor) Reset() {
 	c.anchor = nil
 	c.anchorHash = 0
 	c.anchorSize = 0
+	c.sealed = false
 }
+
+// SealAt advances a forward-only baseline cursor to the raw EOF observed by stat. It deliberately
+// has no anchor: validating an anchor would read pre-consent transcript content. A later shrink or
+// rewrite is sealed again by stat rather than ever falling back to byte zero.
+func (c *Cursor) SealAt(eof int64) {
+	if eof < 0 {
+		eof = 0
+	}
+	c.consumed = eof
+	c.remainder = nil
+	c.skip = false
+	c.anchor = nil
+	c.anchorHash = 0
+	c.anchorSize = 0
+	c.sealed = true
+}
+
+func (c *Cursor) IsSealed() bool { return c.sealed }
 
 // Ingest folds newBytes (the freshly appended tail) into the cursor. It prepends the buffered
 // remainder, parses only complete newline-terminated lines via the committed Parse, and returns
@@ -337,6 +376,8 @@ func (c *Cursor) Save() error {
 		Skip:       c.skip,
 		AnchorHash: c.anchorHash,
 		AnchorSize: c.anchorSize,
+		Scope:      c.scope,
+		Sealed:     c.sealed,
 	}
 	data, err := json.Marshal(p)
 	if err != nil {

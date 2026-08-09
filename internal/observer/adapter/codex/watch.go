@@ -241,6 +241,8 @@ type trackedFile struct {
 	dev, ino        uint64
 	gcSessionID     string
 	gcMetaCheckedAt time.Time
+	policy          *rootPolicyState
+	forwardBaseline bool
 }
 
 func (tf *trackedFile) ref() TranscriptRef {
@@ -255,6 +257,7 @@ type Watcher struct {
 	maxReadChunk int64
 	tracked      map[identityKey]*trackedFile
 	refused      map[string]bool
+	rootPolicies map[string]*rootPolicyState
 }
 
 // NewWatcher validates cfg and returns a Watcher ready to Poll. It requires at least one absolute
@@ -263,14 +266,18 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 	if len(cfg.RootPolicies) > 0 && len(cfg.ApprovedRoots) > 0 {
 		return nil, errors.New("codex watcher: root policies and approved roots are mutually exclusive")
 	}
+	policyStates := map[string]*rootPolicyState{}
 	if len(cfg.RootPolicies) > 0 {
 		for _, p := range cfg.RootPolicies {
+			if !filepath.IsAbs(p.Path) || p.Generation == 0 || (p.Active && p.Mode != rootpolicy.ForwardOnly && p.Mode != rootpolicy.Backfill) || (!p.Active && p.Mode != "") {
+				return nil, fmt.Errorf("codex watcher: invalid root policy for %q", p.Path)
+			}
 			if p.Active {
 				cfg.ApprovedRoots = append(cfg.ApprovedRoots, p.Path)
 			}
 		}
 	}
-	if len(cfg.ApprovedRoots) == 0 {
+	if len(cfg.ApprovedRoots) == 0 && len(cfg.RootPolicies) == 0 {
 		return nil, errors.New("codex watcher: at least one approved root is required")
 	}
 	for _, root := range cfg.ApprovedRoots {
@@ -299,6 +306,18 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 	if cfg.Sink == nil {
 		return nil, errors.New("codex watcher: a candidate sink is required")
 	}
+	if len(cfg.RootPolicies) > 0 {
+		for _, p := range cfg.RootPolicies {
+			if _, exists := policyStates[p.Path]; exists {
+				return nil, fmt.Errorf("codex watcher: duplicate root policy %q", p.Path)
+			}
+			st, err := newRootPolicyState(cfg.StateDir, p)
+			if err != nil {
+				return nil, err
+			}
+			policyStates[p.Path] = st
+		}
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -316,6 +335,7 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 		maxReadChunk: chunk,
 		tracked:      map[identityKey]*trackedFile{},
 		refused:      map[string]bool{},
+		rootPolicies: policyStates,
 	}, nil
 }
 
@@ -367,6 +387,7 @@ func (w *Watcher) Poll(ctx context.Context) error {
 func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	present := map[identityKey]struct{}{}
 	for _, root := range w.cfg.ApprovedRoots {
+		policy := w.rootPolicies[root]
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil // skip an unreadable entry; keep walking the rest of the tree
@@ -422,15 +443,21 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				tf.locator = locator
 				return nil
 			}
-			cur, err := LoadCursor(w.cfg.StateDir, dev, ino, info.Size(), info.ModTime().UnixNano(), w.cfg.MaxPartialLine)
+			cur, forwardBaseline, err := w.cursorFor(policy, dev, ino, info.Size(), info.ModTime().UnixNano())
 			if err != nil {
 				return err
 			}
-			w.tracked[key] = &trackedFile{cursor: cur, root: root, path: path, locator: locator, dev: dev, ino: ino}
+			w.tracked[key] = &trackedFile{cursor: cur, root: root, path: path, locator: locator, dev: dev, ino: ino, policy: policy, forwardBaseline: forwardBaseline}
 			return nil
 		})
 		if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("scanning transcript root %s: %w", root, err)
+		}
+		if policy != nil && !policy.control.Committed {
+			policy.control.Committed = true
+			if err := policy.persistControl(); err != nil {
+				return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
+			}
 		}
 	}
 	for key := range w.tracked {
@@ -462,6 +489,55 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	return out, nil
 }
 
+// cursorFor returns a cursor constrained to the root's policy generation. During a forward-only
+// activation it performs only stat-derived sealing and durable writes; it never opens or reads the
+// transcript. The committed baseline map is the fail-closed recovery path when one cursor file is
+// lost after the activation marker has been written.
+func (w *Watcher) cursorFor(policy *rootPolicyState, dev, ino uint64, size, mod int64) (*Cursor, bool, error) {
+	if policy == nil {
+		cur, err := LoadCursor(w.cfg.StateDir, dev, ino, size, mod, w.cfg.MaxPartialLine)
+		return cur, false, err
+	}
+	cur, err := LoadScopedCursor(w.cfg.StateDir, dev, ino, size, mod, w.cfg.MaxPartialLine, policy.scope)
+	if err != nil {
+		return nil, false, err
+	}
+	key := identityString(dev, ino)
+	if policy.record.Mode != rootpolicy.ForwardOnly {
+		return cur, false, nil
+	}
+	if !policy.control.Committed {
+		if policy.control.Baselines == nil {
+			policy.control.Baselines = map[string]int64{}
+		}
+		policy.control.Baselines[key] = size
+		cur.SealAt(size)
+		cur.observe(size, mod)
+		if err := cur.Save(); err != nil {
+			return nil, false, err
+		}
+		return cur, true, nil
+	}
+	floor, baseline := policy.baseline(dev, ino)
+	if baseline && !cur.IsSealed() {
+		// A missing/corrupt individual cursor must not reopen a baseline at byte zero. If the
+		// file has since shrunk, sealing the current EOF still fences all unknown prior bytes.
+		if size < floor {
+			floor = size
+			policy.control.Baselines[key] = floor
+			if err := policy.persistControl(); err != nil {
+				return nil, false, err
+			}
+		}
+		cur.SealAt(floor)
+		cur.observe(size, mod)
+		if err := cur.Save(); err != nil {
+			return nil, false, err
+		}
+	}
+	return cur, baseline, nil
+}
+
 // drain reads and parses the bytes appended to one tracked file since its cursor offset and
 // delivers the candidates. It opens the file ONCE relative to a fd on the trusted approved root,
 // refusing any symlink within the subtree (openat2 RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH), and
@@ -490,7 +566,14 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 	// the read watermark is an obvious truncation; a same-or-larger size whose byte before the
 	// consumed offset is not a newline is an in-place rewrite (e.g. compaction/clear that grew past
 	// the old offset) or a wrong file at a reused inode. Either way, reset to 0 and re-read.
-	rewrite, err := w.offsetInvalidated(f, tf.cursor, size)
+	var rewrite bool
+	if tf.forwardBaseline {
+		// Forward-only cursors deliberately carry no anchor: reading one would inspect bytes that
+		// existed before consent. A shrink/rewrite is therefore re-sealed from current stat EOF.
+		rewrite = size < tf.cursor.ReadOffset()
+	} else {
+		rewrite, err = w.offsetInvalidated(f, tf.cursor, size)
+	}
 	if err != nil {
 		return fmt.Errorf("corroborating transcript offset %s: %w", tf.locator, err)
 	}
@@ -499,7 +582,17 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		if derr := w.cfg.Sink.DeliverCandidates(ctx, tf.ref(), []*Candidate{diag}); derr != nil {
 			return derr
 		}
-		tf.cursor.Reset()
+		if tf.forwardBaseline {
+			tf.cursor.SealAt(size)
+			if tf.policy != nil {
+				tf.policy.control.Baselines[identityString(tf.dev, tf.ino)] = size
+				if err := tf.policy.persistControl(); err != nil {
+					return err
+				}
+			}
+		} else {
+			tf.cursor.Reset()
+		}
 		if serr := tf.cursor.Save(); serr != nil {
 			return serr
 		}
@@ -564,7 +657,7 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 // stat. It is a no-op when no observer is configured, and the observer's contract forbids blocking,
 // so this never delays the poll.
 func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, modNanos int64) {
-	if w.cfg.ContentObserver == nil {
+	if w.cfg.ContentObserver == nil || tf.forwardBaseline {
 		return
 	}
 	// The sidecar uses the same anchored, no-symlink open discipline as transcript reads. Cache
