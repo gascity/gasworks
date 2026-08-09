@@ -500,8 +500,16 @@ func TestWatcherStateFileGCdOnDeparture(t *testing.T) {
 	if err := os.Remove(p); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
+	// The first absent poll only records the absence: an unreadable directory looks identical to a
+	// deletion, so the state file survives until a second clean walk corroborates the departure.
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("poll 2: %v", err)
+	}
+	if _, err := os.Stat(sp); err != nil {
+		t.Fatalf("state file must survive a single uncorroborated absence: %v", err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll 3: %v", err)
 	}
 	if _, err := os.Stat(sp); !os.IsNotExist(err) {
 		t.Fatalf("departed identity's state file must be GC'd; stat err=%v", err)

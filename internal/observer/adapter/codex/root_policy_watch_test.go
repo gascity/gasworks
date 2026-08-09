@@ -183,6 +183,76 @@ func TestForwardOnlyDeletedBaselineDoesNotFenceLaterNewIdentity(t *testing.T) {
 	}
 }
 
+// TestForwardOnlyTransientUnreadableDirKeepsSealedPrefixFenced proves a store subdirectory that
+// cannot be read for one poll does not release the generation-local floors of the transcripts under
+// it. A failed readdir looks exactly like a deletion from the walk's point of view, and releasing
+// the floor there would republish the whole pre-consent prefix — on the metadata channel and, once
+// the identity stopped being a baseline, on the content channel too — as soon as the directory came
+// back.
+func TestForwardOnlyTransientUnreadableDirKeepsSealedPrefixFenced(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits, so the unreadable poll cannot be staged")
+	}
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	store := filepath.Join(root, "projects")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(store, "session.jsonl")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink, ContentObserver: obs,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	if err := os.Chmod(store, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("unreadable poll: %v", err)
+	}
+	if err := os.Chmod(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("restored poll: %v", err)
+	}
+	if got := len(w.rootPolicies[root].control.Baselines); got != 1 {
+		t.Fatalf("baseline floors after a transient walk error = %d, want the sealed floor retained", got)
+	}
+	if got := obs.forgotten(); len(got) != 0 {
+		t.Fatalf("forgot %v, want no identity released on an uncorroborated absence", got)
+	}
+
+	post := msgLine("post-consent") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes appended above the floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "post-consent" {
+		t.Fatalf("messages = %v, want the sealed prefix to stay fenced", got)
+	}
+	if o, ok := obs.last(); ok {
+		t.Fatalf("baseline-origin transcript reached the content channel: %+v", o)
+	}
+}
+
 func TestRootPolicyRejectsStaleGenerationAndBackfillIsPerRoot(t *testing.T) {
 	ctx := context.Background()
 	rootA, rootB, state := t.TempDir(), t.TempDir(), t.TempDir()

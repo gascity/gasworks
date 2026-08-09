@@ -184,6 +184,12 @@ const (
 	maxGCSessionIDBytes = 256
 	// Gas City's transcriptmeta writer stores the opaque id followed by one LF record delimiter.
 	maxGCSessionMetaBytes = maxGCSessionIDBytes + 1
+	// absenceEvictionPolls is how many consecutive CORROBORATED absent polls an identity must
+	// accumulate before its durable state is released. One empty walk is not evidence a transcript is
+	// gone: a store subdirectory that momentarily cannot be read (a chmod, an NFS blip) produces
+	// exactly the same absence as a deletion, and releasing a forward-only floor there would
+	// republish the whole pre-consent prefix the moment the directory came back.
+	absenceEvictionPolls = 2
 )
 
 // WatchConfig is the endpoint-owned configuration a Watcher runs under. Everything the watcher
@@ -243,6 +249,10 @@ type trackedFile struct {
 	gcMetaCheckedAt time.Time
 	policy          *rootPolicyState
 	forwardBaseline bool
+	// absentPolls counts consecutive polls whose walk positively established that this identity is
+	// no longer under its root (a clean walk plus a readable parent directory). Walk errors leave it
+	// untouched, so an unreadable directory never counts as evidence of absence.
+	absentPolls int
 }
 
 func (tf *trackedFile) ref() TranscriptRef {
@@ -386,18 +396,38 @@ func (w *Watcher) Poll(ctx context.Context) error {
 // order.
 func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	present := map[identityKey]struct{}{}
+	// dirsRead holds every directory this poll actually enumerated, and rootWalkFailed marks a root
+	// whose walk hit any error. Together they are what turns "missing from the walk" into positive
+	// evidence of absence rather than an unreadable-directory artifact.
+	dirsRead := map[string]struct{}{}
+	rootWalkFailed := map[string]bool{}
 	for _, root := range w.cfg.ApprovedRoots {
 		policy := w.rootPolicies[root]
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				// Skip the unreadable entry and keep walking the rest of the tree, but remember that
+				// this walk saw less than the whole root. WalkDir reports a failed readdir as a second
+				// callback for the directory itself, so this is also where a directory loses the
+				// enumerated mark it was given below.
+				rootWalkFailed[root] = true
+				if d != nil && d.IsDir() {
+					delete(dirsRead, filepath.Clean(path))
+				}
 				return nil // skip an unreadable entry; keep walking the rest of the tree
 			}
 			if d.IsDir() {
+				// Provisional: a readdir failure on this directory arrives as a second callback and
+				// takes the entry back out above.
+				dirsRead[filepath.Clean(path)] = struct{}{}
 				return nil
 			}
 			name := d.Name()
 			info, err := os.Stat(path)
 			if err != nil {
+				if !os.IsNotExist(err) {
+					// An entry that cannot be statted is not an entry that is gone.
+					rootWalkFailed[root] = true
+				}
 				return nil // vanished mid-walk; a later poll re-discovers it
 			}
 			dev, ino, ok := fileIdentityOf(info)
@@ -406,6 +436,13 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			}
 			key := identityKey{dev: dev, ino: ino}
 			tf, isTracked := w.tracked[key]
+			if isTracked && tf.absentPolls > 0 {
+				// An earlier clean walk established that this identity had left the root, so a file
+				// carrying it now is a reused inode, not the transcript the cursor and floor belong to.
+				// Release the stale state and re-track it from byte zero.
+				w.releaseTracked(key, tf)
+				tf, isTracked = nil, false
+			}
 			// Match gates DISCOVERY only. An already-tracked file whose name stops matching after a
 			// rename must stay tracked so its unread tail is still drained — dropping it by name
 			// would silently lose that tail. New (untracked) non-matching files are skipped.
@@ -460,28 +497,35 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			}
 		}
 	}
-	for key := range w.tracked {
-		if _, ok := present[key]; !ok {
-			tf := w.tracked[key]
-			// Fully rotated away / deleted. GC the durable state file so a later file that reuses
-			// this (device,inode) cannot resurrect a stale cursor and skip its own leading bytes.
-			_ = os.Remove(tf.cursor.StatePath())
-			if tf.policy != nil && tf.forwardBaseline {
-				// Once this identity is gone, its generation-local floor must disappear with the
-				// cursor. Otherwise a future post-consent file that reuses the inode would be
-				// falsely classified as a pre-consent baseline and silently skipped.
-				delete(tf.policy.control.Baselines, identityString(key.dev, key.ino))
-				if err := tf.policy.persistControl(); err != nil {
-					return nil, fmt.Errorf("forget root-policy baseline %q: %w", tf.root, err)
-				}
-			}
-			delete(w.tracked, key)
-			// Release the content side channel's per-identity state + durable marker at the same
-			// point, so a reused identity starts fresh and idle state does not accumulate.
-			if w.cfg.ContentObserver != nil {
-				w.cfg.ContentObserver.ForgetContent(key.dev, key.ino)
-			}
+	for key := range present {
+		if tf := w.tracked[key]; tf != nil {
+			tf.absentPolls = 0
 		}
+	}
+	for key, tf := range w.tracked {
+		if _, ok := present[key]; ok {
+			continue
+		}
+		// Absence alone is not a departure. A root whose walk hit any error proves nothing about what
+		// lives under it, and neither does a parent directory this poll could not enumerate — both
+		// produce the same empty result as a deletion. Releasing the durable state on that evidence
+		// destroys the generation-local floor, and the committed root then treats the reappearing
+		// file as brand new.
+		if rootWalkFailed[tf.root] {
+			continue
+		}
+		if _, ok := dirsRead[filepath.Clean(filepath.Dir(tf.path))]; !ok {
+			continue
+		}
+		tf.absentPolls++
+		if tf.absentPolls < absenceEvictionPolls {
+			continue
+		}
+		// Corroborated: fully rotated away / deleted.
+		w.releaseTracked(key, tf)
+	}
+	if err := w.flushPolicyControls(); err != nil {
+		return nil, err
 	}
 	out := make([]*trackedFile, 0, len(w.tracked))
 	for _, tf := range w.tracked {
@@ -497,6 +541,39 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		return out[i].ino < out[j].ino
 	})
 	return out, nil
+}
+
+// releaseTracked drops every trace of one tracked identity: its durable cursor file, its
+// generation-local floor, and the content side channel's per-identity state. It is the single point
+// both the corroborated-absence GC and the reused-inode path go through, so a later file that lands
+// on this (device,inode) can neither resurrect a stale cursor nor be mistaken for a pre-consent
+// baseline. The floor removal is only marked dirty here; flushPolicyControls persists it once per
+// root per poll instead of once per identity.
+func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
+	_ = os.Remove(tf.cursor.StatePath())
+	if tf.policy != nil && tf.forwardBaseline {
+		delete(tf.policy.control.Baselines, identityString(key.dev, key.ino))
+		tf.policy.dirty = true
+	}
+	delete(w.tracked, key)
+	if w.cfg.ContentObserver != nil {
+		w.cfg.ContentObserver.ForgetContent(key.dev, key.ino)
+	}
+}
+
+// flushPolicyControls writes every root-policy control record a poll changed, at most once per root.
+// Batching matters at store scale: a rotation sweep that retires hundreds of identities would
+// otherwise rewrite (and fsync) the same control file once per identity.
+func (w *Watcher) flushPolicyControls() error {
+	for root, policy := range w.rootPolicies {
+		if !policy.dirty {
+			continue
+		}
+		if err := policy.persistControl(); err != nil {
+			return fmt.Errorf("persist root-policy control %q: %w", root, err)
+		}
+	}
+	return nil
 }
 
 // cursorFor returns a cursor constrained to the root's policy generation. During a forward-only
@@ -533,11 +610,11 @@ func (w *Watcher) cursorFor(policy *rootPolicyState, dev, ino uint64, size, mod 
 		// A missing/corrupt individual cursor must not reopen a baseline at byte zero. If the
 		// file has since shrunk, sealing the current EOF still fences all unknown prior bytes.
 		if size < floor {
+			// The lowered floor is flushed with the rest of this poll's control changes; the cursor
+			// saved just below already fences the same bytes, so a crash in between reseals no lower.
 			floor = size
 			policy.control.Baselines[key] = floor
-			if err := policy.persistControl(); err != nil {
-				return nil, false, err
-			}
+			policy.dirty = true
 		}
 		cur.SealAt(floor)
 		cur.observe(size, mod)

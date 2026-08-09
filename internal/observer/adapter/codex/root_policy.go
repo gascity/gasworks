@@ -34,6 +34,9 @@ type rootPolicyState struct {
 	scope   string
 	control rootPolicyControl
 	path    string
+	// dirty marks in-memory control changes a poll has made but not yet written. The watcher flushes
+	// them once per root per poll rather than once per changed identity.
+	dirty bool
 }
 
 func rootPolicyID(root string) string {
@@ -87,7 +90,11 @@ func (s *rootPolicyState) persistControl() error {
 	if err != nil {
 		return fmt.Errorf("encode root-policy control: %w", err)
 	}
-	return atomicWriteCursorFile(s.path, b)
+	if err := atomicWriteCursorFile(s.path, b); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
 }
 
 func (s *rootPolicyState) baseline(dev, ino uint64) (int64, bool) {
