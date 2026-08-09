@@ -309,3 +309,111 @@ func TestSinkFailureDuringSealReplacementLeavesAbsenceEvidenceUntouched(t *testi
 		t.Fatalf("diagnostics = %d, want the replacement reported exactly once after recovery", len(got))
 	}
 }
+
+// TestRotationWhileTheDaemonIsDownCapturesTheNewSession is the bd-main-i4i proof, in the shape it was
+// reproduced: seal a session, stop the daemon, rotate the sealed file out of the way by renaming it,
+// let a NEW session be created at the path it left, and start the daemon again. The new file lands on
+// the old locator's lineage, which is checked for generation and floor but not for whether the
+// identity it names is still alive somewhere under the root - so a genuinely new, wholly post-consent
+// session is resealed at its own EOF and its head is never ingested. The sealed bytes did not stay at
+// that path; they moved, and the fence belongs where they went.
+func TestRotationWhileTheDaemonIsDownCapturesTheNewSession(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	rotated := filepath.Join(root, "session.jsonl.rotated")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+	policy := []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}}
+
+	if err := mustWatcher(t, WatchConfig{RootPolicies: policy, StateDir: state, Sink: &recordingSink{}}).Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	sealedDev, sealedIno := identityOf(t, p)
+
+	if err := os.Rename(p, rotated); err != nil {
+		t.Fatal(err)
+	}
+	fresh := msgLine("a-new-post-consent-session-started-after-the-rotation") + "\n"
+	writeFileString(t, p, fresh)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{RootPolicies: policy, StateDir: state, Sink: sink, ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+		reads = append(reads, [2]int64{off, n})
+		return readRangeAt(f, off, n)
+	}})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("restart poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{0, int64(len(fresh))} {
+		t.Fatalf("reads = %v, want the new session read from byte zero and nothing from the rotated file", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "a-new-post-consent-session-started-after-the-rotation" {
+		t.Fatalf("messages = %v, want the new post-consent session captured in full", got)
+	}
+	control := readRootControl(t, state, root)
+	if _, ok := control.Lineages["session.jsonl.rotated"]; !ok {
+		t.Fatalf("lineages = %+v, want the fence to have followed the sealed bytes to their new locator", control.Lineages)
+	}
+	if got, ok := control.Baselines[identityString(sealedDev, sealedIno)]; !ok || got.Floor != int64(len(pre)) {
+		t.Fatalf("rotated file baseline = %+v/%v, want its floor %d intact", got, ok, len(pre))
+	}
+}
+
+// TestLiveRotationCapturesTheNewSessionWhateverTheWalkOrder is the same rotation with the daemon
+// running, which is where the walk order used to decide the outcome: "session.jsonl" sorts before
+// "session.jsonl.rotated", so the new file was reconciled against a lineage the rename had not yet
+// moved, and resealing it re-pointed that lineage at the new inode - which then made the rename's own
+// moveLineage a no-op. Enumerating the whole root before reconciling any of it takes the ordering out
+// of the answer.
+func TestLiveRotationCapturesTheNewSessionWhateverTheWalkOrder(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	rotated := filepath.Join(root, "session.jsonl.rotated")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	if err := os.Rename(p, rotated); err != nil {
+		t.Fatal(err)
+	}
+	fresh := msgLine("a-new-post-consent-session-started-after-the-rotation") + "\n"
+	writeFileString(t, p, fresh)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rotation poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{0, int64(len(fresh))} {
+		t.Fatalf("reads = %v, want the new session read from byte zero and nothing below the rotated file's floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "a-new-post-consent-session-started-after-the-rotation" {
+		t.Fatalf("messages = %v, want the new post-consent session captured in full", got)
+	}
+
+	// The rotated file keeps its floor at its new path: its own appends are captured, its sealed
+	// prefix is not.
+	post := msgLine("appended-to-the-rotated-file") + "\n"
+	appendString(t, rotated, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rotated-file append poll: %v", err)
+	}
+	if len(reads) != 2 || reads[1] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes appended above the rotated file's floor", reads)
+	}
+	if got := sink.messages(); len(got) != 2 || got[1] != "appended-to-the-rotated-file" {
+		t.Fatalf("messages = %v, want the rotated file's sealed prefix still fenced", got)
+	}
+}
