@@ -29,6 +29,20 @@ func TestLoadStrictCanonicalizesAndAcceptsActiveAndTombstoneRecords(t *testing.T
 
 func TestLoadRejectsAmbiguousOrUnsafePolicy(t *testing.T) {
 	root := t.TempDir()
+	symlinkRoot := filepath.Join(t.TempDir(), "linked-root")
+	if err := os.Symlink(root, symlinkRoot); err != nil {
+		t.Fatal(err)
+	}
+	symlinkParentTarget := t.TempDir()
+	symlinkParentChild := filepath.Join(symlinkParentTarget, "child")
+	if err := os.Mkdir(symlinkParentChild, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symlinkParent := filepath.Join(t.TempDir(), "linked-parent")
+	if err := os.Symlink(symlinkParentTarget, symlinkParent); err != nil {
+		t.Fatal(err)
+	}
+	symlinkParentRoot := filepath.Join(symlinkParent, "child")
 	for name, body := range map[string]string{
 		"legacy schema field":      `{"schema":"gasworks.companion.root-policy/v1","roots":[]}`,
 		"unknown field":            `{"schema_version":"gasworks.companion.root-policy/v1","roots":[],"extra":true}`,
@@ -36,6 +50,8 @@ func TestLoadRejectsAmbiguousOrUnsafePolicy(t *testing.T) {
 		"zero generation":          `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + root + `","generation":0,"active":true,"mode":"backfill"}]}`,
 		"bad mode":                 `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + root + `","generation":1,"active":true,"mode":"capture-existing"}]}`,
 		"tombstone mode":           `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + root + `","generation":1,"active":false,"mode":"backfill"}]}`,
+		"symlinked active root":    `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + symlinkRoot + `","generation":1,"active":true,"mode":"forward-only"}]}`,
+		"symlinked active parent":  `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + symlinkParentRoot + `","generation":1,"active":true,"mode":"forward-only"}]}`,
 		"duplicate canonical root": `{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + root + `","generation":1,"active":true,"mode":"backfill"},{"path":"` + root + `/.","generation":2,"active":true,"mode":"backfill"}]}`,
 	} {
 		t.Run(name, func(t *testing.T) {

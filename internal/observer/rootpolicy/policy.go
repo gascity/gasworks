@@ -84,6 +84,24 @@ func Load(path string) ([]Record, error) {
 		}
 		canonical := filepath.Clean(r.Path)
 		resolved, err := filepath.EvalSymlinks(canonical)
+		if r.Active {
+			if canonical != r.Path {
+				return nil, fmt.Errorf("root policy record %d active path must be canonical", i)
+			}
+			info, err := os.Lstat(canonical)
+			if err != nil {
+				return nil, fmt.Errorf("stat root policy record %d path: %w", i, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return nil, fmt.Errorf("root policy record %d active path must name a canonical directory", i)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("resolve root policy record %d path: %w", i, err)
+			}
+			if resolved != canonical {
+				return nil, fmt.Errorf("root policy record %d active path must not cross a symlink", i)
+			}
+		}
 		if err == nil {
 			canonical = resolved
 			info, statErr := os.Stat(canonical)
