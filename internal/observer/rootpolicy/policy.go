@@ -53,7 +53,7 @@ func Load(path string) ([]Record, error) {
 	if err != nil {
 		return nil, fmt.Errorf("stat root policy: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownerSupplied(info) {
 		return nil, fmt.Errorf("root policy must be an owner-only regular file")
 	}
 	data, err := os.ReadFile(path)

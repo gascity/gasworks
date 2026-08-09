@@ -117,6 +117,47 @@ func TestForwardOnlyUncommittedActivationMarkerRestartsStatOnly(t *testing.T) {
 	}
 }
 
+func TestForwardBaselineTruncateResealsAtEOFWithoutReadingPrefix(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("long-pre-consent-record") + "\n"
+	writeFileString(t, p, pre)
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}}, StateDir: state, Sink: sink, ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+		reads = append(reads, [2]int64{off, n})
+		return readRangeAt(f, off, n)
+	}})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A short rewrite triggers the forward-baseline recovery path. It must seal at the new raw
+	// EOF; it must neither use the legacy anchor reader nor restart at byte zero.
+	rewritten := msgLine("rewritten") + "\n"
+	writeFileString(t, p, rewritten)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("truncate/rewrite read %v, want no pre-consent range reads", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("truncate/rewrite captured %v, want no byte-zero fallback", got)
+	}
+	post := msgLine("after-reseal") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(reads) != 1 || reads[0][0] != int64(len(rewritten)) {
+		t.Fatalf("post-reseal reads = %v, want appended bytes from EOF %d", reads, len(rewritten))
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-reseal" {
+		t.Fatalf("post-reseal messages = %v", got)
+	}
+}
+
 func TestRootPolicyRejectsStaleGenerationAndBackfillIsPerRoot(t *testing.T) {
 	ctx := context.Background()
 	rootA, rootB, state := t.TempDir(), t.TempDir(), t.TempDir()
