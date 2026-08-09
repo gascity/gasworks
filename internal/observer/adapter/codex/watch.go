@@ -797,6 +797,13 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
 	_ = os.Remove(tf.cursor.StatePath())
 	if tf.policy != nil && tf.forwardBaseline {
+		// Orphan any live fence still NAMING this identity before its floor is dropped. Releasing the
+		// identity frees its inode number, and a fence that kept naming that number would grant a later,
+		// unrelated file that reuses it reconcileLineage's incumbent exemption to lower or clear the
+		// fence (bd-main-fpj). Orphaning only forces the foreign branch for every later writer - it
+		// never lowers or deletes - so the reused number can at most ratchet the floor up or hold it;
+		// retirement stays the sole un-fencing path.
+		tf.policy.orphanLineagesNaming(key.dev, key.ino)
 		tf.policy.dropBaseline(key.dev, key.ino)
 	}
 	delete(w.tracked, key)

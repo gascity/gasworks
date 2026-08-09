@@ -83,6 +83,15 @@ type sealLineage struct {
 	// that identity actually owns.
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`
+	// Orphaned marks a fence whose named identity was RELEASED while the fence still stood, which frees
+	// that identity's inode NUMBER for the allocator to hand to an unrelated file. The incumbent
+	// exemption is a pure (Device,Inode) comparison, so a file that reuses the freed number would
+	// otherwise meet it and be allowed to lower or clear a fence it is not the sealed transcript of
+	// (bd-main-fpj). An orphaned fence is foreign to EVERY writer, including that reused number:
+	// reconcileLineage may only ratchet its floor up or hold it, never lower, rebind or delete it, and
+	// retirement stays the sole un-fencing path. omitempty keeps an ordinary fence byte-identical on
+	// disk, so an older build still reads the record unchanged.
+	Orphaned bool `json:"orphaned,omitempty"`
 }
 
 func (l sealLineage) baseline() baselineRecord {
@@ -270,19 +279,28 @@ func (s *rootPolicyState) liveFence(locator string) (sealLineage, bool) {
 // It must never be re-derived from s.control.Baselines: setBaseline writes the baseline BEFORE calling
 // setLineage, so a baseline-keyed test would see the just-written foreign entry and be defeated.
 // Absence still un-fences a locator through retireAbsentLineages alone.
+//
+// One case has no incumbent at all: an ORPHANED fence, whose named identity was released while the
+// fence stood (orphanLineagesNaming, from releaseTracked). Releasing an identity frees its inode
+// NUMBER, so the number the fence names can be reused by an unrelated file; the pure (dev,ino) test
+// would then hand that reused number the incumbent's own exemption to lower the floor to zero and
+// delete the fence (bd-main-fpj). An orphaned fence is therefore treated as foreign to EVERY writer -
+// it may only ratchet up or hold, never lower, rebind or delete - and the orphaned marker rides
+// through a ratchet so a reused number cannot launder it off by first raising the floor.
 func (s *rootPolicyState) reconcileLineage(locator string, dev, ino uint64, b baselineRecord) (sealLineage, bool) {
 	cur, fenced := s.liveFence(locator)
-	if fenced && (cur.Device != dev || cur.Inode != ino) {
+	if fenced && (cur.Orphaned || cur.Device != dev || cur.Inode != ino) {
 		if b.Floor <= cur.Floor {
 			return cur, true // hold: a foreign writer never lowers and never rebinds
 		}
-		return sealLineage{ // ratchet up, keeping the incumbent identity
+		return sealLineage{ // ratchet up, keeping the incumbent identity (and its orphaned marker)
 			Floor:           b.Floor,
 			FingerprintHash: b.FingerprintHash,
 			FingerprintLen:  b.FingerprintLen,
 			Generation:      s.control.Generation,
 			Device:          cur.Device,
 			Inode:           cur.Inode,
+			Orphaned:        cur.Orphaned,
 		}, true
 	}
 	if b.Floor <= 0 { // incumbent, or no live fence: an honest write; a floor at zero clears the entry
@@ -305,6 +323,37 @@ func (s *rootPolicyState) reconcileLineage(locator string, dev, ino uint64, b ba
 func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
 	delete(s.control.Baselines, identityString(dev, ino))
 	s.dirty = true
+}
+
+// orphanLineagesNaming marks every LIVE fence whose named identity is (dev,ino) as orphaned, and is
+// called from releaseTracked at the moment that identity's durable floor is dropped. Releasing an
+// identity frees its inode NUMBER for the allocator to hand to an unrelated file; a fence still naming
+// that number would otherwise grant the reused number reconcileLineage's incumbent exemption and let
+// it lower or clear a fence it is not the sealed transcript of (bd-main-fpj). Orphaning forces the
+// foreign branch for every later writer instead.
+//
+// This mutates the fence map directly, on the same footing as retirement, because it only ever RAISES
+// protection: it never lowers a floor, never rebinds an identity and never deletes an entry - it flips
+// one marker that can only make reconcileLineage stricter. It touches only a live fence (current
+// generation, floor above zero) that names the departing identity; a fence at another identity, an
+// already-orphaned one, or a cleared entry is left exactly as it stands.
+//
+// An identity renamed to another path UNDER THE ROOT is found alive by the walk and so is never
+// released, so a genuine rename-back within the root is still correctly the incumbent. An identity
+// that leaves the root - unlinked, or moved outside it - is released once corroborated absent, and its
+// fence is orphaned; that is the conservative direction whether or not the inode itself was freed,
+// since a reused number is a different file and a true return re-inherits its own floor by fingerprint
+// through inheritSealLineage without ever publishing below it.
+func (s *rootPolicyState) orphanLineagesNaming(dev, ino uint64) {
+	for locator := range s.control.Lineages {
+		lin, live := s.liveFence(locator)
+		if !live || lin.Orphaned || lin.Device != dev || lin.Inode != ino {
+			continue
+		}
+		lin.Orphaned = true
+		s.control.Lineages[locator] = lin
+		s.dirty = true
+	}
 }
 
 // holdLineage fences the locator a sealed identity occupies, and is the only way a locator's fence is

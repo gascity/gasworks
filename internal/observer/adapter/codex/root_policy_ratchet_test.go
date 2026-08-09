@@ -96,13 +96,22 @@ func runInterposedFenceProbe(t *testing.T, interposed string) {
 			if err := w.Poll(ctx); err != nil {
 				t.Fatalf("interposition poll: %v", err)
 			}
-			// Reported rather than fatal, so a build that cuts the fence here goes on to show what
-			// that costs: the copy-back below is the step that reaches the owner's own history.
-			if got, ok := w.rootPolicies[root].control.Lineages["session.jsonl"]; !ok || got != fence {
-				t.Errorf("fence after a %d-byte interposition = %+v/%v, want the sealed %+v held", len(interposed), got, ok, fence)
+			// The fence stands exactly as sealed, save for one marker: when a corroborated empty walk
+			// preceded the interposition, I0 reaches absenceEvictionPolls at THIS poll and is released
+			// while the interposed occupant holds the name - the bd-main-fpj trigger - so the fence is
+			// legitimately orphaned (its floor, identity and fingerprint all held; only the reused-inode
+			// exemption is withdrawn). With no such preceding poll I0 is not released yet and the fence
+			// is untouched. Reported rather than fatal, so a build that cut the fence here would go on to
+			// show what that costs at the copy-back below.
+			wantFence := fence
+			if tc.pollAfterRotation {
+				wantFence.Orphaned = true
 			}
-			if got := readRootControl(t, state, root).Lineages["session.jsonl"]; got != fence {
-				t.Errorf("persisted fence = %+v, want the sealed %+v held on disk as well as in memory", got, fence)
+			if got, ok := w.rootPolicies[root].control.Lineages["session.jsonl"]; !ok || got != wantFence {
+				t.Errorf("fence after a %d-byte interposition = %+v/%v, want the sealed %+v held", len(interposed), got, ok, wantFence)
+			}
+			if got := readRootControl(t, state, root).Lineages["session.jsonl"]; got != wantFence {
+				t.Errorf("persisted fence = %+v, want the sealed %+v held on disk as well as in memory", got, wantFence)
 			}
 
 			// The copy-back: an edited copy of the owner's own pre-consent history put back at the
@@ -269,12 +278,16 @@ func TestSameIdentityTruncationStillLowersItsOwnFence(t *testing.T) {
 }
 
 // TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement keeps the invariant a property of the
-// package rather than of the three call sites that happen to hold it today. Rebinding, lowering or
-// deleting a locator's fence is the whole of the exposure, so the map may be written in exactly two
-// primitives that route through reconcileLineage, plus retirement - the one sanctioned un-fencing -
-// and a fourth writer added later fails here rather than in a customer's transcript.
+// package rather than of the call sites that happen to hold it today. Rebinding, lowering or deleting
+// a locator's fence is the whole of the exposure, so the map may be written in exactly two primitives
+// that route through reconcileLineage, plus two writers that only ever RAISE protection and so need no
+// ratchet: retireAbsentLineages, the one sanctioned un-fencing, and orphanLineagesNaming, which flips
+// a single marker that can only make reconcileLineage stricter (it never lowers a floor, rebinds an
+// identity or deletes an entry). A writer added later that is on neither list - one that could lower or
+// clear a fence off the ratchet - fails here rather than in a customer's transcript, because `writers`
+// stays a whitelist: adding these two does not widen it to admit an unsanctioned direct write.
 func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
-	writers := map[string]bool{"setLineage": true, "holdLineage": true, "retireAbsentLineages": true}
+	writers := map[string]bool{"setLineage": true, "holdLineage": true, "retireAbsentLineages": true, "orphanLineagesNaming": true}
 	mustGuard := map[string]bool{"setLineage": true, "holdLineage": true}
 
 	fset := token.NewFileSet()
@@ -336,6 +349,99 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 func isLineageMap(e ast.Expr) bool {
 	sel, ok := e.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "Lineages"
+}
+
+// TestReleasedIdentityFenceSurvivesAReusedInodeNumber is the bd-main-fpj regression. Retirement keys
+// on a locator staying OCCUPIED while identity release keys on a per-identity ABSENCE, and the two
+// decouple when a foreign file keeps the fenced name occupied: the name never retires, yet the
+// ORIGINAL sealed identity is released after absenceEvictionPolls corroborated absences - freeing its
+// inode NUMBER while a live fence still names it. reconcileLineage's incumbent exemption was a pure
+// (Device,Inode) comparison, so a later file the allocator hands the freed number met the exemption
+// and could lower the floor to zero and delete the fence; the owner's pre-consent history copied back
+// to the name then published from byte zero. Releasing an identity must ORPHAN any live fence that
+// still names it, so every later writer - the reused number included - is foreign and may only ratchet
+// the floor up or hold it. Retirement stays the sole un-fencing path.
+func TestReleasedIdentityFenceSurvivesAReusedInodeNumber(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret-one") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	floor := int64(len(pre))
+	dev, ino0 := identityOf(t, p)
+	policy := w.rootPolicies[root]
+	fence := policy.control.Lineages["session.jsonl"]
+	if fence.Floor != floor || fence.FingerprintLen == 0 || fence.Device != dev || fence.Inode != ino0 {
+		t.Fatalf("staging error: fence %+v, want the sealed floor %d fingerprinted and named by (%d,%d)", fence, floor, dev, ino0)
+	}
+
+	// Atomic-replace unlinks the sealed inode I0 - freeing its NUMBER - and stands a short foreign file
+	// at the name. The temp is created before the rename unlinks I0, so it cannot be handed I0's number;
+	// the foreign occupant keeps the locator occupied so retirement never fires, while I0 is now absent
+	// from every walk.
+	replaceViaRename(t, p, "{")
+	if _, ino1 := identityOf(t, p); ino1 == ino0 {
+		t.Skip("filesystem reused the sealed inode on the foreign replace; this probe needs I0 freed first")
+	}
+
+	// Two corroborated absent walks release the tracked I0 while the foreign occupant holds the fence.
+	for i := 0; i < absenceEvictionPolls; i++ {
+		if err := w.Poll(ctx); err != nil {
+			t.Fatalf("absence poll %d: %v", i, err)
+		}
+	}
+	if _, ok := policy.baseline(dev, ino0); ok {
+		t.Fatalf("baseline for the sealed identity (%d,%d) survived %d corroborated absences; the release this probe needs never fired", dev, ino0, absenceEvictionPolls)
+	}
+	held, ok := policy.control.Lineages["session.jsonl"]
+	if !ok || held.Device != dev || held.Inode != ino0 || held.Floor != floor {
+		t.Fatalf("fence after the release = %+v/%v, want the sealed floor %d still named by the freed (%d,%d)", held, ok, floor, dev, ino0)
+	}
+
+	// The freed number I0 is handed to a new, unrelated EMPTY file at the same name, and reaches the
+	// fence exactly as resealReplacement's reseal of a zero-byte reused-inode file does. A pure
+	// (dev,ino) incumbent test reads this as the sealed file lowering its own floor to zero and deletes
+	// the fence; an orphaned fence treats it as foreign and holds.
+	policy.setLineage("session.jsonl", dev, ino0, baselineRecord{Floor: 0})
+	afterReuse, ok := policy.control.Lineages["session.jsonl"]
+	if !ok {
+		t.Fatalf("fence deleted by a file that reused the freed inode number %d; a released identity's fence must be orphaned so the reused number is foreign", ino0)
+	}
+	if afterReuse.Device != dev || afterReuse.Inode != ino0 || afterReuse.Floor != floor {
+		t.Fatalf("fence after the reused-number write = %+v, want it held at {Floor:%d Device:%d Inode:%d}", afterReuse, floor, dev, ino0)
+	}
+
+	// The copy-back: the owner's edited pre-consent history put back at the sealed name as a fresh
+	// inode, the way an editor save or a restore from backup writes it. With the fence held it inherits
+	// the floor and nothing beneath it is delivered; with the fence deleted above it is captured from
+	// byte zero and the pre-consent prefix is published.
+	edited := msgLine("redacted-pre-consent-history") + "\n"
+	replaceViaRename(t, p, edited)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("copy-back poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want no pre-consent-derived record delivered after a reused inode number cleared the fence", got)
+	}
+	for _, r := range reads {
+		if r[0] < floor {
+			t.Fatalf("read %v dips below the sealed floor %d; the pre-consent prefix was published", r, floor)
+		}
+	}
 }
 
 // TestForeignReplacementAtOrAboveFloorNeverRebindsTheFenceIdentity is the bd-main-dyc regression, and
