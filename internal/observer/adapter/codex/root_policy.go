@@ -208,18 +208,17 @@ func (s *rootPolicyState) setBaseline(locator string, dev, ino uint64, b baselin
 	s.dirty = true
 }
 
-// setLineage points a locator at the floor the identity now sitting there is sealed over. A floor at
-// byte zero has no pre-consent prefix beneath it and so carries nothing worth inheriting: it drops
-// the entry instead, which is also how a truncation all the way to zero lowers a lineage - but only
-// for the identity the fence names, because fenceHolds turns every other write into a ratchet.
+// setLineage points a locator at the floor the identity now sitting there is sealed over, through the
+// reconcileLineage choke point. A floor at byte zero has no pre-consent prefix beneath it and so
+// carries nothing worth inheriting: reconcileLineage drops the entry, which is also how a truncation
+// all the way to zero lowers a lineage - but only for the identity the fence names, because a foreign
+// write is ratcheted up or held there instead, never rebound and never lowered.
 func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baselineRecord) {
 	if locator == "" {
 		return
 	}
-	if s.fenceHolds(locator, dev, ino, b.Floor) {
-		return
-	}
-	if b.Floor <= 0 {
+	next, keep := s.reconcileLineage(locator, dev, ino, b)
+	if !keep {
 		delete(s.control.Lineages, locator)
 		return
 	}
@@ -229,14 +228,7 @@ func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baseline
 	if s.control.Lineages == nil {
 		s.control.Lineages = map[string]sealLineage{}
 	}
-	s.control.Lineages[locator] = sealLineage{
-		Floor:           b.Floor,
-		FingerprintHash: b.FingerprintHash,
-		FingerprintLen:  b.FingerprintLen,
-		Generation:      s.control.Generation,
-		Device:          dev,
-		Inode:           ino,
-	}
+	s.control.Lineages[locator] = next
 }
 
 // liveFence returns the fence standing at a locator right now, which is the only kind of entry that
@@ -251,28 +243,59 @@ func (s *rootPolicyState) liveFence(locator string) (sealLineage, bool) {
 	return lin, true
 }
 
-// fenceHolds reports that a live fence at locator must NOT be written down to floor on behalf of
-// (dev,ino), and it is the whole of the ratchet: a live fence is lowered - or, at a floor of zero,
-// deleted - only by the very identity it names.
+// reconcileLineage returns the lineage entry that must stand at locator after identity (dev,ino) with
+// baseline b writes there, and whether an entry should exist at all. It is the whole of the ratchet,
+// and the single choke point both setLineage and holdLineage route through, so no write path can
+// rebind or lower a live fence by taking a different door.
 //
-// The identity is the distinction, because it is what says where the sealed bytes are (bd-main-9xl).
-// A sealed file that shrinks its OWN floor really did destroy the bytes above it: an in-place
-// truncation or a rewrite beneath the floor leaves nothing anywhere for the fence to protect, and
-// lowering there is honest bookkeeping that the reseal diagnostic reports (A22). Any OTHER identity
-// at that locator is a replacement standing where a sealed transcript used to be, and its own end of
-// file says nothing about the sealed bytes: those are alive in the file that rotated away, which is
-// the whole reason the name it left keeps a fence through its retirement window. Resealing at the
-// replacement's size cut that floor down to the interposed file's length - or deleted the fence
-// outright when the interposition held no bytes at all - and the next copy of the owner's pre-consent
-// history put back at the name inherited the cut floor and published everything above it. So a
-// replacement may RAISE a fence or hold it, never cut beneath it, and absence still un-fences a
-// locator through retireAbsentLineages alone.
-func (s *rootPolicyState) fenceHolds(locator string, dev, ino uint64, floor int64) bool {
+// A live fence carries not just a floor but the IDENTITY that last legitimately held the locator, and
+// that identity is what says where the sealed bytes are (bd-main-9xl). It is IMMUTABLE to every writer
+// but the one it names:
+//
+//   - The incumbent (writer identity == the fence's), or a locator with no live fence, is an honest
+//     write and stands exactly as given. A file that shrinks its OWN floor really did destroy the
+//     bytes above it - an in-place truncation or a rewrite beneath the floor leaves nothing anywhere
+//     for the fence to protect - so it lowers, and a floor at zero clears the entry (A22); the reseal
+//     diagnostic reports it.
+//   - A foreign identity is a replacement standing where a sealed transcript used to be, and its own
+//     end of file says nothing about the sealed bytes: those are alive in the file that rotated away,
+//     which is the whole reason the name it left keeps a fence through its retirement window. It may
+//     RATCHET the fence up (a strictly higher floor, keeping the incumbent identity) or hold it, but
+//     it NEVER lowers and NEVER rebinds the identity. Guarding only the floor let a foreign write at
+//     or above it rebind the fence to the writer; the writer then met its own same-identity exemption
+//     and could lower the floor to zero, delete the fence, and have the owner's pre-consent prefix
+//     republished from byte zero by the next copy put back at the name (bd-main-dyc).
+//
+// Incumbency is a pure comparison of the writer's (dev,ino) against the LIVE FENCE's (Device,Inode).
+// It must never be re-derived from s.control.Baselines: setBaseline writes the baseline BEFORE calling
+// setLineage, so a baseline-keyed test would see the just-written foreign entry and be defeated.
+// Absence still un-fences a locator through retireAbsentLineages alone.
+func (s *rootPolicyState) reconcileLineage(locator string, dev, ino uint64, b baselineRecord) (sealLineage, bool) {
 	cur, fenced := s.liveFence(locator)
-	if !fenced || (cur.Device == dev && cur.Inode == ino) {
-		return false
+	if fenced && (cur.Device != dev || cur.Inode != ino) {
+		if b.Floor <= cur.Floor {
+			return cur, true // hold: a foreign writer never lowers and never rebinds
+		}
+		return sealLineage{ // ratchet up, keeping the incumbent identity
+			Floor:           b.Floor,
+			FingerprintHash: b.FingerprintHash,
+			FingerprintLen:  b.FingerprintLen,
+			Generation:      s.control.Generation,
+			Device:          cur.Device,
+			Inode:           cur.Inode,
+		}, true
 	}
-	return floor < cur.Floor
+	if b.Floor <= 0 { // incumbent, or no live fence: an honest write; a floor at zero clears the entry
+		return sealLineage{}, false
+	}
+	return sealLineage{
+		Floor:           b.Floor,
+		FingerprintHash: b.FingerprintHash,
+		FingerprintLen:  b.FingerprintLen,
+		Generation:      s.control.Generation,
+		Device:          dev,
+		Inode:           ino,
+	}, true
 }
 
 // dropBaseline releases one identity's floor while deliberately LEAVING the locator's lineage in
@@ -314,16 +337,11 @@ func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
 	if !sealed || base.Floor <= 0 {
 		return
 	}
-	if s.fenceHolds(locator, dev, ino, base.Floor) {
+	lin, keep := s.reconcileLineage(locator, dev, ino, base)
+	if !keep {
+		// A foreign write that would lower is refused here rather than deleting: holding only ever adds
+		// or raises a fence, and un-fencing is retireAbsentLineages' alone.
 		return
-	}
-	lin := sealLineage{
-		Floor:           base.Floor,
-		FingerprintHash: base.FingerprintHash,
-		FingerprintLen:  base.FingerprintLen,
-		Generation:      s.control.Generation,
-		Device:          dev,
-		Inode:           ino,
 	}
 	if cur, known := s.control.Lineages[locator]; known && cur == lin {
 		return

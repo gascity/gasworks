@@ -241,11 +241,12 @@ func TestDisplacementWithAnAmbiguousIdentityFailsClosed(t *testing.T) {
 
 // TestTwoTranscriptsExchangingPathsKeepBothFences is the second half of F2. When two sealed files swap
 // names the walk reports two renames whose sources and destinations are each other's, and applying
-// them one at a time let the second overwrite what the first had just written - so the identity guard
-// rejected it and one fence was dropped on the floor. Both files are sealed; the exchange has to leave
-// both floors intact and neither name unfenced. Where each fence lands is bounded below by the ratchet
-// (bd-main-9xl): an arriving file raises a name's fence or holds it, and only the identity a fence
-// names may cut it.
+// them one at a time let the second overwrite what the first had just written - so a fence was dropped
+// on the floor. Both files are sealed; the exchange has to leave both floors intact and neither name
+// unfenced. Where each fence lands is bounded below by the ratchet: an arriving file raises a name's
+// fence or holds it, never cuts it, and a live fence's identity is immutable to a foreign writer - even
+// one arriving by rename (bd-main-dyc) - so each name keeps the identity it already carried while its
+// floor ratchets to whichever of the two is higher.
 func TestTwoTranscriptsExchangingPathsKeepBothFences(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
@@ -276,16 +277,21 @@ func TestTwoTranscriptsExchangingPathsKeepBothFences(t *testing.T) {
 		t.Fatalf("exchange poll: %v", err)
 	}
 	control := readRootControl(t, state, root)
-	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor != int64(len(preB)) {
-		t.Fatalf("lineage at a.jsonl = %+v/%v, want b's fence to have followed it there", got, ok)
+	// b's file landed at a.jsonl carrying a HIGHER floor than a.jsonl's own, so the fence there ratchets
+	// up to it - but a live fence's identity is immutable to a foreign writer, even one arriving by
+	// rename (bd-main-dyc), so a.jsonl keeps the incumbent name it already carried. The invariant turns
+	// on the higher floor holding and the name staying fenced, not on which identity the entry records;
+	// b's fingerprint rode the ratchet up with the floor, so the rewrite below still corroborates.
+	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devA || got.Inode != inoA || got.Floor != int64(len(preB)) {
+		t.Fatalf("lineage at a.jsonl = %+v/%v, want the incumbent identity held and the floor ratcheted to b's %d", got, ok, len(preB))
 	}
 	// b.jsonl is where a's file went, but a's floor is LOWER than the fence already standing at that
 	// name, and a live fence is cut only by the identity it names (bd-main-9xl): b's sealed bytes are
 	// alive at a.jsonl, so the name they left keeps the higher fence until retirement clears it. Both
 	// locators stay fenced and both floors survive, which is what this probe turns on - the bug it
 	// names dropped one of them on the floor.
-	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Floor < int64(len(preB)) {
-		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence still standing at the name b left", got, ok)
+	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor < int64(len(preB)) {
+		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence and its incumbent identity still standing at the name b left", got, ok)
 	}
 	if got, ok := control.Baselines[identityString(devA, inoA)]; !ok || got.Floor != int64(len(preA)) {
 		t.Fatalf("a's baseline = %+v/%v, want its own floor %d intact wherever it now lives", got, ok, len(preA))
@@ -708,19 +714,22 @@ func TestErroredReconcileKeepsEveryStagedVacate(t *testing.T) {
 		}
 	}
 
-	// The next complete walk converges: each fence ends up where its file did.
+	// The next complete walk converges: every occupied name ends fenced at no less than the floor that
+	// stood there. A live fence's identity is immutable to a foreign writer arriving by rename
+	// (bd-main-dyc), so each name keeps the identity it already carried while its floor ratchets to the
+	// higher of the two.
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("recovery poll: %v", err)
 	}
 	control := readRootControl(t, state, root)
-	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor != int64(len(preB)) {
-		t.Fatalf("lineage at a.jsonl = %+v/%v, want b's fence to have followed it there", got, ok)
+	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devA || got.Inode != inoA || got.Floor != int64(len(preB)) {
+		t.Fatalf("lineage at a.jsonl = %+v/%v, want the incumbent identity held and the floor ratcheted to b's %d", got, ok, len(preB))
 	}
 	// b.jsonl holds a's file now, but a's floor is lower than the fence already standing at that name,
 	// and only the identity a fence names may cut it (bd-main-9xl) - b's sealed bytes are alive at
 	// a.jsonl. What this probe turns on is unchanged: an errored reconcile leaves no locator unfenced.
-	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Floor < int64(len(preB)) {
-		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence still standing there", got, ok)
+	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor < int64(len(preB)) {
+		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence and its incumbent identity still standing there", got, ok)
 	}
 	if got, ok := control.Baselines[identityString(devA, inoA)]; !ok || got.Floor != int64(len(preA)) {
 		t.Fatalf("a's baseline = %+v/%v, want its own floor %d intact after the errored reconcile", got, ok, len(preA))
