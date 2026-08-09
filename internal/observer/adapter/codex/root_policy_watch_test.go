@@ -4,8 +4,10 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
@@ -393,6 +395,281 @@ func TestRootPolicyWatcherCapturesClaudeAndCodexJSONLAfterForwardActivation(t *t
 	if got := sink.messages(); len(got) != 2 || got[0] != "new-claude" || got[1] != "new-codex" {
 		t.Fatalf("provider-neutral messages = %v, want both appended provider transcripts", got)
 	}
+}
+
+// TestForwardBaselineGrowingInPlaceRewriteResealsAtEOF is the D5 proof. A rewrite that replaces the
+// sealed prefix and grows past it is invisible to a size comparison: the file is larger than the
+// floor, so the old code read from the floor into unrelated content, delivering bytes that belong to
+// a file the owner never consented to and parsing them mid-record. The floor fingerprint catches it,
+// and the recovery reseals at the current EOF rather than replaying anything below it.
+func TestForwardBaselineGrowingInPlaceRewriteResealsAtEOF(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret-that-must-never-be-delivered") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	policy := []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}}
+	w := mustWatcher(t, WatchConfig{RootPolicies: policy, StateDir: state, Sink: sink, ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+		reads = append(reads, [2]int64{off, n})
+		return readRangeAt(f, off, n)
+	}})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	// A GROWING in-place rewrite: same inode, different bytes under the floor, larger than the floor.
+	rewritten := msgLine("rewritten-first-record-with-entirely-different-content") + "\n" + msgLine("rewritten-second") + "\n"
+	if len(rewritten) <= len(pre) {
+		t.Fatalf("rewrite is %d bytes, must grow past the %d-byte floor to exercise D5", len(rewritten), len(pre))
+	}
+	writeFileString(t, p, rewritten)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rewrite poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("rewrite poll read %v, want no bytes read below or above the diverged floor", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("rewrite poll delivered %v, want nothing from a file whose sealed prefix diverged", got)
+	}
+	diags := diagnostics(sink.all())
+	if len(diags) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one rewrite diagnostic", len(diags))
+	}
+	ctxText := diags[0].Diagnostic.Context
+	if !strings.Contains(ctxText, "diverged") || !strings.Contains(ctxText, "resealing capture at the current end of file") || !strings.Contains(ctxText, "no bytes are re-delivered") {
+		t.Fatalf("rewrite diagnostic = %q, want an honest reseal-at-EOF description", ctxText)
+	}
+	if strings.Contains(ctxText, "restarting capture at 0") {
+		t.Fatalf("rewrite diagnostic = %q, want no claim of a byte-zero restart the code never performs", ctxText)
+	}
+
+	base := mustBaseline(t, readRootControl(t, state, root), p)
+	if base.Floor != int64(len(rewritten)) {
+		t.Fatalf("floor = %d, want the rewritten EOF %d", base.Floor, len(rewritten))
+	}
+	if base.FingerprintLen != floorFingerprintLen {
+		t.Fatalf("refreshed fingerprint length = %d, want %d", base.FingerprintLen, floorFingerprintLen)
+	}
+
+	post := msgLine("after-rewrite") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-rewrite append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(rewritten)), int64(len(post))} {
+		t.Fatalf("post-rewrite reads = %v, want only the bytes appended above the new floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-rewrite" {
+		t.Fatalf("post-rewrite messages = %v, want only the record appended after the reseal", got)
+	}
+}
+
+// TestForwardBaselineUnchangedPrefixAppendRecordsFingerprintOnce proves the corroboration is inert
+// on the ordinary path: the fingerprint is computed once, on the first drain after the seal, and
+// every later drain only verifies it, so an append still delivers exactly its own bytes and the
+// durable floor record never moves.
+func TestForwardBaselineUnchangedPrefixAppendRecordsFingerprintOnce(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	sealed := mustBaseline(t, readRootControl(t, state, root), p)
+	if sealed.Floor != int64(len(pre)) || sealed.FingerprintLen != floorFingerprintLen || sealed.FingerprintHash == 0 {
+		t.Fatalf("sealed baseline = %+v, want floor %d with a full fingerprint recorded on the first drain", sealed, len(pre))
+	}
+
+	first := msgLine("first-append") + "\n"
+	appendString(t, p, first)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("first append poll: %v", err)
+	}
+	second := msgLine("second-append") + "\n"
+	appendString(t, p, second)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("second append poll: %v", err)
+	}
+	want := [][2]int64{{int64(len(pre)), int64(len(first))}, {int64(len(pre) + len(first)), int64(len(second))}}
+	if len(reads) != 2 || reads[0] != want[0] || reads[1] != want[1] {
+		t.Fatalf("reads = %v, want only the two appended ranges %v", reads, want)
+	}
+	if got := sink.messages(); len(got) != 2 || got[0] != "first-append" || got[1] != "second-append" {
+		t.Fatalf("messages = %v, want both appends and nothing from the sealed prefix", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 0 {
+		t.Fatalf("diagnostics = %d, want none for an unchanged sealed prefix", len(got))
+	}
+	if got := mustBaseline(t, readRootControl(t, state, root), p); got != sealed {
+		t.Fatalf("baseline after appends = %+v, want the once-recorded %+v", got, sealed)
+	}
+}
+
+// TestForwardBaselineTruncateBelowFloorLowersFloorDurably is the A22 proof: a truncation below the
+// floor lowers the durable floor (and drops the fingerprint window that described the removed
+// bytes), and the lowered floor survives a restart that has lost every cursor file. Keeping the old
+// floor would leave capture pointing past the end of the file forever; forgetting it entirely would
+// republish the surviving prefix.
+func TestForwardBaselineTruncateBelowFloorLowersFloorDurably(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-record-one") + "\n" + msgLine("pre-consent-record-two") + "\n"
+	writeFileString(t, p, pre)
+	policy := []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}}
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{RootPolicies: policy, StateDir: state, Sink: sink})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	truncated := int64(len(pre) / 2)
+	if err := os.Truncate(p, truncated); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("truncate poll: %v", err)
+	}
+	lowered := mustBaseline(t, readRootControl(t, state, root), p)
+	if lowered.Floor != truncated {
+		t.Fatalf("floor = %d, want it lowered to the truncated size %d", lowered.Floor, truncated)
+	}
+	if lowered.FingerprintLen != floorFingerprintLen || lowered.FingerprintHash == 0 {
+		t.Fatalf("fingerprint after truncation = %+v, want a window refreshed at the new floor", lowered)
+	}
+	diags := diagnostics(sink.all())
+	if len(diags) != 1 || !strings.Contains(diags[0].Diagnostic.Context, "resealing capture at the new end of file") {
+		t.Fatalf("truncation diagnostics = %+v, want one honest reseal report", diags)
+	}
+
+	// Restart with every cursor lost: the durable floor is the only surviving fence.
+	for _, cursor := range mustGlob(t, filepath.Join(state, "root-cursors", "*", "codex-cursor-*.json")) {
+		if err := os.Remove(cursor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	post := msgLine("after-truncate") + "\n"
+	appendString(t, p, post)
+	var reads [][2]int64
+	restarted := &recordingSink{}
+	w2 := mustWatcher(t, WatchConfig{RootPolicies: policy, StateDir: state, Sink: restarted, ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+		reads = append(reads, [2]int64{off, n})
+		return readRangeAt(f, off, n)
+	}})
+	if err := w2.Poll(ctx); err != nil {
+		t.Fatalf("restart poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{truncated, int64(len(post))} {
+		t.Fatalf("restart reads = %v, want only the bytes appended above the lowered floor %d", reads, truncated)
+	}
+	if got := restarted.messages(); len(got) != 1 || got[0] != "after-truncate" {
+		t.Fatalf("restart messages = %v, want only the post-truncation record", got)
+	}
+}
+
+// TestRootPolicyControlUpgradeKeepsV1Floors proves the schema bump is not a capture-loss event: a
+// control file written by the previous build stores each baseline as a bare floor integer, and
+// dropping those on upgrade would re-publish every sealed pre-consent prefix on the next poll.
+func TestRootPolicyControlUpgradeKeepsV1Floors(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("sealed-before-the-upgrade") + "\n"
+	writeFileString(t, p, pre)
+	dev, ino := identityOf(t, p)
+
+	v1, err := json.Marshal(map[string]any{
+		"version": rootPolicyControlMinVersion, "root": root, "generation": 1,
+		"active": true, "mode": rootpolicy.ForwardOnly, "committed": true,
+		"baselines": map[string]int64{identityString(dev, ino): int64(len(pre))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFileString(t, filepath.Join(state, "root-policy-"+rootPolicyID(root)+".json"), string(v1))
+
+	post := msgLine("after-the-upgrade") + "\n"
+	appendString(t, p, post)
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("upgraded poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes appended above the inherited floor %d", reads, len(pre))
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-the-upgrade" {
+		t.Fatalf("messages = %v, want the v1 floor to keep fencing the sealed prefix", got)
+	}
+	control := readRootControl(t, state, root)
+	if control.Version != rootPolicyControlVersion {
+		t.Fatalf("control version = %d, want it re-stamped to %d", control.Version, rootPolicyControlVersion)
+	}
+	base := mustBaseline(t, control, p)
+	if base.Floor != int64(len(pre)) || base.FingerprintLen != floorFingerprintLen {
+		t.Fatalf("upgraded baseline = %+v, want the v1 floor %d plus a lazily recorded fingerprint", base, len(pre))
+	}
+}
+
+func readRootControl(t *testing.T, stateDir, root string) rootPolicyControl {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(stateDir, "root-policy-"+rootPolicyID(root)+".json"))
+	if err != nil {
+		t.Fatalf("read root-policy control: %v", err)
+	}
+	var c rootPolicyControl
+	if err := json.Unmarshal(data, &c); err != nil {
+		t.Fatalf("decode root-policy control: %v", err)
+	}
+	return c
+}
+
+func mustBaseline(t *testing.T, control rootPolicyControl, path string) baselineRecord {
+	t.Helper()
+	dev, ino := identityOf(t, path)
+	base, ok := control.Baselines[identityString(dev, ino)]
+	if !ok {
+		t.Fatalf("no durable baseline for %s in %+v", path, control.Baselines)
+	}
+	return base
+}
+
+func identityOf(t *testing.T, path string) (dev, ino uint64) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	dev, ino, ok := fileIdentityOf(info)
+	if !ok {
+		t.Fatalf("no filesystem identity for %s", path)
+	}
+	return dev, ino
 }
 
 func mustGlob(t *testing.T, pattern string) []string {
