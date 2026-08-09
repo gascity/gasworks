@@ -89,10 +89,10 @@ type Membership struct {
 	Reason NonMemberReason
 }
 
-// TranscriptStat is the cheap stat evidence a verdict is anchored to: the owner uid the uid
-// corroboration compares, and the {size, ctime} pair a negative entry is invalidated by. ctime
-// rather than mtime because ctime cannot be back-dated by utimes, so a rewritten file cannot keep
-// a stale negative verdict alive.
+// TranscriptStat is the cheap stat evidence a cached verdict is anchored to: the owner uid the uid
+// corroboration compares, and the {size, ctime} pair the index re-corroborates every verdict — of
+// either sign — against. ctime rather than mtime because ctime cannot be back-dated by utimes, so a
+// rewritten file cannot keep a stale verdict alive.
 type TranscriptStat struct {
 	Size       int64
 	CtimeNanos int64
@@ -100,11 +100,14 @@ type TranscriptStat struct {
 }
 
 const (
-	// maxPeekCWDLines is how many parsed cwd-less records the peek tolerates before it calls the
-	// budget exhausted. A real transcript of either dialect records its cwd within the first few
-	// lines (Claude opens with cwd-less bookkeeping records such as {"type":"queue-operation"});
-	// 32 is generous headroom over every transcript observed in the wild.
-	maxPeekCWDLines = 32
+	// maxPeekParseFailures is how many CONSECUTIVE unparseable records the peek tolerates before it
+	// calls the budget exhausted. It exists only to stop a file that is not JSONL at all — a binary
+	// blob, a log, a half-written garbage file — from being scanned to the full byte budget on the
+	// chance a cwd record turns up in it. It deliberately does not count parsed cwd-less records:
+	// bookkeeping records such as {"type":"queue-operation"} are how real transcripts open, and a
+	// count over them would hand a permanent cached non-member to exactly the long-preamble sessions
+	// the byte budget below was raised to admit. A run broken by one parseable record starts over.
+	maxPeekParseFailures = 32
 	// maxPeekBytes bounds the head read of a single peek, and with it the peek's memory: the buffer
 	// is min(file size, this), and a head that is one pathologically long unterminated line can
 	// never buffer more. It is deliberately the watcher's own DefaultMaxReadChunk, so deciding a
@@ -125,9 +128,9 @@ type MembershipPeeker struct {
 	// euid is the identity every peeked file must be owned by (A9a). It is a field rather than a
 	// call to os.Geteuid per peek so the corroboration is fixed for the daemon's lifetime.
 	euid uint32
-	// maxLines / maxBytes are the peek caps, fields so tests can exercise exhaustion cheaply.
-	maxLines int
-	maxBytes int64
+	// maxParseFailures / maxBytes are the peek caps, fields so tests can exercise exhaustion cheaply.
+	maxParseFailures int
+	maxBytes         int64
 }
 
 // projectRoot is one active kind=project consent root. Path arrives canonical from
@@ -142,10 +145,10 @@ type projectRoot struct {
 // root is tailed directly and never selected by membership.
 func NewMembershipPeeker(policy rootpolicy.Policy) *MembershipPeeker {
 	p := &MembershipPeeker{
-		stores:   append([]string(nil), policy.Stores...),
-		euid:     uint32(os.Geteuid()),
-		maxLines: maxPeekCWDLines,
-		maxBytes: maxPeekBytes,
+		stores:           append([]string(nil), policy.Stores...),
+		euid:             uint32(os.Geteuid()),
+		maxParseFailures: maxPeekParseFailures,
+		maxBytes:         maxPeekBytes,
 	}
 	for _, r := range policy.Roots {
 		if r.Active && r.IsProject() {
@@ -192,21 +195,30 @@ func (p *MembershipPeeker) Peek(store, locator string, dev, ino uint64) (Members
 		return Membership{}, TranscriptStat{}, err
 	}
 
-	lines := 0
+	// How far the scan reaches is the byte budget's business: a record that parsed but carried no
+	// cwd is ordinary transcript bookkeeping, and however many of them precede the cwd record they
+	// are not evidence of anything. Only a run of records that do not parse at all suggests this is
+	// not a transcript, and that run is what the failure cap bounds.
+	failures := 0
 	for _, line := range splitJSONLines(head[:n]) {
-		if lines >= p.maxLines {
-			break
-		}
-		if cwd, ok := peekCWD(line); ok {
+		cwd, found, parsed := peekCWD(line)
+		if found {
 			return p.classify(cwd, locator), st, nil
 		}
-		// An unparseable line is a cwd-less line: a torn write or a record shape this peek does not
-		// know spends budget, but it never aborts the peek.
-		lines++
+		if parsed {
+			failures = 0
+			continue
+		}
+		// A torn write or a record shape this peek does not know spends budget but never aborts the
+		// peek; only an unbroken run of them does.
+		failures++
+		if failures >= p.maxParseFailures {
+			return Membership{State: MembershipNonMember, Reason: ReasonPeekCapExhausted}, st, nil
+		}
 	}
 	// splitJSONLines drops a trailing unterminated line, so a cwd record still being written is
 	// simply not seen yet. Only a genuinely spent budget is negative evidence.
-	if lines >= p.maxLines || int64(n) >= p.maxBytes {
+	if int64(n) >= p.maxBytes {
 		return Membership{State: MembershipNonMember, Reason: ReasonPeekCapExhausted}, st, nil
 	}
 	// A small file that never records a cwd at all — a stub opened and abandoned before the first
@@ -248,31 +260,34 @@ func (p *MembershipPeeker) classify(cwd, locator string) Membership {
 	return Membership{State: MembershipNonMember, Reason: ReasonOutsideProjectRoots}
 }
 
-// peekCWD returns the session cwd of one transcript record, for either dialect. Claude writes it as
-// a top-level "cwd" on its per-message envelopes; Codex writes it once, on the session_meta record,
-// at payload.cwd. cwd is read as a raw message so a record whose cwd is not a string is a cwd-less
-// record rather than an unparseable line.
-func peekCWD(line []byte) (string, bool) {
+// peekCWD returns the session cwd of one transcript record, for either dialect, together with
+// whether the line was a JSON record at all. Claude writes the cwd as a top-level "cwd" on its
+// per-message envelopes; Codex writes it once, on the session_meta record, at payload.cwd. cwd is
+// read as a raw message so a record whose cwd is not a string is a cwd-less record rather than an
+// unparseable line — parsed is what separates ordinary bookkeeping from garbage, and only garbage
+// is rationed.
+func peekCWD(line []byte) (cwd string, found, parsed bool) {
 	var probe struct {
 		Type    string          `json:"type"`
 		CWD     json.RawMessage `json:"cwd"`
 		Payload json.RawMessage `json:"payload"`
 	}
 	if json.Unmarshal(line, &probe) != nil {
-		return "", false
+		return "", false, false
 	}
-	if cwd, ok := decodeCWD(probe.CWD); ok {
-		return cwd, true
+	if top, ok := decodeCWD(probe.CWD); ok {
+		return top, true, true
 	}
 	if probe.Type == rolloutSessionMeta && len(probe.Payload) > 0 {
 		var meta struct {
 			CWD json.RawMessage `json:"cwd"`
 		}
 		if json.Unmarshal(probe.Payload, &meta) == nil {
-			return decodeCWD(meta.CWD)
+			nested, ok := decodeCWD(meta.CWD)
+			return nested, ok, true
 		}
 	}
-	return "", false
+	return "", false, true
 }
 
 func decodeCWD(raw json.RawMessage) (string, bool) {
