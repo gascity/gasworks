@@ -265,8 +265,19 @@ func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
 // identity guard then rejected it and dropped a fence on the floor (bd-main-x6u F2). Staging also lets
 // a locator that a reseal has since taken over keep its new fence: applyLineageShifts releases a
 // vacated locator only if it still carries the very lineage that left it.
-func (s *rootPolicyState) moveLineage(oldLocator, newLocator string, dev, ino uint64) {
+//
+// corroborated is the walk's own standard (rootScan.corroborated). Releasing the old locator is an
+// un-fencing, so it takes the same evidence retirement and cursor-state GC take; a walk that lost an
+// entry mid-flight saw an identity at one of its names and simply missed the others, which is exactly
+// how a hard link's second fence used to be vacated while it still held the sealed bytes
+// (bd-main-ikh). Below the bar the move degrades to a hold: the new locator is fenced, the old one
+// keeps what it has, and the next corroborated walk relocates it properly.
+func (s *rootPolicyState) moveLineage(oldLocator, newLocator string, dev, ino uint64, corroborated bool) {
 	if oldLocator == "" || oldLocator == newLocator {
+		return
+	}
+	if !corroborated {
+		s.holdLineage(newLocator, dev, ino)
 		return
 	}
 	lin, ok := s.control.Lineages[oldLocator]
@@ -313,12 +324,18 @@ func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
 // been reconciled — is what lets fences cross over each other without either being lost. A vacated
 // locator whose lineage is no longer the one that left it has been taken over since (a replacement
 // resealed onto it), and is kept.
-func (s *rootPolicyState) applyLineageShifts() {
+//
+// reconciled says whether the walk that staged these shifts finished. A reconcile that ended early
+// staged whatever it had reached and nothing it had not, so its vacates are half an account: the file
+// whose arrival at a vacated locator would have kept that locator fenced may be the one the scan never
+// got to. The holds still apply — they only ever add a fence — and the vacates wait for a walk that
+// completes (bd-main-ikh).
+func (s *rootPolicyState) applyLineageShifts(reconciled bool) {
 	if len(s.pendingShifts) == 0 {
 		return
 	}
 	for _, sh := range s.pendingShifts {
-		if sh.vacate == "" {
+		if sh.vacate == "" || !reconciled {
 			continue
 		}
 		if cur, ok := s.control.Lineages[sh.vacate]; ok && cur == sh.lin {
@@ -387,18 +404,6 @@ func (s *rootPolicyState) retireAbsentLineages(seen map[string]struct{}) {
 			delete(s.absentLineagePolls, locator)
 		}
 	}
-}
-
-// observedLocatorEmpty reports whether a complete, error-free walk that lost nothing under it has
-// positively found this locator EMPTY since the fence there was recorded. It is the positive newness
-// evidence a displaced lineage needs before the file now standing at the vacated locator may be
-// captured from byte zero (A1-v2, bd-main-x6u): the sealed identity being alive elsewhere says where
-// the sealed bytes went, and only an observation of the locator standing empty says that what is there
-// now arrived after they left. The counter it reads is the retirement streak, which is cleared the
-// moment a walk finds the locator occupied — and a fence is only ever recorded over an occupied
-// locator — so a non-zero count cannot predate the fence it is consulted for.
-func (s *rootPolicyState) observedLocatorEmpty(locator string) bool {
-	return s.absentLineagePolls[locator] > 0
 }
 
 // forgetLineageAbsence discards the retirement evidence gathered so far, because the walk that just
