@@ -66,14 +66,16 @@ func runDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy-file and -approved-root are mutually exclusive")
 		return 2
 	}
+	var policy rootpolicy.Policy
 	var policyRecords []rootpolicy.Record
 	if *rootPolicyFile != "" {
 		var err error
-		policyRecords, err = rootpolicy.Load(*rootPolicyFile)
+		policy, err = rootpolicy.LoadPolicy(*rootPolicyFile)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
 			return 2
 		}
+		policyRecords = capturableRoots(policy.Roots)
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy-file")
 			return 2
@@ -119,7 +121,14 @@ func runDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
 	}
 	if *rootPolicyFile != "" {
-		cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval)
+		// A policy whose every root is a project root leaves the watcher nothing to tail, and a
+		// rootless watcher fails construction, so the daemon runs metadata-only until the
+		// membership engine lands. Any other policy keeps its v1 wiring exactly.
+		if len(policyRecords) == 0 && len(policy.Roots) > 0 {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: root policy carries only project roots; transcript capture is idle")
+		} else {
+			cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval)
+		}
 	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
@@ -196,6 +205,30 @@ func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration
 		Match:         transcriptNameMatch,
 		Interval:      interval,
 	}
+}
+
+// captureProjectRoots gates capture for kind=project roots. A project root's path is the owner's
+// PROJECT folder, not a transcript directory: its sessions live in the policy's recorded stores and
+// are selected by the C2-prime membership engine, which has not landed yet. Until it does, project
+// roots are parsed, validated, and carried in the policy but never reach the watcher — walking a
+// project folder would capture arbitrary user files. Flipping this to true is the membership
+// engine's job, together with the store-side session selection.
+const captureProjectRoots = false
+
+// capturableRoots drops the records the watcher must not see yet. It is a silent filter by design:
+// a project root is a valid, accepted registration, not a fault, so it earns no per-poll diagnostic.
+func capturableRoots(records []rootpolicy.Record) []rootpolicy.Record {
+	if captureProjectRoots {
+		return records
+	}
+	out := make([]rootpolicy.Record, 0, len(records))
+	for _, r := range records {
+		if r.IsProject() {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // newPolicyWatchLoopConfig keeps companion consent records intact until the watcher, where the
