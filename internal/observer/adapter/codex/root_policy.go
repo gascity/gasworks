@@ -115,6 +115,11 @@ type rootPolicyState struct {
 	// dirty marks in-memory control changes a poll has made but not yet written. The watcher flushes
 	// them once per root per poll rather than once per changed identity.
 	dirty bool
+	// absentLineagePolls counts, per locator, the consecutive complete and error-free walks that have
+	// positively found that locator empty. It is deliberately in-memory only: the count is evidence
+	// this process gathered, and a restart re-gathers it rather than retiring a fence on a
+	// predecessor's word.
+	absentLineagePolls map[string]int
 }
 
 func rootPolicyID(root string) string {
@@ -271,22 +276,48 @@ func (s *rootPolicyState) lineage(locator string) (sealLineage, bool) {
 	return lin, true
 }
 
-// forgetAbsentLineages drops the lineage of every locator a COMPLETE, error-free walk of the root
-// just found empty, and is what keeps the inheritance narrow. An unlinked path with nothing put back
-// in its place is a deleted transcript, not a rewritten one, so the next file created there is a
-// genuinely new transcript and is captured in full; only a replacement the walk never saw the path
-// empty for - which is precisely what an atomic temp-write+rename produces - inherits a floor.
-// Callers must pass the locators of a walk that enumerated the whole root: a walk that hit any error
-// proves nothing about what is missing, and dropping a fence on that evidence would republish a
-// sealed prefix the first time a directory was briefly unreadable.
-func (s *rootPolicyState) forgetAbsentLineages(seen map[string]struct{}) {
+// retireAbsentLineages drops the lineage of every locator that absenceEvictionPolls consecutive
+// COMPLETE, error-free walks of the root have found empty, and is what keeps the inheritance narrow.
+// An unlinked path with nothing put back in its place is a deleted transcript, not a rewritten one,
+// so the next file created there is a genuinely new transcript and is captured in full; only a
+// replacement the walks never saw the path empty for - which is precisely what an atomic
+// temp-write+rename produces - inherits a floor.
+//
+// Retirement is the one step that un-fences a locator, so it is held to the same corroboration
+// standard as cursor-state GC (A1-v2): one walk finding a path empty is indistinguishable from a
+// rotation caught in flight, and retiring on that evidence would republish a sealed prefix to the
+// very next file created there. Callers must pass the locators of a walk that enumerated the whole
+// root and lost nothing under it; anything less is not evidence and belongs in forgetLineageAbsence.
+func (s *rootPolicyState) retireAbsentLineages(seen map[string]struct{}) {
+	if s.absentLineagePolls == nil {
+		s.absentLineagePolls = map[string]int{}
+	}
 	for locator := range s.control.Lineages {
 		if _, ok := seen[locator]; ok {
+			delete(s.absentLineagePolls, locator)
+			continue
+		}
+		s.absentLineagePolls[locator]++
+		if s.absentLineagePolls[locator] < absenceEvictionPolls {
 			continue
 		}
 		delete(s.control.Lineages, locator)
+		delete(s.absentLineagePolls, locator)
 		s.dirty = true
 	}
+	for locator := range s.absentLineagePolls {
+		if _, ok := s.control.Lineages[locator]; !ok {
+			delete(s.absentLineagePolls, locator)
+		}
+	}
+}
+
+// forgetLineageAbsence discards the retirement evidence gathered so far, because the walk that just
+// finished cannot extend it: the run of consecutive empty observations a retirement rests on has to
+// be unbroken, and a walk that hit an error, never read the root, or lost an entry to a rename in
+// flight breaks it.
+func (s *rootPolicyState) forgetLineageAbsence() {
+	clear(s.absentLineagePolls)
 }
 
 // The indirections keep the policy state small and give tests a narrow seam without exposing it.

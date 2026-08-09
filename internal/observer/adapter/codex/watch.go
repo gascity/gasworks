@@ -433,6 +433,11 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		policy := w.rootPolicies[root]
 		forwardActivating := policy != nil && policy.record.Mode == rootpolicy.ForwardOnly && !policy.control.Committed
 		rootEnumerated := false
+		// walkVanished marks a directory entry that was gone by the time the walk statted it — a
+		// rename in flight. The rest of the tree is still enumerated, but a walk that raced a rename
+		// cannot claim to have positively observed any locator empty, which is the evidence lineage
+		// retirement runs on.
+		walkVanished := false
 		// seenLocators records every locator under this root the walk found occupied. It is the
 		// evidence forgetAbsentLineages needs to tell a deleted transcript (path left empty) from a
 		// replaced one (path never empty), and it is collected for refused files too: a path holding
@@ -479,6 +484,8 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				if !os.IsNotExist(err) {
 					// An entry that cannot be statted is not an entry that is gone.
 					rootWalkFailed[root] = true
+				} else {
+					walkVanished = true
 				}
 				return nil // vanished mid-walk; a later poll re-discovers it
 			}
@@ -487,14 +494,15 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				return nil
 			}
 			key := identityKey{dev: dev, ino: ino}
+			// A tracked identity that is here again after being missed by an earlier walk RESUMES from
+			// its existing cursor and floor. One clean-walk miss is not evidence the transcript left:
+			// a rename racing the walk (the listing holds the old name, the stat of it finds nothing)
+			// and a file moved out of the root and back both produce exactly that, and releasing the
+			// state there re-tracks the file at byte zero and drains its sealed, pre-consent prefix.
+			// Release stays gated on the corroborated absenceEvictionPolls evidence below; a file that
+			// really was replaced by an inode-reusing new one is caught where it always was, by the
+			// drain's fingerprint corroboration, which reseals rather than publishes.
 			tf, isTracked := w.tracked[key]
-			if isTracked && tf.absentPolls > 0 {
-				// An earlier clean walk established that this identity had left the root, so a file
-				// carrying it now is a reused inode, not the transcript the cursor and floor belong to.
-				// Release the stale state and re-track it from byte zero.
-				w.releaseTracked(key, tf)
-				tf, isTracked = nil, false
-			}
 			if forwardActivating && info.Mode().IsRegular() {
 				lstat, lerr := os.Lstat(path)
 				if lerr != nil {
@@ -599,9 +607,18 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 					return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
 				}
 			}
-			// The same complete-walk evidence retires the seal lineages of locators that are now
-			// empty. Anything less than a complete walk leaves every fence standing.
-			policy.forgetAbsentLineages(seenLocators)
+			// Retiring a locator's seal lineage needs more evidence than committing the activation
+			// does, because retirement is the one step that un-fences a path: the walk must have been
+			// complete, error-free, AND free of entries that vanished under it, and the locator must
+			// have been found empty by absenceEvictionPolls consecutive such walks (A1-v2). A single
+			// empty walk is what an in-flight rotation looks like from the outside.
+			if !walkVanished {
+				policy.retireAbsentLineages(seenLocators)
+			} else {
+				policy.forgetLineageAbsence()
+			}
+		} else if policy != nil {
+			policy.forgetLineageAbsence()
 		}
 	}
 	for key := range present {

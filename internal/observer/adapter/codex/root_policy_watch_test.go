@@ -269,8 +269,13 @@ func TestForwardOnlyDeletedBaselineDoesNotFenceLaterNewIdentity(t *testing.T) {
 	if err := os.Remove(p); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Poll(ctx); err != nil {
-		t.Fatalf("drop poll: %v", err)
+	// Two clean walks, because retiring the locator's fence is corroborated to the same N>=2 standard
+	// as releasing the identity's cursor (A1-v2): one walk finding the path empty is what a rotation
+	// caught in flight looks like too.
+	for i := 0; i < absenceEvictionPolls; i++ {
+		if err := w.Poll(ctx); err != nil {
+			t.Fatalf("drop poll %d: %v", i, err)
+		}
 	}
 	writeFileString(t, p, msgLine("new-file")+"\n")
 	if err := w.Poll(ctx); err != nil {
