@@ -24,6 +24,27 @@ func codexMetaLine(cwd string) string {
 	return `{"type":"session_meta","payload":{"id":"019c-0001","cwd":"` + cwd + `"}}`
 }
 
+// fillerLine is one cwd-less record of roughly n bytes, for pushing a cwd record out to a byte
+// offset without spending the peek's much smaller line budget.
+func fillerLine(n int) string {
+	return `{"type":"queue-operation","pad":"` + strings.Repeat("a", n) + `"}`
+}
+
+// writeStraddlingTranscript writes a byte-cap fixture and returns its size, having checked that the
+// fixture leaves the line cap slack — otherwise a peek-cap-exhausted verdict would prove nothing
+// about the byte budget under test.
+func writeStraddlingTranscript(t *testing.T, store, locator string, lines []string) int64 {
+	t.Helper()
+	if cwdLess := len(lines) - 1; cwdLess >= maxPeekCWDLines {
+		t.Fatalf("fixture spends %d cwd-less records, at or over the %d-record line cap", cwdLess, maxPeekCWDLines)
+	}
+	info, err := os.Stat(writeTranscript(t, store, locator, lines...))
+	if err != nil {
+		t.Fatalf("stat %s: %v", locator, err)
+	}
+	return info.Size()
+}
+
 func peekerFor(t *testing.T, store string, projects ...string) *MembershipPeeker {
 	t.Helper()
 	policy := rootpolicy.Policy{Stores: []string{store}}
@@ -161,6 +182,39 @@ func TestPeekByteCapExhaustionIsNonMember(t *testing.T) {
 	wantVerdict(t, m, MembershipNonMember, "", ReasonPeekCapExhausted)
 }
 
+// The peek's byte budget is the watcher's own read chunk, not the original 256KB: measurement over
+// a real 574-transcript store found 1.7% of sessions writing their first cwd record past 256KB, at
+// offsets up to ~850KB. These fixtures straddle the real bound with the record count held well
+// under maxPeekCWDLines, so the byte budget is the only cap in play.
+func TestPeekByteCapCoversRecordsFarPastTheOldBound(t *testing.T) {
+	if maxPeekBytes != DefaultMaxReadChunk {
+		t.Fatalf("maxPeekBytes = %d, want the watcher's DefaultMaxReadChunk %d", maxPeekBytes, DefaultMaxReadChunk)
+	}
+	store, project := t.TempDir(), t.TempDir()
+	dir := mungeClaudeProjectDir(project)
+	p := peekerFor(t, store, project)
+
+	const filler = 800 << 10
+	// Four fillers put the cwd record past 3MB — far beyond the old cap, inside the new one.
+	deep := []string{fillerLine(filler), fillerLine(filler), fillerLine(filler), fillerLine(filler), claudeCWDLine(project)}
+	size := writeStraddlingTranscript(t, store, filepath.Join(dir, "deep.jsonl"), deep)
+	if size <= 256<<10 || size >= maxPeekBytes {
+		t.Fatalf("fixture is %d bytes, want it past the old 256KB cap and inside the %d-byte budget", size, maxPeekBytes)
+	}
+	m, _ := mustPeek(t, p, store, filepath.Join(dir, "deep.jsonl"))
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+
+	// Two more fillers push it past 4MiB: the budget is spent on complete records, which is the one
+	// honest way to run out of bytes rather than out of lines.
+	beyond := append(append([]string(nil), deep[:4]...), fillerLine(filler), fillerLine(filler), claudeCWDLine(project))
+	size = writeStraddlingTranscript(t, store, filepath.Join(dir, "beyond.jsonl"), beyond)
+	if size <= maxPeekBytes {
+		t.Fatalf("fixture is %d bytes, want more than the %d-byte budget", size, maxPeekBytes)
+	}
+	m, _ = mustPeek(t, p, store, filepath.Join(dir, "beyond.jsonl"))
+	wantVerdict(t, m, MembershipNonMember, "", ReasonPeekCapExhausted)
+}
+
 func TestPeekTreatsUnparseableLinesAsCWDLessWithoutAborting(t *testing.T) {
 	store, project := t.TempDir(), t.TempDir()
 	locator := filepath.Join(mungeClaudeProjectDir(project), "session.jsonl")
@@ -197,6 +251,63 @@ func TestPeekMungedDirMismatchIsNonMember(t *testing.T) {
 	writeTranscript(t, store, locator, claudeCWDLine(project))
 
 	m, _ := mustPeek(t, peekerFor(t, store, project), store, locator)
+	wantVerdict(t, m, MembershipNonMember, "", ReasonStoreDirMismatch)
+}
+
+// Claude names the store subdirectory from the session LAUNCH directory while the first recorded
+// cwd can be a deeper path (an in-repo worktree is the ordinary case), so the directory witness
+// accepts a munged ancestor of the recorded cwd — A9b as amended by the 574-transcript field
+// measurement, where strict equality refused 5.7% of genuine members. Unrelated directories, and
+// prefixes that are not ancestors, still refuse.
+func TestDirWitnessAcceptsAMungedAncestorOfTheRecordedCWD(t *testing.T) {
+	const launch = "/data/projects/gascity"
+	const worktree = launch + "/.claude/worktrees/docs"
+	p := peekerFor(t, t.TempDir(), launch)
+
+	cases := []struct {
+		name    string
+		dirname string
+		cwd     string
+		state   MembershipState
+		id      string
+		reason  NonMemberReason
+	}{
+		{"launch dir is a munged ancestor of the worktree cwd",
+			"-data-projects-gascity", worktree, MembershipMember, rootPolicyID(launch), ReasonNone},
+		{"exact equality still passes",
+			"-data-projects-gascity", launch, MembershipMember, rootPolicyID(launch), ReasonNone},
+		{"a worktree filed under its own munged name is exact too",
+			mungeClaudeProjectDir(worktree), worktree, MembershipMember, rootPolicyID(launch), ReasonNone},
+		{"an unrelated project's directory refuses",
+			"-data-projects-other", worktree, MembershipNonMember, "", ReasonStoreDirMismatch},
+		{"a prefix that is not a path boundary is not an ancestor",
+			"-data-projects-gas", launch, MembershipNonMember, "", ReasonStoreDirMismatch},
+		{"a descendant directory does not witness a shallower cwd",
+			mungeClaudeProjectDir(worktree), launch, MembershipNonMember, "", ReasonStoreDirMismatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := p.classify(tc.cwd, filepath.Join(tc.dirname, "session.jsonl"))
+			wantVerdict(t, got, tc.state, tc.id, tc.reason)
+		})
+	}
+}
+
+// The same amendment through the real peek: a transcript filed under its launch directory's munged
+// name, recording the worktree the session actually ran in.
+func TestPeekWorktreeSessionFiledUnderItsLaunchDir(t *testing.T) {
+	store, project := t.TempDir(), t.TempDir()
+	worktree := filepath.Join(project, ".claude", "worktrees", "docs")
+	locator := filepath.Join(mungeClaudeProjectDir(project), "session.jsonl")
+	writeTranscript(t, store, locator, queueLine, claudeCWDLine(worktree))
+
+	m, _ := mustPeek(t, peekerFor(t, store, project), store, locator)
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+
+	// That same recorded cwd, filed under some other project's directory, is still refused.
+	foreign := filepath.Join(mungeClaudeProjectDir(t.TempDir()), "session.jsonl")
+	writeTranscript(t, store, foreign, claudeCWDLine(worktree))
+	m, _ = mustPeek(t, peekerFor(t, store, project), store, foreign)
 	wantVerdict(t, m, MembershipNonMember, "", ReasonStoreDirMismatch)
 }
 

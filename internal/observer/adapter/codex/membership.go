@@ -105,11 +105,15 @@ const (
 	// lines (Claude opens with cwd-less bookkeeping records such as {"type":"queue-operation"});
 	// 32 is generous headroom over every transcript observed in the wild.
 	maxPeekCWDLines = 32
-	// maxPeekBytes bounds the head read of a single peek. It is well under the package's
-	// DefaultMaxPartialLine, so a transcript whose head is one pathologically long unterminated
-	// line can never buffer more than this — the peek's per-line memory is bounded by the same
-	// budget as its total read.
-	maxPeekBytes int64 = 256 << 10
+	// maxPeekBytes bounds the head read of a single peek, and with it the peek's memory: the buffer
+	// is min(file size, this), and a head that is one pathologically long unterminated line can
+	// never buffer more. It is deliberately the watcher's own DefaultMaxReadChunk, so deciding a
+	// file costs no more in one pass than tailing it does.
+	//
+	// The original 256KB was set from short transcripts and refused real sessions: measurement over
+	// a 574-transcript store found first cwd records at byte offsets up to ~850KB, 1.7% of sessions
+	// past 256KB — a long pasted opening prompt or a burst of cwd-less bookkeeping precedes them.
+	maxPeekBytes int64 = DefaultMaxReadChunk
 )
 
 // MembershipPeeker answers the membership question for transcripts discovered beneath the recorded
@@ -205,6 +209,12 @@ func (p *MembershipPeeker) Peek(store, locator string, dev, ino uint64) (Members
 	if lines >= p.maxLines || int64(n) >= p.maxBytes {
 		return Membership{State: MembershipNonMember, Reason: ReasonPeekCapExhausted}, st, nil
 	}
+	// A small file that never records a cwd at all — a stub opened and abandoned before the first
+	// envelope — stays undetermined for good: it is under both caps, so no later peek can turn it
+	// negative, and an undetermined verdict is deliberately never cached. It is therefore re-read
+	// (at most its own small length) on every poll. That is intentional: silence is not evidence of
+	// non-membership, and the re-peek cadence is what the store-scale tiering of A11 bounds — old
+	// files drop to the slow stat-only tier and stop being re-peeked every poll.
 	return Membership{State: MembershipUndetermined}, st, nil
 }
 
@@ -223,10 +233,10 @@ func (p *MembershipPeeker) classify(cwd, locator string) Membership {
 	if !filepath.IsAbs(clean) {
 		return Membership{State: MembershipNonMember, Reason: ReasonCWDNotAbsolute}
 	}
-	// A9b: in the claude-projects layout the store itself encodes the cwd in the directory name, so
+	// A9b: in the claude-projects layout the store itself encodes a cwd in the directory name, so
 	// the transcript's self-declaration has an independent witness. The munge is taken over the cwd
 	// exactly as recorded, because that is the string Claude Code encoded.
-	if dir, ok := claudeStoreSubdir(locator); ok && mungeClaudeProjectDir(cwd) != dir {
+	if dir, ok := claudeStoreSubdir(locator); ok && !dirWitnessesCWD(dir, cwd) {
 		return Membership{State: MembershipNonMember, Reason: ReasonStoreDirMismatch}
 	}
 	// A19 keeps active roots mutually non-overlapping, so at most one can match.
@@ -274,6 +284,23 @@ func decodeCWD(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return cwd, true
+}
+
+// dirWitnessesCWD reports whether a claude-projects store subdirectory name corroborates the cwd a
+// transcript recorded. Claude names that directory from the session LAUNCH directory, while the
+// first recorded cwd is whatever directory the session was working in — for an in-repo worktree
+// (<proj>/.claude/worktrees/x) that is a strictly deeper path. Requiring equality therefore refused
+// genuine members (5.7% of a real 574-transcript store), so a munged ANCESTOR is accepted too: the
+// name must equal the munged cwd or be a '-'-separated prefix of it.
+//
+// The comparison is on munged strings and so is lossy — a directory named for a sibling
+// (<proj>-other) also clears the prefix test. That slack is deliberate. The witness only has to
+// refuse a transcript claiming a cwd unrelated to the directory it was filed under; which root a
+// member actually belongs to is decided by classify's component-wise containment check on the
+// recorded path itself, which no amount of munging can loosen.
+func dirWitnessesCWD(dirname, cwd string) bool {
+	munged := mungeClaudeProjectDir(cwd)
+	return munged == dirname || strings.HasPrefix(munged, dirname+"-")
 }
 
 // mungeClaudeProjectDir encodes a session cwd the way Claude Code names the per-project directory
