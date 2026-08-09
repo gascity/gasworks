@@ -462,9 +462,19 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	}
 	for key := range w.tracked {
 		if _, ok := present[key]; !ok {
+			tf := w.tracked[key]
 			// Fully rotated away / deleted. GC the durable state file so a later file that reuses
 			// this (device,inode) cannot resurrect a stale cursor and skip its own leading bytes.
-			_ = os.Remove(cursorStatePath(w.cfg.StateDir, key.dev, key.ino))
+			_ = os.Remove(tf.cursor.StatePath())
+			if tf.policy != nil && tf.forwardBaseline {
+				// Once this identity is gone, its generation-local floor must disappear with the
+				// cursor. Otherwise a future post-consent file that reuses the inode would be
+				// falsely classified as a pre-consent baseline and silently skipped.
+				delete(tf.policy.control.Baselines, identityString(key.dev, key.ino))
+				if err := tf.policy.persistControl(); err != nil {
+					return nil, fmt.Errorf("forget root-policy baseline %q: %w", tf.root, err)
+				}
+			}
 			delete(w.tracked, key)
 			// Release the content side channel's per-identity state + durable marker at the same
 			// point, so a reused identity starts fresh and idle state does not accumulate.

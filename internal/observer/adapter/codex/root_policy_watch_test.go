@@ -158,6 +158,31 @@ func TestForwardBaselineTruncateResealsAtEOFWithoutReadingPrefix(t *testing.T) {
 	}
 }
 
+func TestForwardOnlyDeletedBaselineDoesNotFenceLaterNewIdentity(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	writeFileString(t, p, msgLine("old")+"\n")
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}}, StateDir: state, Sink: sink})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("drop poll: %v", err)
+	}
+	writeFileString(t, p, msgLine("new-file")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("new-file poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "new-file" {
+		t.Fatalf("new identity messages = %v, want post-activation new file", got)
+	}
+}
+
 func TestRootPolicyRejectsStaleGenerationAndBackfillIsPerRoot(t *testing.T) {
 	ctx := context.Background()
 	rootA, rootB, state := t.TempDir(), t.TempDir(), t.TempDir()
