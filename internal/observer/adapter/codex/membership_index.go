@@ -47,28 +47,76 @@ func NewMembershipIndex() *MembershipIndex {
 // st, reporting false when there is nothing usable and the caller must peek.
 //
 // A cached entry is discarded when the identity has moved to a different path (A4), and whenever the
-// live stat no longer corroborates the verdict. Dropping an entry never substitutes a verdict: it
-// only costs the caller a fresh bounded peek, which re-decides the file the identity is now.
-func (ix *MembershipIndex) Lookup(dev, ino uint64, path string, st TranscriptStat) (Membership, bool) {
+// live stat no longer corroborates the verdict. A positive verdict on a file that has GROWN is
+// consistent with either an append or a foreign session copied over the inode that ended up larger;
+// head — invoked only in that one case — re-reads the bounded leading window the verdict was
+// fingerprinted over so the two can be told apart. An append leaves that window unchanged and the
+// verdict is kept; a foreign replacement changes it and the entry is dropped. Every other corroborated
+// verdict, of either sign, is decided on {size, ctime} alone with no content read. Dropping an entry
+// never substitutes a verdict: it only costs the caller a fresh bounded peek, which re-decides the
+// file the identity now is.
+//
+// head may be nil; then a grown positive verdict is neither confirmed nor refused but simply re-peeked,
+// so a caller that supplies no head reader never trusts growth it cannot corroborate. A non-nil error
+// is transient (the head read raced a vanish or rotation): the entry is left in place and the caller
+// skips the file this poll, exactly as it treats a failed peek.
+func (ix *MembershipIndex) Lookup(dev, ino uint64, path string, st TranscriptStat, head HeadHasher) (Membership, bool, error) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 	id := transcriptIdentity{dev: dev, ino: ino}
 	e, ok := ix.entries[id]
 	if !ok {
-		return Membership{}, false
+		return Membership{}, false, nil
 	}
-	if e.path != path || !corroborates(e.verdict.State, e.stat, st) {
+	if e.path != path {
 		ix.dropLocked(id, e)
-		return Membership{}, false
+		return Membership{}, false, nil
+	}
+	switch corroborate(e.verdict.State, e.stat, st, e.verdict.Head.present()) {
+	case corrEvict:
+		ix.dropLocked(id, e)
+		return Membership{}, false, nil
+	case corrCheckHead:
+		if head == nil {
+			// No head reader this poll: do not trust the growth, but do not destroy a verdict that may
+			// still be valid — a bounded re-peek re-decides it.
+			return Membership{}, false, nil
+		}
+		liveHash, err := head(e.verdict.Head.Len)
+		if err != nil {
+			// Transient: the head read raced a vanish or rotation. Keep the entry; the caller skips the
+			// file and re-decides on the next poll.
+			return Membership{}, false, err
+		}
+		if liveHash != e.verdict.Head.Hash {
+			// The leading bytes are a different session's: a foreign replacement, not an append.
+			ix.dropLocked(id, e)
+			return Membership{}, false, nil
+		}
 	}
 	if e.stat != st {
 		e.stat = st
 		ix.entries[id] = e
 	}
-	return e.verdict, true
+	return e.verdict, true, nil
 }
 
-// corroborates reports whether the live stat st still supports a verdict reached under snap.
+// corroboration is what the live stat says about a cached verdict on the next poll.
+type corroboration int
+
+const (
+	// corrEvict: the stat is rewrite evidence; the entry is dropped and the file re-peeked.
+	corrEvict corroboration = iota
+	// corrHold: the stat corroborates the verdict with no content read needed.
+	corrHold
+	// corrCheckHead: a positive verdict on a file that grew — consistent with an append, but a foreign
+	// session copied over the inode that ended up larger looks the same to {size, ctime}. The head
+	// fingerprint is what decides it, so the caller must re-read the leading window.
+	corrCheckHead
+)
+
+// corroborate reports what the live stat st says about a verdict reached under snap. hasHead is
+// whether the verdict carries a head fingerprint to fall back on when the file has grown.
 //
 // A NEGATIVE verdict is anchored rigidly: the file was shown not to be ours at exactly this
 // {size, ctime}, so either half moving means the bytes changed under the inode and the verdict is
@@ -83,20 +131,39 @@ func (ix *MembershipIndex) Lookup(dev, ino uint64, path string, st TranscriptSta
 // the peek's uid corroboration). A rewritten file's recorded cwd is no longer the one the verdict
 // was read from, so the entry goes and the next peek decides it again.
 //
-// Growth at an unchanged ctime is treated as an append: ctime granularity is coarse enough that two
-// observations of a busy transcript can share one, and refusing it would evict exactly the files the
-// cache is for while catching no rewrite the size test does not already see.
-func corroborates(state MembershipState, snap, st TranscriptStat) bool {
+// Growth alone, though, cannot tell an append from a foreign session copied over the inode that
+// happens to end up larger: both only grow the file and only move ctime forward. That is the one case
+// {size, ctime} leaves open, and it is closed by re-checking the head fingerprint (corrCheckHead). A
+// verdict that carries no head fingerprint (hasHead false) falls back to accepting the growth, the
+// same way the seal side inherits a floor it never fingerprinted — an anchor never taken can neither
+// confirm nor refute the growth.
+//
+// Growth at an unchanged ctime is treated as growth, not a rewrite: ctime granularity is coarse
+// enough that two observations of a busy transcript can share one, and the head check (or its
+// fallback) governs it either way.
+func corroborate(state MembershipState, snap, st TranscriptStat, hasHead bool) corroboration {
 	if state == MembershipNonMember {
-		return snap.Size == st.Size && snap.CtimeNanos == st.CtimeNanos
+		if snap.Size == st.Size && snap.CtimeNanos == st.CtimeNanos {
+			return corrHold
+		}
+		return corrEvict
 	}
 	if snap.UID != st.UID {
-		return false
+		return corrEvict
 	}
 	if st.Size == snap.Size {
-		return st.CtimeNanos == snap.CtimeNanos
+		if st.CtimeNanos == snap.CtimeNanos {
+			return corrHold
+		}
+		return corrEvict
 	}
-	return st.Size > snap.Size && st.CtimeNanos >= snap.CtimeNanos
+	if st.Size < snap.Size || st.CtimeNanos < snap.CtimeNanos {
+		return corrEvict
+	}
+	if !hasHead {
+		return corrHold
+	}
+	return corrCheckHead
 }
 
 // Record caches a decided verdict for the identity (dev, ino) seen at path, anchored to the stat

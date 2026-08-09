@@ -87,7 +87,33 @@ type Membership struct {
 	// Reason is the machine-readable cause of a negative verdict. Set only when State is
 	// MembershipNonMember.
 	Reason NonMemberReason
+	// Head is the content anchor a positive verdict carries: a bounded fingerprint of the transcript's
+	// leading bytes, taken at verdict time. {size, ctime} alone cannot tell an append from a foreign
+	// session copied over the inode that merely ends up larger — both only grow the file and move
+	// ctime forward — so the corroboration path re-reads this leading window when a cached member has
+	// grown and refuses the verdict if the bytes are a different session's. Set only when State is
+	// MembershipMember; a negative verdict is anchored rigidly to its {size, ctime} and needs no
+	// content anchor. This parallels the seal-side floor fingerprint (root_policy.go), which
+	// corroborates a forward-only floor by the bytes ending at it; here the anchored boundary is the
+	// file's head rather than a floor.
+	Head HeadFingerprint
 }
+
+// HeadFingerprint is a bounded hash of a transcript's leading bytes together with how many bytes it
+// covers. A zero Len means no head anchor was recorded, in which case a grown member falls back to
+// the stat-only append acceptance (an anchor never taken can neither confirm nor refute the growth,
+// the same stance the seal side takes for a floor it never fingerprinted).
+type HeadFingerprint struct {
+	// Hash is the FNV-1a hash of the first Len bytes — hashBytes, the same function the seal-floor
+	// fingerprint and the cursor anchor use.
+	Hash uint64
+	// Len is how many leading bytes Hash covers: min(bytes read at verdict time, membershipHeadLen).
+	// It is what the corroboration path re-reads, so a short member fingerprinted over fewer than
+	// membershipHeadLen bytes is compared over exactly those bytes.
+	Len int
+}
+
+func (h HeadFingerprint) present() bool { return h.Len > 0 }
 
 // TranscriptStat is the cheap stat evidence a cached verdict is anchored to: the owner uid the uid
 // corroboration compares, and the {size, ctime} pair the index re-corroborates every verdict — of
@@ -117,6 +143,15 @@ const (
 	// a 574-transcript store found first cwd records at byte offsets up to ~850KB, 1.7% of sessions
 	// past 256KB — a long pasted opening prompt or a burst of cwd-less bookkeeping precedes them.
 	maxPeekBytes int64 = DefaultMaxReadChunk
+	// membershipHeadLen bounds the leading-byte window a positive verdict is fingerprinted over, and
+	// with it the single bounded pread the corroboration path spends to confirm a grown member is an
+	// append rather than a foreign replacement. It is larger than the 64-byte seal-floor / cursor-
+	// anchor windows on purpose: those sit at a distinctive mid-file offset, whereas a transcript's
+	// first bytes are often shared opening bookkeeping, so the head window must span enough leading
+	// records to reach the session-identifying content (the first cwd / session_meta record) that
+	// tells one session from another. It stays far below maxPeekBytes, so an append never re-reads
+	// more than this to corroborate.
+	membershipHeadLen = 512
 )
 
 // MembershipPeeker answers the membership question for transcripts discovered beneath the recorded
@@ -194,6 +229,10 @@ func (p *MembershipPeeker) Peek(store, locator string, dev, ino uint64) (Members
 	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
 		return Membership{}, TranscriptStat{}, err
 	}
+	// The head fingerprint is taken once, over the bytes just read, and attached to a positive verdict
+	// so a later poll can tell an append from a foreign session copied over this inode. It costs
+	// nothing here — the bytes are already in hand.
+	hf := headFingerprintOf(head[:n])
 
 	// How far the scan reaches is the byte budget's business: a record that parsed but carried no
 	// cwd is ordinary transcript bookkeeping, and however many of them precede the cwd record they
@@ -203,7 +242,7 @@ func (p *MembershipPeeker) Peek(store, locator string, dev, ino uint64) (Members
 	for _, line := range splitJSONLines(head[:n]) {
 		cwd, found, parsed := peekCWD(line)
 		if found {
-			return p.classify(cwd, locator), st, nil
+			return withHead(p.classify(cwd, locator), hf), st, nil
 		}
 		if parsed {
 			failures = 0
@@ -373,11 +412,80 @@ func transcriptStatOf(f *os.File) (TranscriptStat, error) {
 
 // StatTranscript reads the same corroboration fields for a path the caller has not opened, for the
 // walk-side MembershipIndex lookup that decides whether a cached verdict still holds. It does not
-// follow a symlink; discovery has already refused symlinked transcripts.
+// follow a symlink; discovery has already refused symlinked transcripts. It stays a bare lstat — no
+// content read — so the common case (an idle or absent file) never touches a byte; the head anchor is
+// re-read lazily, only when a cached member has actually grown (see MembershipIndex.Lookup).
 func StatTranscript(path string) (TranscriptStat, error) {
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
 		return TranscriptStat{}, err
 	}
 	return TranscriptStat{Size: st.Size, CtimeNanos: st.Ctim.Nano(), UID: st.Uid}, nil
+}
+
+// headFingerprintOf fingerprints up to membershipHeadLen leading bytes of a head already read into
+// memory, for the peek that has the bytes in hand. A short transcript is fingerprinted whole; the
+// recorded Len is exactly what the corroboration path later re-reads and re-hashes.
+func headFingerprintOf(head []byte) HeadFingerprint {
+	n := len(head)
+	if n > membershipHeadLen {
+		n = membershipHeadLen
+	}
+	if n <= 0 {
+		return HeadFingerprint{}
+	}
+	return HeadFingerprint{Hash: hashBytes(head[:n]), Len: n}
+}
+
+// withHead attaches the head fingerprint to a positive verdict. A negative verdict is anchored to its
+// {size, ctime} alone — nothing legitimate rewrites a non-member in place and expects to stay one —
+// so it carries no content fingerprint.
+func withHead(m Membership, hf HeadFingerprint) Membership {
+	if m.State == MembershipMember {
+		m.Head = hf
+	}
+	return m
+}
+
+// HeadHasher re-reads the leading n bytes of the file behind a positive verdict and returns their
+// FNV-1a hash, so a grown member can be confirmed as an append (head unchanged) rather than refused
+// as a foreign replacement. n is the byte length the verdict's HeadFingerprint was recorded over. The
+// MembershipIndex invokes it only when a cached member's file has grown past its last observed length,
+// so an append pays exactly this one bounded read and never a full re-peek.
+type HeadHasher func(n int) (uint64, error)
+
+// OpenTranscriptHeadHasher builds a HeadHasher over the identity-validated transcript at
+// store/locator, opened through the same anchored, no-symlink, identity-checked path the peek uses,
+// so the live head hash is computed over exactly the bytes the peek fingerprinted. An error (the file
+// vanished, rotated to a new inode, or shrank below the recorded window) is returned to the index,
+// which treats it as a transient miss the same way it treats a failed peek: skip the file and
+// re-decide on the next poll.
+func OpenTranscriptHeadHasher(store, locator string, dev, ino uint64) HeadHasher {
+	return func(n int) (uint64, error) {
+		f, _, _, err := openValidatedTranscript(store, locator, dev, ino)
+		if err != nil {
+			return 0, err
+		}
+		defer f.Close()
+		return readHeadHash(f, n)
+	}
+}
+
+// readHeadHash reads exactly n leading bytes from an open transcript and hashes them with the same
+// FNV-1a the fingerprint was taken with. It reports io.ErrUnexpectedEOF when the file no longer holds
+// that many bytes (a shrink or rotation caught mid-poll), which the caller treats as a window it
+// cannot corroborate against rather than as a match.
+func readHeadHash(f *os.File, n int) (uint64, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	buf := make([]byte, n)
+	got, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return 0, err
+	}
+	if got < n {
+		return 0, io.ErrUnexpectedEOF
+	}
+	return hashBytes(buf), nil
 }

@@ -2,7 +2,10 @@
 
 package codex
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func memberVerdict(id string) Membership {
 	return Membership{State: MembershipMember, ProjectRootID: id}
@@ -12,9 +15,27 @@ func nonMemberVerdict(reason NonMemberReason) Membership {
 	return Membership{State: MembershipNonMember, Reason: reason}
 }
 
+// headHasherForPath re-reads the leading bytes of a real fixture file the same way the production
+// hasher does, so a grown member's head is corroborated over the identical bytes the peek fingerprinted.
+// Synthetic entries recorded without a head never grow into the corrCheckHead branch, so this is not
+// invoked for the paths that do not exist on disk.
+func headHasherForPath(path string) HeadHasher {
+	return func(n int) (uint64, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return 0, err
+		}
+		defer f.Close()
+		return readHeadHash(f, n)
+	}
+}
+
 func mustLookup(t *testing.T, ix *MembershipIndex, dev, ino uint64, path string, st TranscriptStat) Membership {
 	t.Helper()
-	m, ok := ix.Lookup(dev, ino, path, st)
+	m, ok, err := ix.Lookup(dev, ino, path, st, headHasherForPath(path))
+	if err != nil {
+		t.Fatalf("lookup(%d,%d,%q) error: %v", dev, ino, path, err)
+	}
 	if !ok {
 		t.Fatalf("lookup(%d,%d,%q) missed, want a cached verdict", dev, ino, path)
 	}
@@ -23,7 +44,11 @@ func mustLookup(t *testing.T, ix *MembershipIndex, dev, ino uint64, path string,
 
 func wantMiss(t *testing.T, ix *MembershipIndex, dev, ino uint64, path string, st TranscriptStat) {
 	t.Helper()
-	if m, ok := ix.Lookup(dev, ino, path, st); ok {
+	m, ok, err := ix.Lookup(dev, ino, path, st, headHasherForPath(path))
+	if err != nil {
+		t.Fatalf("lookup(%d,%d,%q) error: %v", dev, ino, path, err)
+	}
+	if ok {
 		t.Fatalf("lookup(%d,%d,%q) = %s, want a miss forcing a re-peek", dev, ino, path, m.State)
 	}
 }

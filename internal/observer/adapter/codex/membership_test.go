@@ -469,6 +469,86 @@ func TestIndexedMemberIsRePeekedAfterAnInPlaceRewrite(t *testing.T) {
 	}
 }
 
+// The residual the stat corroboration cannot close on its own: a foreign session copied over a
+// member's inode that ends up STRICTLY LARGER with a forward change time is, to {size, ctime} alone,
+// indistinguishable from an ordinary append — both only grow the file and only move ctime forward.
+// Anchoring the positive verdict to a bounded head fingerprint is what refuses it: the replacement's
+// leading bytes are a different session's, so the cached member verdict must be dropped and the file
+// re-peeked rather than treated as an append onto the member.
+func TestIndexedMemberIsRePeekedAfterALargerForeignReplacement(t *testing.T) {
+	store, project := t.TempDir(), t.TempDir()
+	// The date-sharded codex layout carries no directory witness, so the verdict turns purely on the
+	// cwd the content records — exactly the evidence a foreign replacement rewrites.
+	locator := filepath.Join("2026", "08", "09", "rollout-019c-0004.jsonl")
+	lines := []string{codexMetaLine(project)}
+	for i := 0; i < 8; i++ {
+		lines = append(lines, fillerLine(256))
+	}
+	path := writeTranscript(t, store, locator, lines...)
+	p := peekerFor(t, store, project)
+	ix := NewMembershipIndex()
+
+	dev, ino := identityOf(t, path)
+	m, st := mustPeek(t, p, store, locator)
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+	ix.Record(dev, ino, path, st, m)
+
+	// Copy a different, strictly larger session over the file: same inode, same path, a cwd in no
+	// registered root. Unlike a truncate or a shorter overwrite, the size only grows and the change
+	// time only moves forward, so the stat evidence alone reads exactly like an append.
+	foreign := t.TempDir()
+	body := codexMetaLine(foreign) + "\n"
+	for i := 0; i < 40; i++ {
+		body += fillerLine(256) + "\n"
+	}
+	writeFileString(t, path, body)
+	if dev2, ino2 := identityOf(t, path); dev2 != dev || ino2 != ino {
+		t.Fatalf("the replacement moved the identity to (%d,%d), want the original (%d,%d) — "+
+			"the fixture must exercise an in-place replacement, not a rename", dev2, ino2, dev, ino)
+	}
+	live := mustStat(t, path)
+	if live.Size <= st.Size || live.CtimeNanos < st.CtimeNanos {
+		t.Fatalf("fixture must grow the file with a forward ctime: live %+v, recorded %+v", live, st)
+	}
+
+	// The cached member verdict must NOT survive a growth-to-larger foreign replacement.
+	wantMiss(t, ix, dev, ino, path, live)
+
+	// The forced re-peek decides the file it is now, not the member it was.
+	m2, _ := mustPeek(t, p, store, locator)
+	wantVerdict(t, m2, MembershipNonMember, "", ReasonOutsideProjectRoots)
+}
+
+// An ordinary append must still corroborate against the head fingerprint without a full re-peek: the
+// leading bytes the fingerprint covers are untouched by an append, so the bounded anchor read matches
+// and the cached member verdict is kept.
+func TestIndexedMemberSurvivesAnAppendViaTheHeadFingerprint(t *testing.T) {
+	store, project := t.TempDir(), t.TempDir()
+	locator := filepath.Join("2026", "08", "09", "rollout-019c-0005.jsonl")
+	lines := []string{codexMetaLine(project)}
+	for i := 0; i < 8; i++ {
+		lines = append(lines, fillerLine(256))
+	}
+	path := writeTranscript(t, store, locator, lines...)
+	p := peekerFor(t, store, project)
+	ix := NewMembershipIndex()
+
+	dev, ino := identityOf(t, path)
+	m, st := mustPeek(t, p, store, locator)
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+	ix.Record(dev, ino, path, st, m)
+
+	// Grow the file the way a live session does: append records, leaving the head untouched.
+	appendString(t, path, fillerLine(256)+"\n")
+	grown := mustStat(t, path)
+	if grown.Size <= st.Size {
+		t.Fatalf("append did not grow the file: grown %+v, recorded %+v", grown, st)
+	}
+	if got := mustLookup(t, ix, dev, ino, path, grown); got != m {
+		t.Fatalf("verdict after an append = %+v, want the cached member %+v", got, m)
+	}
+}
+
 func TestPeekVanishedFileIsAnErrorNotAVerdict(t *testing.T) {
 	store, project := t.TempDir(), t.TempDir()
 	locator := "session.jsonl"
