@@ -31,7 +31,7 @@ type Record struct {
 }
 
 type document struct {
-	Schema string      `json:"schema"`
+	Schema string      `json:"schema_version"`
 	Roots  []rawRecord `json:"roots"`
 }
 
@@ -82,14 +82,19 @@ func Load(path string) ([]Record, error) {
 		if r.Generation == 0 {
 			return nil, fmt.Errorf("root policy record %d generation must be greater than zero", i)
 		}
-		canonical, err := filepath.EvalSymlinks(r.Path)
-		if err != nil {
+		canonical := filepath.Clean(r.Path)
+		resolved, err := filepath.EvalSymlinks(canonical)
+		if err == nil {
+			canonical = resolved
+			info, statErr := os.Stat(canonical)
+			if statErr != nil || !info.IsDir() {
+				return nil, fmt.Errorf("root policy record %d path must name a directory", i)
+			}
+		} else if r.Active || !os.IsNotExist(err) {
 			return nil, fmt.Errorf("resolve root policy record %d path: %w", i, err)
 		}
-		info, err := os.Stat(canonical)
-		if err != nil || !info.IsDir() {
-			return nil, fmt.Errorf("root policy record %d path must name an existing directory", i)
-		}
+		// An inactive record is a tombstone. Its directory may have been removed after consent
+		// was revoked, so preserve the clean explicit absolute spelling as its stable identity.
 		if _, ok := seen[canonical]; ok {
 			return nil, fmt.Errorf("root policy contains duplicate canonical root %q", canonical)
 		}

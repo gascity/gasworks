@@ -46,7 +46,7 @@ func runDaemon(args []string) int {
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
-	rootPolicyFile := fs.String("root-policy", "", "owner-supplied companion transcript root policy (mutually exclusive with -approved-root)")
+	rootPolicyFile := fs.String("root-policy-file", "", "owner-supplied companion transcript root policy (mutually exclusive with -approved-root)")
 	cursorDir := fs.String("cursor-dir", "", "transcript cursor state dir (required with -approved-root)")
 	// The watcher re-walks and stats every file under the approved roots on each poll (change
 	// detection is a bounded poll, not fsnotify), so its steady-state CPU is O(files under the roots)
@@ -63,7 +63,7 @@ func runDaemon(args []string) int {
 		return 2
 	}
 	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy and -approved-root are mutually exclusive")
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy-file and -approved-root are mutually exclusive")
 		return 2
 	}
 	var policyRecords []rootpolicy.Record
@@ -75,7 +75,7 @@ func runDaemon(args []string) int {
 			return 2
 		}
 		if *cursorDir == "" {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy")
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy-file")
 			return 2
 		}
 	}
@@ -109,7 +109,7 @@ func runDaemon(args []string) int {
 		cfg.Upload = &daemon.UploadLoopConfig{Sender: client}
 		if *contentUpload {
 			if len(approvedRoots) == 0 && len(policyRecords) == 0 {
-				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root or -root-policy; running metadata-only")
+				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
 			} else {
 				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
 				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
