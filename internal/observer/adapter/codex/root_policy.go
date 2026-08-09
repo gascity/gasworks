@@ -210,9 +210,13 @@ func (s *rootPolicyState) setBaseline(locator string, dev, ino uint64, b baselin
 
 // setLineage points a locator at the floor the identity now sitting there is sealed over. A floor at
 // byte zero has no pre-consent prefix beneath it and so carries nothing worth inheriting: it drops
-// the entry instead, which is also how a truncation all the way to zero lowers a lineage.
+// the entry instead, which is also how a truncation all the way to zero lowers a lineage - but only
+// for the identity the fence names, because fenceHolds turns every other write into a ratchet.
 func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baselineRecord) {
 	if locator == "" {
+		return
+	}
+	if s.fenceHolds(locator, dev, ino, b.Floor) {
 		return
 	}
 	if b.Floor <= 0 {
@@ -233,6 +237,42 @@ func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baseline
 		Device:          dev,
 		Inode:           ino,
 	}
+}
+
+// liveFence returns the fence standing at a locator right now, which is the only kind of entry that
+// fences anything: one recorded in the CURRENT consent generation (a re-registration mints a new
+// generation, and consent given again is consent to reseal) over a floor above byte zero (a floor at
+// zero has no pre-consent prefix beneath it).
+func (s *rootPolicyState) liveFence(locator string) (sealLineage, bool) {
+	lin, ok := s.control.Lineages[locator]
+	if !ok || lin.Generation != s.control.Generation || lin.Floor <= 0 {
+		return sealLineage{}, false
+	}
+	return lin, true
+}
+
+// fenceHolds reports that a live fence at locator must NOT be written down to floor on behalf of
+// (dev,ino), and it is the whole of the ratchet: a live fence is lowered - or, at a floor of zero,
+// deleted - only by the very identity it names.
+//
+// The identity is the distinction, because it is what says where the sealed bytes are (bd-main-9xl).
+// A sealed file that shrinks its OWN floor really did destroy the bytes above it: an in-place
+// truncation or a rewrite beneath the floor leaves nothing anywhere for the fence to protect, and
+// lowering there is honest bookkeeping that the reseal diagnostic reports (A22). Any OTHER identity
+// at that locator is a replacement standing where a sealed transcript used to be, and its own end of
+// file says nothing about the sealed bytes: those are alive in the file that rotated away, which is
+// the whole reason the name it left keeps a fence through its retirement window. Resealing at the
+// replacement's size cut that floor down to the interposed file's length - or deleted the fence
+// outright when the interposition held no bytes at all - and the next copy of the owner's pre-consent
+// history put back at the name inherited the cut floor and published everything above it. So a
+// replacement may RAISE a fence or hold it, never cut beneath it, and absence still un-fences a
+// locator through retireAbsentLineages alone.
+func (s *rootPolicyState) fenceHolds(locator string, dev, ino uint64, floor int64) bool {
+	cur, fenced := s.liveFence(locator)
+	if !fenced || (cur.Device == dev && cur.Inode == ino) {
+		return false
+	}
+	return floor < cur.Floor
 }
 
 // dropBaseline releases one identity's floor while deliberately LEAVING the locator's lineage in
@@ -259,12 +299,22 @@ func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
 // two holds in one walk can contend: each names the locator its own file occupies. That is what the
 // deferred staging this replaced was for — with no vacates left there is nothing to order, nothing to
 // hold back from a walk that ended early, and nothing left in memory by a panic mid-walk.
+//
+// "Only ever adds" is an invariant, so it is checked rather than assumed: one sealed transcript can
+// arrive at a name ANOTHER one's fence still covers (a swap, or a rename onto a name inside its
+// retirement window), and writing its own lower floor there would cut a live fence down on behalf of
+// an identity that is not the one it names — the same lowering bd-main-9xl closed everywhere else. The
+// arriving file is fenced by its own identity-keyed floor either way; the locator keeps the higher
+// fence until retirement clears it.
 func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
 	if locator == "" {
 		return
 	}
 	base, sealed := s.baseline(dev, ino)
 	if !sealed || base.Floor <= 0 {
+		return
+	}
+	if s.fenceHolds(locator, dev, ino, base.Floor) {
 		return
 	}
 	lin := sealLineage{
@@ -294,11 +344,7 @@ func (s *rootPolicyState) lineage(locator string) (sealLineage, bool) {
 	if !s.control.Committed || s.record.Mode != rootpolicy.ForwardOnly || locator == "" {
 		return sealLineage{}, false
 	}
-	lin, ok := s.control.Lineages[locator]
-	if !ok || lin.Generation != s.control.Generation || lin.Floor <= 0 {
-		return sealLineage{}, false
-	}
-	return lin, true
+	return s.liveFence(locator)
 }
 
 // retireAbsentLineages drops the lineage of every locator that absenceEvictionPolls consecutive

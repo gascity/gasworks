@@ -242,8 +242,10 @@ func TestDisplacementWithAnAmbiguousIdentityFailsClosed(t *testing.T) {
 // TestTwoTranscriptsExchangingPathsKeepBothFences is the second half of F2. When two sealed files swap
 // names the walk reports two renames whose sources and destinations are each other's, and applying
 // them one at a time let the second overwrite what the first had just written - so the identity guard
-// rejected it and one fence was dropped on the floor. Both files are sealed; both fences have to land
-// where their file did.
+// rejected it and one fence was dropped on the floor. Both files are sealed; the exchange has to leave
+// both floors intact and neither name unfenced. Where each fence lands is bounded below by the ratchet
+// (bd-main-9xl): an arriving file raises a name's fence or holds it, and only the identity a fence
+// names may cut it.
 func TestTwoTranscriptsExchangingPathsKeepBothFences(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
@@ -277,15 +279,23 @@ func TestTwoTranscriptsExchangingPathsKeepBothFences(t *testing.T) {
 	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor != int64(len(preB)) {
 		t.Fatalf("lineage at a.jsonl = %+v/%v, want b's fence to have followed it there", got, ok)
 	}
-	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Device != devA || got.Inode != inoA || got.Floor != int64(len(preA)) {
-		t.Fatalf("lineage at b.jsonl = %+v/%v, want a's fence to have followed it there", got, ok)
+	// b.jsonl is where a's file went, but a's floor is LOWER than the fence already standing at that
+	// name, and a live fence is cut only by the identity it names (bd-main-9xl): b's sealed bytes are
+	// alive at a.jsonl, so the name they left keeps the higher fence until retirement clears it. Both
+	// locators stay fenced and both floors survive, which is what this probe turns on - the bug it
+	// names dropped one of them on the floor.
+	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Floor < int64(len(preB)) {
+		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence still standing at the name b left", got, ok)
+	}
+	if got, ok := control.Baselines[identityString(devA, inoA)]; !ok || got.Floor != int64(len(preA)) {
+		t.Fatalf("a's baseline = %+v/%v, want its own floor %d intact wherever it now lives", got, ok, len(preA))
 	}
 	if got := sink.all(); len(got) != 0 {
 		t.Fatalf("exchange delivered %d candidates, want none - neither file changed", len(got))
 	}
 
-	// Each fence is still standing where its file is: an atomic rewrite of either locator inherits the
-	// floor rather than publishing the pre-consent bytes it kept.
+	// The fence at a.jsonl is standing where b's file is: an atomic rewrite there inherits the floor
+	// rather than publishing the pre-consent bytes it kept.
 	replaceViaRename(t, a, preB+msgLine("appended-by-the-rewrite")+"\n")
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("post-exchange rewrite poll: %v", err)
@@ -641,7 +651,9 @@ func TestRotationOutOfTheRootIngestsFromZeroOnlyAfterCorroboratedEmptyWalks(t *t
 // bd-main-37y removed the vacate entirely - a rename copies its fence to the destination and leaves
 // the source lineage to retirement - so what this now holds is the property that made vacates
 // unstageable in the first place: an errored reconcile leaves every fence standing, and the next
-// complete walk still converges each one onto the locator its file occupies. Kept unmodified.
+// complete walk still leaves every occupied name fenced at no less than the floor that stood there.
+// Restaged for the ratchet (bd-main-9xl): where an arriving file's own floor is lower than the fence
+// already standing at the name it lands on, the higher fence holds.
 func TestErroredReconcileKeepsEveryStagedVacate(t *testing.T) {
 	ctx := context.Background()
 	root, state, scratch := t.TempDir(), t.TempDir(), t.TempDir()
@@ -704,18 +716,29 @@ func TestErroredReconcileKeepsEveryStagedVacate(t *testing.T) {
 	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor != int64(len(preB)) {
 		t.Fatalf("lineage at a.jsonl = %+v/%v, want b's fence to have followed it there", got, ok)
 	}
-	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Device != devA || got.Inode != inoA || got.Floor != int64(len(preA)) {
-		t.Fatalf("lineage at b.jsonl = %+v/%v, want a's fence to have followed it there", got, ok)
+	// b.jsonl holds a's file now, but a's floor is lower than the fence already standing at that name,
+	// and only the identity a fence names may cut it (bd-main-9xl) - b's sealed bytes are alive at
+	// a.jsonl. What this probe turns on is unchanged: an errored reconcile leaves no locator unfenced.
+	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Floor < int64(len(preB)) {
+		t.Fatalf("lineage at b.jsonl = %+v/%v, want the higher fence still standing there", got, ok)
+	}
+	if got, ok := control.Baselines[identityString(devA, inoA)]; !ok || got.Floor != int64(len(preA)) {
+		t.Fatalf("a's baseline = %+v/%v, want its own floor %d intact after the errored reconcile", got, ok, len(preA))
 	}
 
-	// The fence at b.jsonl is real: an atomic rewrite there inherits a's floor instead of publishing
-	// the pre-consent history the errored poll left sitting unfenced.
+	// The fence at b.jsonl is real: an atomic rewrite there is resealed at its own end of file instead
+	// of publishing the pre-consent history the errored poll left sitting unfenced. An unfenced locator
+	// would have delivered preA's record from byte zero.
+	diagsBefore := len(diagnostics(sink.all()))
 	replaceViaRename(t, b, preA+msgLine("appended-by-the-rewrite")+"\n")
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("post-recovery rewrite poll: %v", err)
 	}
-	if got := sink.messages(); len(got) != 1 || got[0] != "appended-by-the-rewrite" {
-		t.Fatalf("messages = %v, want only the record appended above a's inherited floor", got)
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want nothing published from a rewrite beneath a standing fence", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != diagsBefore+1 {
+		t.Fatalf("diagnostics = %d, want one more than the %d before the rewrite", len(got), diagsBefore)
 	}
 }
 
