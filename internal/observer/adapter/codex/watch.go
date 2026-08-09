@@ -383,13 +383,18 @@ func (w *Watcher) Poll(ctx context.Context) error {
 // descended and its would-be transcript is simply never discovered (refused by absence). It
 // performs only readdir and stat — never a content read — so steady-state discovery is bounded by
 // the directory tree size, not transcript size. It returns the tracked files in a deterministic
-// order.
+// order. A forward-only activation fails closed on every traversal or stat uncertainty, because
+// its durable baseline is valid only after the entire explicitly registered root was seen.
 func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	present := map[identityKey]struct{}{}
 	for _, root := range w.cfg.ApprovedRoots {
 		policy := w.rootPolicies[root]
+		forwardActivating := policy != nil && policy.record.Mode == rootpolicy.ForwardOnly && !policy.control.Committed
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
+				if forwardActivating {
+					return fmt.Errorf("walk %s: %w", path, walkErr)
+				}
 				return nil // skip an unreadable entry; keep walking the rest of the tree
 			}
 			if d.IsDir() {
@@ -398,6 +403,9 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			name := d.Name()
 			info, err := os.Stat(path)
 			if err != nil {
+				if forwardActivating {
+					return fmt.Errorf("stat %s: %w", path, err)
+				}
 				return nil // vanished mid-walk; a later poll re-discovers it
 			}
 			dev, ino, ok := fileIdentityOf(info)
@@ -406,9 +414,27 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			}
 			key := identityKey{dev: dev, ino: ino}
 			tf, isTracked := w.tracked[key]
+			if forwardActivating && info.Mode().IsRegular() {
+				lstat, err := os.Lstat(path)
+				if err != nil {
+					return fmt.Errorf("lstat %s: %w", path, err)
+				}
+				if lstat.Mode().IsRegular() {
+					cur, forwardBaseline, err := w.cursorFor(policy, dev, ino, info.Size(), info.ModTime().UnixNano())
+					if err != nil {
+						return err
+					}
+					if isTracked {
+						tf.cursor = cur
+						tf.forwardBaseline = forwardBaseline
+					}
+				}
+			}
 			// Match gates DISCOVERY only. An already-tracked file whose name stops matching after a
 			// rename must stay tracked so its unread tail is still drained — dropping it by name
-			// would silently lose that tail. New (untracked) non-matching files are skipped.
+			// would silently lose that tail. New (untracked) non-matching files are skipped, except
+			// that an uncommitted forward-only activation seals every regular identity above so a
+			// later rename cannot expose bytes that existed before consent.
 			if !isTracked && w.cfg.Match != nil && !w.cfg.Match(name) {
 				return nil
 			}

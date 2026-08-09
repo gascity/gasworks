@@ -54,6 +54,102 @@ func TestForwardOnlyBaselineUsesStatOnlyAndNeverObservesWholeContent(t *testing.
 	}
 }
 
+func TestForwardOnlyBaselinesNonmatchingIdentityBeforeItIsRenamedToJSONL(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	staged := filepath.Join(root, "session.tmp")
+	transcript := filepath.Join(root, "session.jsonl")
+	pre := msgLine("before-consent") + "\n"
+	post := msgLine("after-consent") + "\n"
+	writeFileString(t, staged, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state,
+		Sink:         sink,
+		Match:        func(name string) bool { return filepath.Ext(name) == ".jsonl" },
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	if len(reads) != 0 || len(sink.messages()) != 0 {
+		t.Fatalf("activation read/capture = %v/%v, want zero", reads, sink.messages())
+	}
+
+	if err := os.Rename(staged, transcript); err != nil {
+		t.Fatalf("rename staged transcript: %v", err)
+	}
+	appendString(t, transcript, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("renamed transcript poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want post-consent bytes only", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-consent" {
+		t.Fatalf("messages = %v, want post-consent record only", got)
+	}
+}
+
+func TestForwardOnlyIncompleteActivationDoesNotCommitOrDrainEarlierBytes(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	transcript := filepath.Join(root, "session.jsonl")
+	blocker := filepath.Join(root, "z-stat-failure.jsonl")
+	pre := msgLine("before-incomplete-activation") + "\n"
+	during := msgLine("while-activation-incomplete") + "\n"
+	post := msgLine("after-complete-activation") + "\n"
+	writeFileString(t, transcript, pre)
+	if err := os.Symlink(filepath.Join(root, "missing-target"), blocker); err != nil {
+		t.Fatalf("create dangling symlink: %v", err)
+	}
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state,
+		Sink:         sink,
+		Match:        func(name string) bool { return filepath.Ext(name) == ".jsonl" },
+	})
+	if err := w.Poll(ctx); err == nil {
+		t.Fatal("activation poll succeeded despite stat failure")
+	}
+	if w.rootPolicies[root].control.Committed {
+		t.Fatal("activation marker committed despite incomplete traversal")
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("incomplete activation captured %v", got)
+	}
+
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("remove stat-failure symlink: %v", err)
+	}
+	appendString(t, transcript, during)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("completed activation poll: %v", err)
+	}
+	if !w.rootPolicies[root].control.Committed {
+		t.Fatal("activation marker was not committed after complete traversal")
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("completed activation captured pre-consent bytes %v", got)
+	}
+
+	appendString(t, transcript, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-activation poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-complete-activation" {
+		t.Fatalf("messages = %v, want only bytes appended after complete activation", got)
+	}
+}
+
 func TestForwardOnlyLostCursorResealsFromCommittedRootFloor(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
