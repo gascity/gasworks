@@ -120,6 +120,17 @@ type rootPolicyState struct {
 	// this process gathered, and a restart re-gathers it rather than retiring a fence on a
 	// predecessor's word.
 	absentLineagePolls map[string]int
+	// pendingShifts holds the fence relocations one walk discovered, applied together once the whole
+	// walk has been reconciled. See applyLineageShifts.
+	pendingShifts []lineageShift
+}
+
+// lineageShift is one staged fence relocation: release the locator a sealed identity left (vacate,
+// empty when it left nothing) and fence the locator it now holds (hold).
+type lineageShift struct {
+	vacate string
+	hold   string
+	lin    sealLineage
 }
 
 func rootPolicyID(root string) string {
@@ -245,21 +256,87 @@ func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
 }
 
 // moveLineage follows a renamed transcript. The sealed content the lineage describes moved with the
-// file, so afterwards a new inode at the OLD path is a genuinely new transcript while one at the new
-// path is a rewrite candidate.
+// file, so afterwards a new inode at the OLD path is a rewrite candidate no longer, while one at the
+// new path is.
+//
+// The move is STAGED rather than applied, because one walk can report several moves whose sources and
+// destinations are each other's: two files that exchange names produce exactly that, and applying each
+// move as it is discovered let the second overwrite the destination the first had just written, whose
+// identity guard then rejected it and dropped a fence on the floor (bd-main-x6u F2). Staging also lets
+// a locator that a reseal has since taken over keep its new fence: applyLineageShifts releases a
+// vacated locator only if it still carries the very lineage that left it.
 func (s *rootPolicyState) moveLineage(oldLocator, newLocator string, dev, ino uint64) {
 	if oldLocator == "" || oldLocator == newLocator {
 		return
 	}
 	lin, ok := s.control.Lineages[oldLocator]
 	if !ok || lin.Device != dev || lin.Inode != ino {
+		// The old locator no longer carries this identity's fence — a file left in its place has
+		// already resealed onto it this poll. The identity is still sealed, so the floor it carries
+		// still has to fence wherever it has gone; there is simply nothing to release behind it.
+		s.holdLineage(newLocator, dev, ino)
 		return
 	}
-	delete(s.control.Lineages, oldLocator)
-	if newLocator != "" {
-		s.control.Lineages[newLocator] = lin
-	}
+	s.pendingShifts = append(s.pendingShifts, lineageShift{vacate: oldLocator, hold: newLocator, lin: lin})
 	s.dirty = true
+}
+
+// holdLineage fences a locator a sealed identity occupies without releasing anything, for the case
+// where the identity did not move away from anywhere: a second hard link to a sealed file gives one
+// identity two live locators at once, and treating the second as a rename of the first retired the
+// fence at a path that still holds the sealed bytes.
+func (s *rootPolicyState) holdLineage(locator string, dev, ino uint64) {
+	if locator == "" {
+		return
+	}
+	base, sealed := s.baseline(dev, ino)
+	if !sealed || base.Floor <= 0 {
+		return
+	}
+	lin := sealLineage{
+		Floor:           base.Floor,
+		FingerprintHash: base.FingerprintHash,
+		FingerprintLen:  base.FingerprintLen,
+		Generation:      s.control.Generation,
+		Device:          dev,
+		Inode:           ino,
+	}
+	if cur, known := s.control.Lineages[locator]; known && cur == lin {
+		return
+	}
+	s.pendingShifts = append(s.pendingShifts, lineageShift{hold: locator, lin: lin})
+	s.dirty = true
+}
+
+// applyLineageShifts commits one walk's staged fence relocations: every vacated locator is released
+// first, then every held locator is fenced. Doing it in that order — and only after the whole walk has
+// been reconciled — is what lets fences cross over each other without either being lost. A vacated
+// locator whose lineage is no longer the one that left it has been taken over since (a replacement
+// resealed onto it), and is kept.
+func (s *rootPolicyState) applyLineageShifts() {
+	if len(s.pendingShifts) == 0 {
+		return
+	}
+	for _, sh := range s.pendingShifts {
+		if sh.vacate == "" {
+			continue
+		}
+		if cur, ok := s.control.Lineages[sh.vacate]; ok && cur == sh.lin {
+			delete(s.control.Lineages, sh.vacate)
+		}
+	}
+	for _, sh := range s.pendingShifts {
+		if sh.hold == "" {
+			continue
+		}
+		if s.control.Lineages == nil {
+			s.control.Lineages = map[string]sealLineage{}
+		}
+		// Deliberately not subject to maxSealLineages: the cap declines to admit fences for locators
+		// nothing has fenced yet, and must never drop one that is already established.
+		s.control.Lineages[sh.hold] = sh.lin
+	}
+	s.pendingShifts = s.pendingShifts[:0]
 }
 
 // lineage returns the sealed floor a new identity discovered at locator may inherit. Like baseline
@@ -310,6 +387,18 @@ func (s *rootPolicyState) retireAbsentLineages(seen map[string]struct{}) {
 			delete(s.absentLineagePolls, locator)
 		}
 	}
+}
+
+// observedLocatorEmpty reports whether a complete, error-free walk that lost nothing under it has
+// positively found this locator EMPTY since the fence there was recorded. It is the positive newness
+// evidence a displaced lineage needs before the file now standing at the vacated locator may be
+// captured from byte zero (A1-v2, bd-main-x6u): the sealed identity being alive elsewhere says where
+// the sealed bytes went, and only an observation of the locator standing empty says that what is there
+// now arrived after they left. The counter it reads is the retirement streak, which is cleared the
+// moment a walk finds the locator occupied — and a fence is only ever recorded over an occupied
+// locator — so a non-zero count cannot predate the fence it is consulted for.
+func (s *rootPolicyState) observedLocatorEmpty(locator string) bool {
+	return s.absentLineagePolls[locator] > 0
 }
 
 // forgetLineageAbsence discards the retirement evidence gathered so far, because the walk that just

@@ -1,0 +1,485 @@
+//go:build unix
+
+package codex
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/gascity/gasworks/internal/observer/rootpolicy"
+)
+
+// TestSedInPlaceBackupNeverPublishesTheEditedPreConsentHistory is the bd-main-x6u probe. `sed -i.bak`
+// leaves the untouched ORIGINAL inode at a.jsonl.bak and writes the EDITED text into a brand-new inode
+// at a.jsonl. Displacement sees the lineage's identity alive at the .bak locator and used to read that
+// as "whatever is at a.jsonl now must be new" - so the file it captured from byte zero was the owner's
+// own pre-consent history with an edit applied, which is exactly the redaction case A1-v2 was written
+// to prevent. An identity being alive elsewhere says where the sealed bytes went; it says nothing
+// about what is standing at the locator they left.
+func TestSedInPlaceBackupNeverPublishesTheEditedPreConsentHistory(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "a.jsonl")
+	bak := filepath.Join(root, "a.jsonl.bak")
+	pre := msgLine("pre-consent-secret-one") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	sealedDev, sealedIno := identityOf(t, p)
+
+	if err := os.Rename(p, bak); err != nil {
+		t.Fatal(err)
+	}
+	edited := msgLine("pre-consent-secret-one") + "\n" + msgLine("redacted-and-longer-than-the-line-it-replaced") + "\n"
+	writeFileString(t, p, edited)
+
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("sed -i.bak poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want nothing read below either file's floor", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want no pre-consent record delivered from an edited copy", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one ingestion-loss diagnostic for the resealed locator", len(got))
+	}
+	control := readRootControl(t, state, root)
+	if _, ok := control.Lineages["a.jsonl.bak"]; !ok {
+		t.Fatalf("lineages = %+v, want the fence to have followed the untouched original to .bak", control.Lineages)
+	}
+	if got, ok := control.Baselines[identityString(sealedDev, sealedIno)]; !ok || got.Floor != int64(len(pre)) {
+		t.Fatalf("original baseline = %+v/%v, want its floor %d intact at .bak", got, ok, len(pre))
+	}
+	editedDev, editedIno := identityOf(t, p)
+	if got, ok := control.Baselines[identityString(editedDev, editedIno)]; !ok || got.Floor != int64(len(edited)) {
+		t.Fatalf("edited-file baseline = %+v/%v, want a reseal at its EOF %d", got, ok, len(edited))
+	}
+
+	post := msgLine("written-after-the-edit") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-edit append poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "written-after-the-edit" {
+		t.Fatalf("messages = %v, want only what was written after the reseal", got)
+	}
+}
+
+// TestSedInPlaceBackupThatLeavesTheSealedWindowIntactInheritsTheFloor is the same displacement with an
+// edit that does not shift the window ending at the floor. The replacement's own bytes then
+// demonstrably ARE the sealed prefix, so the corroborated-window fence decides it: the floor is
+// inherited at the vacated locator and nothing beneath it is delivered - the displacement check never
+// gets to weigh in.
+func TestSedInPlaceBackupThatLeavesTheSealedWindowIntactInheritsTheFloor(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "a.jsonl")
+	bak := filepath.Join(root, "a.jsonl.bak")
+	pre := msgLine("pre-consent-secret-one") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	if err := os.Rename(p, bak); err != nil {
+		t.Fatal(err)
+	}
+	// Same length, and the edit lands far enough from the end that the fingerprinted window is
+	// byte-identical.
+	edited := msgLine("pre-consent-REDACTED-1") + "\n" + msgLine("pre-consent-secret-two") + "\n"
+	if len(edited) != len(pre) {
+		t.Fatalf("staging error: edited length %d != sealed length %d", len(edited), len(pre))
+	}
+	writeFileString(t, p, edited)
+
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("window-preserving edit poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want nothing read below the inherited floor", reads)
+	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("delivered %d candidates, want none for a replacement that corroborates as the sealed prefix", len(got))
+	}
+	editedDev, editedIno := identityOf(t, p)
+	control := readRootControl(t, state, root)
+	if got, ok := control.Baselines[identityString(editedDev, editedIno)]; !ok || got.Floor != int64(len(pre)) {
+		t.Fatalf("edited-file baseline = %+v/%v, want the sealed floor %d inherited", got, ok, len(pre))
+	}
+}
+
+// TestHardLinkedTranscriptRewriteIsNeverCapturedFromByteZero is the bd-main-x6u F2 probe. `ln a.jsonl
+// b.jsonl` gives ONE identity two locators, and a scan that records only one path per identity has to
+// throw one of them away: the fence at the discarded locator went with it, so an atomic rewrite of
+// that link found no lineage at all and was captured from byte zero. A hard link is not a rename - the
+// identity did not leave anything behind - so both locators stay fenced and the rewritten one reseals.
+func TestHardLinkedTranscriptRewriteIsNeverCapturedFromByteZero(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	a, b := filepath.Join(root, "a.jsonl"), filepath.Join(root, "b.jsonl")
+	pre := msgLine("pre-consent-secret-behind-two-links") + "\n"
+	writeFileString(t, a, pre)
+	if err := os.Link(a, b); err != nil {
+		t.Skipf("hard links unavailable on this filesystem: %v", err)
+	}
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	control := readRootControl(t, state, root)
+	for _, link := range []string{"a.jsonl", "b.jsonl"} {
+		if _, ok := control.Lineages[link]; !ok {
+			t.Fatalf("lineages = %+v, want every link of a sealed identity fenced", control.Lineages)
+		}
+	}
+
+	// The owner rewrites one link in place the way every editor does. b.jsonl still holds the original
+	// identity and the original pre-consent bytes.
+	replaceViaRename(t, a, msgLine("the-rewrite-that-must-not-be-published")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rewrite poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want the rewritten link resealed, not read from byte zero", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want nothing published from a rewritten link of a sealed file", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one ingestion-loss diagnostic", len(got))
+	}
+}
+
+// TestDisplacementWithAnAmbiguousIdentityFailsClosed covers the other half of F2. With three links,
+// unlinking one and creating a file in its place gives the watcher everything a byte-zero ingest asks
+// for - a corroborated walk that saw the locator EMPTY, and the sealed identity alive elsewhere - but
+// "elsewhere" is two places at once. An identity at several locators names nowhere in particular, so
+// it is not usable as evidence that anything moved, and the new file takes the fail-closed reseal
+// instead of being published.
+func TestDisplacementWithAnAmbiguousIdentityFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	a := filepath.Join(root, "a.jsonl")
+	pre := msgLine("pre-consent-secret-behind-three-links") + "\n"
+	writeFileString(t, a, pre)
+	for _, link := range []string{"b.jsonl", "c.jsonl"} {
+		if err := os.Link(a, filepath.Join(root, link)); err != nil {
+			t.Skipf("hard links unavailable on this filesystem: %v", err)
+		}
+	}
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	if err := os.Remove(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("empty-locator poll: %v", err)
+	}
+	if got := w.rootPolicies[root].absentLineagePolls["a.jsonl"]; got != 1 {
+		t.Fatalf("empty-walk streak = %d, want the locator positively observed empty once", got)
+	}
+
+	writeFileString(t, a, msgLine("a-file-created-where-a-multiply-linked-identity-was")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("new-file poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want an ambiguous displacement to fence rather than publish", got)
+	}
+	control := readRootControl(t, state, root)
+	for _, link := range []string{"b.jsonl", "c.jsonl"} {
+		if _, ok := control.Lineages[link]; !ok {
+			t.Fatalf("lineages = %+v, want the surviving links still fenced", control.Lineages)
+		}
+	}
+}
+
+// TestTwoTranscriptsExchangingPathsKeepBothFences is the second half of F2. When two sealed files swap
+// names the walk reports two renames whose sources and destinations are each other's, and applying
+// them one at a time let the second overwrite what the first had just written - so the identity guard
+// rejected it and one fence was dropped on the floor. Both files are sealed; both fences have to land
+// where their file did.
+func TestTwoTranscriptsExchangingPathsKeepBothFences(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	a, b := filepath.Join(root, "a.jsonl"), filepath.Join(root, "b.jsonl")
+	preA := msgLine("pre-consent-secret-in-a") + "\n"
+	preB := msgLine("pre-consent-secret-in-b-which-is-a-different-length") + "\n"
+	writeFileString(t, a, preA)
+	writeFileString(t, b, preB)
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	devA, inoA := identityOf(t, a)
+	devB, inoB := identityOf(t, b)
+
+	swap := filepath.Join(root, "swap.tmp")
+	for _, mv := range [][2]string{{a, swap}, {b, a}, {swap, b}} {
+		if err := os.Rename(mv[0], mv[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("exchange poll: %v", err)
+	}
+	control := readRootControl(t, state, root)
+	if got, ok := control.Lineages["a.jsonl"]; !ok || got.Device != devB || got.Inode != inoB || got.Floor != int64(len(preB)) {
+		t.Fatalf("lineage at a.jsonl = %+v/%v, want b's fence to have followed it there", got, ok)
+	}
+	if got, ok := control.Lineages["b.jsonl"]; !ok || got.Device != devA || got.Inode != inoA || got.Floor != int64(len(preA)) {
+		t.Fatalf("lineage at b.jsonl = %+v/%v, want a's fence to have followed it there", got, ok)
+	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("exchange delivered %d candidates, want none - neither file changed", len(got))
+	}
+
+	// Each fence is still standing where its file is: an atomic rewrite of either locator inherits the
+	// floor rather than publishing the pre-consent bytes it kept.
+	replaceViaRename(t, a, preB+msgLine("appended-by-the-rewrite")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-exchange rewrite poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "appended-by-the-rewrite" {
+		t.Fatalf("messages = %v, want only the record appended above b's inherited floor", got)
+	}
+}
+
+// TestRotationToAnEarlierNameInOnePollWindowResealsTheVacatedLocator holds the F1 semantics under the
+// walk order that hides the evidence. When the sealed file is renamed to a name that sorts BEFORE the
+// one it left, the walk reconciles the rename first - and a fence relocated on the spot is gone by the
+// time the file standing at the vacated locator is looked at, which reads as a locator no fence ever
+// covered and captures it from byte zero. Staging the relocation until the whole walk is reconciled is
+// what keeps that file answerable to the fence it displaced.
+func TestRotationToAnEarlierNameInOnePollWindowResealsTheVacatedLocator(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	rotated := filepath.Join(root, "a-rotated.jsonl")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	// Both filesystem operations land inside one poll window, so no walk ever sees session.jsonl empty.
+	if err := os.Rename(p, rotated); err != nil {
+		t.Fatal(err)
+	}
+	writeFileString(t, p, msgLine("whatever-is-standing-here-now")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("rotation poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want the unwitnessed replacement resealed", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want nothing published from a locator that was never observed empty", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one ingestion-loss diagnostic", len(got))
+	}
+	control := readRootControl(t, state, root)
+	if got, ok := control.Lineages["a-rotated.jsonl"]; !ok || got.Floor != int64(len(pre)) {
+		t.Fatalf("lineage at a-rotated.jsonl = %+v/%v, want the sealed floor %d to have followed it", got, ok, len(pre))
+	}
+}
+
+// TestSuccessiveRenameRacingWalksDoNotReleaseATrackedIdentity is the bd-main-x6u F3 probe. A walk that
+// lost an entry between readdir and stat is not evidence about anything, which the lineage-retirement
+// side already knows - but the identity-absence counter took the same walk as proof the file was gone.
+// Two of them in a row (a rename racing each poll) reached the eviction threshold, released the durable
+// floor, and the identity was then re-tracked from byte zero.
+func TestSuccessiveRenameRacingWalksDoNotReleaseATrackedIdentity(t *testing.T) {
+	ctx := context.Background()
+	root, state, away := t.TempDir(), t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret-that-must-never-be-delivered") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink, ContentObserver: obs,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	dev, ino := identityOf(t, p)
+	sealed := mustBaseline(t, readRootControl(t, state, root), p)
+
+	// The tracked file is out of the root, and every walk while it is away loses an entry between
+	// readdir and stat - a rename in flight, staged here as the same ENOENT a dangling symlink gives.
+	hidden := filepath.Join(away, "session.jsonl")
+	if err := os.Rename(p, hidden); err != nil {
+		t.Fatal(err)
+	}
+	inflight := filepath.Join(root, "z-in-flight.jsonl")
+	if err := os.Symlink(filepath.Join(root, "gone"), inflight); err != nil {
+		t.Skipf("cannot stage an entry that vanishes between readdir and stat: %v", err)
+	}
+	for i := 0; i < absenceEvictionPolls; i++ {
+		if err := w.Poll(ctx); err != nil {
+			t.Fatalf("rename-racing poll %d: %v", i, err)
+		}
+	}
+	tf, ok := w.tracked[identityKey{dev: dev, ino: ino}]
+	if !ok {
+		t.Fatal("the tracked identity was released on walks that lost an entry to a rename in flight")
+	}
+	if tf.absentPolls != 0 {
+		t.Fatalf("absentPolls = %d after uncorroborated walks, want absence counted only on the evidence retirement runs on", tf.absentPolls)
+	}
+	if got := obs.forgotten(); len(got) != 0 {
+		t.Fatalf("forgot %v on uncorroborated absence, want the identity kept", got)
+	}
+
+	if err := os.Remove(inflight); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(hidden, p); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("reappearance poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want the identity to resume from its floor", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want the sealed prefix still fenced after the reappearance", got)
+	}
+	if got := mustBaseline(t, readRootControl(t, state, root), p); got != sealed {
+		t.Fatalf("baseline after reappearance = %+v, want the floor sealed before the races %+v", got, sealed)
+	}
+}
+
+// TestReconcileErrorRestartsTheRetirementStreak is the bd-main-x6u F4 defect. A reconcile that fails
+// part way returns before the poll's streak bookkeeping, so the run of consecutive corroborated
+// observations a retirement rests on was neither advanced nor broken - it simply carried across a poll
+// that established nothing. An errored poll is not evidence, and it is not consecutive with anything.
+func TestReconcileErrorRestartsTheRetirementStreak(t *testing.T) {
+	ctx := context.Background()
+	root, state, scratch := t.TempDir(), t.TempDir(), t.TempDir()
+	replaced, gone := filepath.Join(root, "a.jsonl"), filepath.Join(root, "gone.jsonl")
+	writeFileString(t, replaced, msgLine("pre-consent-in-the-replaced-file")+"\n")
+	writeFileString(t, gone, msgLine("pre-consent-in-the-deleted-file")+"\n")
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	// The replacement inode is minted BEFORE anything is unlinked, so it cannot land on the inode the
+	// deletion below frees - which would make it a rename of the deleted file rather than a
+	// replacement of this one, and would stage a different bug than the one under test.
+	staged := filepath.Join(scratch, "staged.jsonl")
+	writeFileString(t, staged, msgLine("a-completely-different-record")+"\n")
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("first empty poll: %v", err)
+	}
+	if got := w.rootPolicies[root].absentLineagePolls["gone.jsonl"]; got != 1 {
+		t.Fatalf("retirement streak = %d after one corroborated empty walk, want 1", got)
+	}
+
+	// A reseal diagnostic the sink refuses ends this reconcile early. Nothing it did or did not see is
+	// usable, including about the locator whose streak is standing at one.
+	if err := os.Rename(staged, replaced); err != nil {
+		t.Fatal(err)
+	}
+	sink.failNext = true
+	sink.failErr = errors.New("sink unavailable")
+	if err := w.Poll(ctx); err == nil {
+		t.Fatal("poll succeeded despite a sink failure that ended the reconcile")
+	}
+	if got := w.rootPolicies[root].absentLineagePolls["gone.jsonl"]; got != 0 {
+		t.Fatalf("retirement streak = %d after an errored poll, want the run broken", got)
+	}
+
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("first recovered poll: %v", err)
+	}
+	if _, ok := w.rootPolicies[root].control.Lineages["gone.jsonl"]; !ok {
+		t.Fatalf("lineages = %+v, want the fence held until two corroborated walks agree", w.rootPolicies[root].control.Lineages)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("second recovered poll: %v", err)
+	}
+	if _, ok := w.rootPolicies[root].control.Lineages["gone.jsonl"]; ok {
+		t.Fatalf("lineages = %+v, want the fence retired once two corroborated walks agree", w.rootPolicies[root].control.Lineages)
+	}
+}

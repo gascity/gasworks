@@ -310,14 +310,19 @@ func TestSinkFailureDuringSealReplacementLeavesAbsenceEvidenceUntouched(t *testi
 	}
 }
 
-// TestRotationWhileTheDaemonIsDownCapturesTheNewSession is the bd-main-i4i proof, in the shape it was
-// reproduced: seal a session, stop the daemon, rotate the sealed file out of the way by renaming it,
-// let a NEW session be created at the path it left, and start the daemon again. The new file lands on
-// the old locator's lineage, which is checked for generation and floor but not for whether the
-// identity it names is still alive somewhere under the root - so a genuinely new, wholly post-consent
-// session is resealed at its own EOF and its head is never ingested. The sealed bytes did not stay at
-// that path; they moved, and the fence belongs where they went.
-func TestRotationWhileTheDaemonIsDownCapturesTheNewSession(t *testing.T) {
+// TestRotationWhileTheDaemonIsDownResealsTheNewSessionWithADiagnostic is the bd-main-i4i shape with
+// the bd-main-x6u semantics. Seal a session, stop the daemon, rotate the sealed file out of the way,
+// let a NEW session be created at the path it left, and start the daemon again. The fence still
+// follows the sealed bytes to the locator they moved to - the identity is alive there, which is
+// positive evidence - but that says nothing about what the vacated locator now holds. No walk of this
+// process ever observed that locator empty, so the file sitting there is resealed at its current EOF
+// with an ingestion-loss diagnostic rather than published from byte zero; only its later appends are
+// captured.
+//
+// This is a ratified semantics change from a617d3e (bd-main-x6u, design-v2.1 amendment A1-v2): the
+// same displacement that used to license a byte-zero ingest here is what `sed -i.bak` produces, where
+// the file at the vacated locator is the owner's own pre-consent history with an edit applied.
+func TestRotationWhileTheDaemonIsDownResealsTheNewSessionWithADiagnostic(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
 	p := filepath.Join(root, "session.jsonl")
@@ -346,11 +351,14 @@ func TestRotationWhileTheDaemonIsDownCapturesTheNewSession(t *testing.T) {
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("restart poll: %v", err)
 	}
-	if len(reads) != 1 || reads[0] != [2]int64{0, int64(len(fresh))} {
-		t.Fatalf("reads = %v, want the new session read from byte zero and nothing from the rotated file", reads)
+	if len(reads) != 0 {
+		t.Fatalf("reads = %v, want nothing read from either file", reads)
 	}
-	if got := sink.messages(); len(got) != 1 || got[0] != "a-new-post-consent-session-started-after-the-rotation" {
-		t.Fatalf("messages = %v, want the new post-consent session captured in full", got)
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want the unwitnessed replacement fenced, not published", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one ingestion-loss diagnostic for the resealed locator", len(got))
 	}
 	control := readRootControl(t, state, root)
 	if _, ok := control.Lineages["session.jsonl.rotated"]; !ok {
@@ -358,6 +366,23 @@ func TestRotationWhileTheDaemonIsDownCapturesTheNewSession(t *testing.T) {
 	}
 	if got, ok := control.Baselines[identityString(sealedDev, sealedIno)]; !ok || got.Floor != int64(len(pre)) {
 		t.Fatalf("rotated file baseline = %+v/%v, want its floor %d intact", got, ok, len(pre))
+	}
+	freshDev, freshIno := identityOf(t, p)
+	if got, ok := control.Baselines[identityString(freshDev, freshIno)]; !ok || got.Floor != int64(len(fresh)) {
+		t.Fatalf("vacated-locator baseline = %+v/%v, want a reseal at its EOF %d", got, ok, len(fresh))
+	}
+
+	// The reseal is a fence, not a stop: everything appended after it is captured.
+	post := msgLine("appended-after-the-reseal") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(fresh)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes appended above the reseal", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "appended-after-the-reseal" {
+		t.Fatalf("messages = %v, want capture to resume above the reseal", got)
 	}
 }
 
@@ -367,6 +392,12 @@ func TestRotationWhileTheDaemonIsDownCapturesTheNewSession(t *testing.T) {
 // moved, and resealing it re-pointed that lineage at the new inode - which then made the rename's own
 // moveLineage a no-op. Enumerating the whole root before reconciling any of it takes the ordering out
 // of the answer.
+//
+// The staging carries the bd-main-x6u semantics: a running daemon polls between the rename and the
+// creation of the new session, so a complete, error-free walk positively observes the locator EMPTY
+// before anything is created there. That observation is the newness evidence a byte-zero ingest now
+// requires - the live pattern this test is named for - and without it the same displacement is
+// resealed instead (TestRotationWhileTheDaemonIsDownResealsTheNewSessionWithADiagnostic).
 func TestLiveRotationCapturesTheNewSessionWhateverTheWalkOrder(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
@@ -390,6 +421,11 @@ func TestLiveRotationCapturesTheNewSessionWhateverTheWalkOrder(t *testing.T) {
 	}
 	if err := os.Rename(p, rotated); err != nil {
 		t.Fatal(err)
+	}
+	// The poll the live daemon actually gets between the two filesystem operations: it sees the
+	// rotated file where it now lives and the locator it left standing empty.
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-rename poll: %v", err)
 	}
 	fresh := msgLine("a-new-post-consent-session-started-after-the-rotation") + "\n"
 	writeFileString(t, p, fresh)

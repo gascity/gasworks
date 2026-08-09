@@ -423,12 +423,38 @@ func (w *Watcher) Poll(ctx context.Context) error {
 // root that does not yet exist, which defers the activation commit rather than failing), because
 // its durable baseline is valid only after the entire explicitly registered root was seen.
 func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
+	files, err := w.reconcileRoots(ctx)
+	if err != nil {
+		// A reconcile that ended part way through establishes nothing, and it is not consecutive with
+		// the polls on either side of it. Both absence streaks are runs of CORROBORATED observations,
+		// so an errored poll has to break them rather than be stepped over (bd-main-x6u F4).
+		w.forgetAbsenceEvidence()
+		return nil, err
+	}
+	return files, nil
+}
+
+// forgetAbsenceEvidence discards every consecutive-absence count this process has accumulated: the
+// per-identity release streak and every root's per-locator retirement streak.
+func (w *Watcher) forgetAbsenceEvidence() {
+	for _, tf := range w.tracked {
+		tf.absentPolls = 0
+	}
+	for _, policy := range w.rootPolicies {
+		policy.forgetLineageAbsence()
+	}
+}
+
+// reconcileRoots is reconcile's body: everything above is the contract, and everything an early
+// return here leaves half-established is the caller's to discard.
+func (w *Watcher) reconcileRoots(ctx context.Context) ([]*trackedFile, error) {
 	present := map[identityKey]struct{}{}
-	// dirsRead holds every directory this poll actually enumerated, and rootWalkFailed marks a root
-	// whose walk hit any error. Together they are what turns "missing from the walk" into positive
-	// evidence of absence rather than an unreadable-directory artifact.
+	// dirsRead holds every directory this poll actually enumerated, and rootCorroborated marks a root
+	// whose walk was complete, error-free, and lost nothing under it. Together they are what turns
+	// "missing from the walk" into positive evidence of absence rather than an unreadable-directory or
+	// rename-in-flight artifact.
 	dirsRead := map[string]struct{}{}
-	rootWalkFailed := map[string]bool{}
+	rootCorroborated := map[string]bool{}
 	for _, root := range w.cfg.ApprovedRoots {
 		policy := w.rootPolicies[root]
 		forwardActivating := policy != nil && policy.record.Mode == rootpolicy.ForwardOnly && !policy.control.Committed
@@ -437,15 +463,17 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			// A walk that ended early enumerated only part of the root, so nothing below may read
 			// this poll as evidence of what is missing under it — whether the error is fatal here or
 			// tolerated as a root that does not exist yet.
-			rootWalkFailed[root] = true
 			if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("scanning transcript root %s: %w", root, err)
 			}
 			continue
 		}
-		if scan.failed {
-			rootWalkFailed[root] = true
-		}
+		// Releasing a tracked identity and retiring a locator's fence both un-fence sealed bytes, so
+		// they run on the same evidence: a walk that read the whole root, hit no error, and lost no
+		// entry between readdir and stat. Anything less is what a rotation in flight looks like from
+		// the outside, and counting it toward a release is what let two rename-racing polls evict a
+		// live floor (bd-main-x6u F3).
+		rootCorroborated[root] = scan.enumerated && !scan.failed && !scan.vanished
 		// A reconcile error leaves this root's evidence partial, so it returns before any of the
 		// clean-walk consumers below can read it.
 		seenLocators, err := w.reconcileScan(ctx, root, policy, forwardActivating, scan, present)
@@ -459,22 +487,19 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		// root enumerates nothing, and committing there would record zero baselines and hand every
 		// pre-existing file a byte-zero cursor once the root appeared. Leaving the marker uncommitted
 		// retries the metadata-only seal on the next poll, which is the fail-closed direction.
-		if scan.enumerated && !scan.failed {
-			if !policy.control.Committed {
-				policy.control.Committed = true
-				if err := policy.persistControl(); err != nil {
-					return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
-				}
+		if scan.enumerated && !scan.failed && !policy.control.Committed {
+			policy.control.Committed = true
+			if err := policy.persistControl(); err != nil {
+				return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
 			}
-			// Retiring a locator's seal lineage needs more evidence than committing the activation
-			// does, because retirement is the one step that un-fences a path: the walk must have been
-			// complete, error-free, AND free of entries that vanished under it, and the locator must
-			// have been found empty by absenceEvictionPolls consecutive such walks (A1-v2). A single
-			// empty walk is what an in-flight rotation looks like from the outside.
-			if !scan.vanished {
-				policy.retireAbsentLineages(seenLocators)
-				continue
-			}
+		}
+		// Retiring a locator's seal lineage needs more evidence than committing the activation does,
+		// because retirement is the one step that un-fences a path: it takes the corroborated walk, and
+		// the locator must have been found empty by absenceEvictionPolls consecutive such walks
+		// (A1-v2). A single empty walk is what an in-flight rotation looks like from the outside.
+		if rootCorroborated[root] {
+			policy.retireAbsentLineages(seenLocators)
+			continue
 		}
 		policy.forgetLineageAbsence()
 	}
@@ -487,12 +512,12 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		if _, ok := present[key]; ok {
 			continue
 		}
-		// Absence alone is not a departure. A root whose walk hit any error proves nothing about what
-		// lives under it, and neither does a parent directory this poll could not enumerate — both
+		// Absence alone is not a departure. An uncorroborated walk proves nothing about what lives
+		// under the root, and neither does a parent directory this poll could not enumerate — both
 		// produce the same empty result as a deletion. Releasing the durable state on that evidence
 		// destroys the generation-local floor, and the committed root then treats the reappearing
 		// file as brand new.
-		if rootWalkFailed[tf.root] {
+		if !rootCorroborated[tf.root] {
 			continue
 		}
 		if _, ok := dirsRead[filepath.Clean(filepath.Dir(tf.path))]; !ok {
@@ -543,9 +568,11 @@ type scannedFile struct {
 type rootScan struct {
 	files []scannedFile
 	// byIdentity locates each regular identity the walk found, so a seal lineage can be matched to the
-	// file carrying it wherever that file moved to. Walk order is lexical and the first path wins, so
-	// a hardlinked identity resolves deterministically.
-	byIdentity map[identityKey]string
+	// file carrying it wherever that file moved to. It is MULTI-VALUED because an identity can occupy
+	// several locators at once: hard links are one file under two names, and keeping only one of them
+	// both hid the second from the fence bookkeeping and made an ambiguous identity look like an
+	// unambiguous move (bd-main-x6u F2). Paths arrive in the walk's lexical order.
+	byIdentity map[identityKey][]string
 	// enumerated is set when the root directory itself was read.
 	enumerated bool
 	// failed marks a walk that hit any error: absence under it is evidence of nothing.
@@ -561,7 +588,7 @@ type rootScan struct {
 // the walk already paid. A forward-only activation fails closed on every traversal or stat
 // uncertainty, because its durable baseline is valid only over the entire registered root.
 func (w *Watcher) scanRoot(root string, forwardActivating bool, dirsRead map[string]struct{}) (*rootScan, error) {
-	scan := &rootScan{byIdentity: map[identityKey]string{}}
+	scan := &rootScan{byIdentity: map[identityKey][]string{}}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// The lone carve-out is a root that does not yet exist: defer the activation to a later
@@ -615,13 +642,22 @@ func (w *Watcher) scanRoot(root string, forwardActivating bool, dirsRead map[str
 			size: info.Size(), mod: info.ModTime().UnixNano(), regular: info.Mode().IsRegular(),
 		}
 		scan.files = append(scan.files, f)
-		key := identityKey{dev: dev, ino: ino}
-		if _, dup := scan.byIdentity[key]; f.regular && !dup {
-			scan.byIdentity[key] = path
+		if f.regular {
+			key := identityKey{dev: dev, ino: ino}
+			scan.byIdentity[key] = append(scan.byIdentity[key], path)
 		}
 		return nil
 	})
 	return scan, err
+}
+
+// locatorsOf returns every path this walk found one identity living at. Two or more means hard links:
+// the identity did not move away from any of them, and no single one of them is where it went.
+func (s *rootScan) locatorsOf(dev, ino uint64) []string {
+	if s == nil {
+		return nil
+	}
+	return s.byIdentity[identityKey{dev: dev, ino: ino}]
 }
 
 // reconcileScan turns one root's enumeration into tracking decisions, in the walk's own lexical
@@ -634,6 +670,13 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 	// (path never empty), and it is collected for refused files too: a path holding something the
 	// watcher declines to read is still an occupied path.
 	seenLocators := map[string]struct{}{}
+	// Fence relocations are staged as they are discovered and applied together here, so that moves
+	// which cross over each other all land. The deferred form is deliberate: a reconcile that ends
+	// early still has to put back the fences it took up, or a poll that failed would leave a locator
+	// unfenced.
+	if policy != nil {
+		defer policy.applyLineageShifts()
+	}
 	for _, f := range scan.files {
 		key := identityKey{dev: f.dev, ino: f.ino}
 		// A tracked identity that is here again after being missed by an earlier walk RESUMES from its
@@ -714,9 +757,16 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 		present[key] = struct{}{}
 		if isTracked {
 			// A rename kept the identity and the cursor; only path/root/locator move - and with them
-			// the seal lineage, so the fence follows the sealed bytes to their new path.
+			// the seal lineage, so the fence follows the sealed bytes to their new path. A file living
+			// at several locators at once is NOT a rename, though: it is hard-linked, the path it is
+			// being seen at second is as real as the first, and moving the fence off the first would
+			// unfence bytes that are still sitting there under the other name.
 			if policy != nil {
-				policy.moveLineage(tf.locator, locator, f.dev, f.ino)
+				if len(scan.locatorsOf(f.dev, f.ino)) > 1 {
+					policy.holdLineage(locator, f.dev, f.ino)
+				} else {
+					policy.moveLineage(tf.locator, locator, f.dev, f.ino)
+				}
 			}
 			tf.root = root
 			tf.path = f.path
@@ -881,13 +931,27 @@ func (w *Watcher) inheritSealLineage(ctx context.Context, policy *rootPolicyStat
 	// The sealed transcript may not have been replaced at all. Rotation renames it out of the way and
 	// starts a new session at the path it left, which reaches here looking exactly like a rewrite —
 	// except that the identity the lineage names is still alive elsewhere under the root. The sealed
-	// bytes went with it, so the fence follows them, and this locator is free for what it now holds: a
-	// file created after consent, captured in full. The one exception is a file whose own bytes
-	// demonstrably ARE the sealed prefix (a copy left behind beside the original, as `sed -i.bak`
-	// leaves), which is fenced where it is found rather than published.
-	if to, displaced := w.displacedLineageLocator(scan, lin, d); displaced && !corroborated {
-		policy.moveLineage(d.locator, to, lin.Device, lin.Inode)
-		return baselineRecord{}, false, nil
+	// bytes went with it, so the fence follows them there.
+	//
+	// What that does NOT establish is that the file standing at the locator they left is new. `sed
+	// -i.bak` produces this exact picture — the untouched original moves to the .bak name and the
+	// EDITED history takes its place — and so does any rotation the watcher was not running for. So
+	// the vacated locator is resealed at its own EOF unless a walk of this process positively observed
+	// it EMPTY after the fence was recorded, which is the live rotation pattern and is the only
+	// evidence that separates "created after consent" from "the same history, edited" (A1-v2,
+	// bd-main-x6u F1). A file whose own bytes demonstrably ARE the sealed prefix never reaches the
+	// question: the corroborated window inherits the floor where it is found.
+	//
+	// An identity found alive at SEVERAL locators names no single place the sealed bytes went, so it
+	// is not usable as displacement evidence at all; it takes the same reseal, without moving anything.
+	if to, displaced, ambiguous := w.displacedLineageLocator(scan, lin, d); (displaced || ambiguous) && !corroborated {
+		if displaced {
+			policy.moveLineage(d.locator, to, lin.Device, lin.Inode)
+			if policy.observedLocatorEmpty(d.locator) {
+				return baselineRecord{}, false, nil
+			}
+		}
+		return w.resealReplacement(ctx, policy, d, size, sealReplacedDisplaced, rec.Floor)
 	}
 	switch {
 	case !readable:
@@ -912,32 +976,38 @@ func (w *Watcher) inheritSealLineage(ctx context.Context, policy *rootPolicyStat
 }
 
 // displacedLineageLocator reports where the identity a seal lineage names is living now, when this
-// walk found it under the root at a locator other than the one the lineage is recorded at. That is
-// positive evidence, and it is only ever read as such: not finding the identity says nothing (the
-// walk may have been partial, and the sealed file may simply be gone), so the caller falls through to
-// the fail-closed inheritance path. The locator is derived the same way discovery derives one, with
-// the walk-relative path as the fallback for a file the watcher would refuse to read — the sealed
-// bytes are still there either way, and the fence has to name where.
-func (w *Watcher) displacedLineageLocator(scan *rootScan, lin sealLineage, d discovered) (string, bool) {
-	if scan == nil {
-		return "", false
+// walk found it under the root at exactly one locator other than the one the lineage is recorded at.
+// That is positive evidence, and it is only ever read as such: not finding the identity says nothing
+// (the walk may have been partial, and the sealed file may simply be gone), so the caller falls
+// through to the fail-closed inheritance path.
+//
+// ambiguous reports the separate case of an identity found at SEVERAL locators - hard links, one file
+// under more than one name. It is still proof that the sealed file is alive and so that the file at
+// this locator is not it, but it names no single place the bytes went, so nothing may be moved on it.
+//
+// The locator is derived the same way discovery derives one, with the walk-relative path as the
+// fallback for a file the watcher would refuse to read — the sealed bytes are still there either way,
+// and the fence has to name where.
+func (w *Watcher) displacedLineageLocator(scan *rootScan, lin sealLineage, d discovered) (to string, displaced, ambiguous bool) {
+	paths := scan.locatorsOf(lin.Device, lin.Inode)
+	if len(paths) == 0 {
+		return "", false, false
 	}
-	path, found := scan.byIdentity[identityKey{dev: lin.Device, ino: lin.Inode}]
-	if !found {
-		return "", false
+	if len(paths) > 1 {
+		return "", false, true
 	}
-	locator, ok, _ := canonicalizeTranscript(path, w.cfg.ApprovedRoots)
+	locator, ok, _ := canonicalizeTranscript(paths[0], w.cfg.ApprovedRoots)
 	if !ok {
-		rel, err := filepath.Rel(d.root, path)
+		rel, err := filepath.Rel(d.root, paths[0])
 		if err != nil {
-			return "", false
+			return "", false, false
 		}
 		locator = filepath.ToSlash(rel)
 	}
 	if locator == "" || locator == d.locator {
-		return "", false
+		return "", false, false
 	}
-	return locator, true
+	return locator, true, false
 }
 
 // resealReplacement fences everything a replaced locator currently holds and reports the capture
@@ -1532,6 +1602,11 @@ const (
 	sealReplacedShort
 	// sealReplacedUnverifiable: the floor was never fingerprinted, so there is nothing to compare.
 	sealReplacedUnverifiable
+	// sealReplacedDisplaced: the sealed transcript itself is alive elsewhere under the root, so the
+	// file at this locator is definitely a different one — but no walk ever saw this locator standing
+	// empty, so it cannot be shown to have arrived after the sealed file left. `sed -i.bak` produces
+	// exactly this and leaves the owner's edited pre-consent history here.
+	sealReplacedDisplaced
 )
 
 // sealReplacementDiagnostic reports that the file at a sealed path was replaced by a new one and
@@ -1547,6 +1622,8 @@ func sealReplacementDiagnostic(outcome sealReplacement, floor, size int64) *Cand
 		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path and holds only %d bytes, too few to corroborate the sealed prefix; resealing capture at the current end of file; no bytes below it are delivered", floor, size)
 	case sealReplacedUnverifiable:
 		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path before that prefix was ever fingerprinted (the file is now %d bytes), so the replacement can be neither confirmed nor refuted; inheriting the sealed floor and capturing only the bytes above it", floor, size)
+	case sealReplacedDisplaced:
+		reason = fmt.Sprintf("the transcript sealed at offset %d at this path is still present elsewhere under its root, and this path was never observed empty in between, so the file now holding it (%d bytes) cannot be shown to be a new one; resealing capture at the current end of file; nothing below it is delivered", floor, size)
 	default:
 		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path and its prefix diverged from the bytes that were sealed (the file is now %d bytes); resealing capture at the current end of file; the replaced interval is not captured and no bytes are re-delivered", floor, size)
 	}
