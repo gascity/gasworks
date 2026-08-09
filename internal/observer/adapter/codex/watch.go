@@ -31,6 +31,11 @@ var (
 	errIdentityMismatch = errors.New("codex watcher: transcript identity changed since discovery")
 	errNotRegular       = errors.New("codex watcher: transcript is not a regular file")
 	errRefusedResolve   = errors.New("codex watcher: transcript path resolution crossed a symlink")
+	// errDeferTracking marks a newly discovered identity whose seal lineage could not be evaluated
+	// this poll, because the file vanished or was swapped again between the walk and the validated
+	// open. Tracking waits for the next reconcile rather than starting at byte zero, which would
+	// drain a prefix the locator's lineage may still fence.
+	errDeferTracking = errors.New("codex watcher: deferring tracking until the seal lineage can be read")
 )
 
 // KNOWN mc-SCALE CAPTURE GAP — symlinked transcripts are refused, so aimux-multiplexed sessions are
@@ -259,6 +264,24 @@ func (tf *trackedFile) ref() TranscriptRef {
 	return TranscriptRef{Locator: tf.locator, Device: tf.dev, Inode: tf.ino}
 }
 
+// discovered is one regular file a walk just canonicalized, before it becomes a trackedFile: where
+// it lives, which identity it carries, and the stat the walk read. It travels together because the
+// baseline decision needs all of it: the locator to look up a seal lineage, the root and identity
+// to re-open the file through the same validated open a drain uses, and the stat to seal.
+type discovered struct {
+	root    string
+	path    string
+	locator string
+	dev     uint64
+	ino     uint64
+	size    int64
+	mod     int64
+}
+
+func (d discovered) ref() TranscriptRef {
+	return TranscriptRef{Locator: d.locator, Device: d.dev, Inode: d.ino}
+}
+
 // Watcher tails the approved transcript roots by bounded polling. It is not safe for concurrent
 // use; Poll and Run must be driven from a single goroutine.
 type Watcher struct {
@@ -407,6 +430,11 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	for _, root := range w.cfg.ApprovedRoots {
 		policy := w.rootPolicies[root]
 		rootEnumerated := false
+		// seenLocators records every locator under this root the walk found occupied. It is the
+		// evidence forgetAbsentLineages needs to tell a deleted transcript (path left empty) from a
+		// replaced one (path never empty), and it is collected for refused files too: a path holding
+		// something the watcher declines to read is still an occupied path.
+		seenLocators := map[string]struct{}{}
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				// Skip the unreadable entry and keep walking the rest of the tree, but remember that
@@ -470,6 +498,7 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			// discovery O(new/moved matched files) rather than O(all tracked files) per poll.
 			if isTracked && tf.path == path {
 				tf.root = root
+				seenLocators[tf.locator] = struct{}{}
 				present[key] = struct{}{}
 				return nil
 			}
@@ -478,20 +507,32 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 			// (drain re-validates with O_NOFOLLOW at read time; this refusal is discovery-time.)
 			locator, ok, refusal := canonicalizeTranscript(path, w.cfg.ApprovedRoots)
 			if !ok {
+				if rel, relErr := filepath.Rel(root, path); relErr == nil {
+					seenLocators[rel] = struct{}{}
+				}
 				w.reportRefusal(ctx, refusal, path)
 				return nil
 			}
 			delete(w.refused, path)
+			seenLocators[locator] = struct{}{}
 			present[key] = struct{}{}
 			if isTracked {
-				// A rename kept the identity and the cursor; only path/root/locator move.
+				// A rename kept the identity and the cursor; only path/root/locator move - and with
+				// them the seal lineage, so the fence follows the sealed bytes to their new path.
+				if policy != nil {
+					policy.moveLineage(tf.locator, locator, dev, ino)
+				}
 				tf.root = root
 				tf.path = path
 				tf.locator = locator
 				return nil
 			}
-			cur, forwardBaseline, err := w.cursorFor(policy, dev, ino, info.Size(), info.ModTime().UnixNano())
+			found := discovered{root: root, path: path, locator: locator, dev: dev, ino: ino, size: info.Size(), mod: info.ModTime().UnixNano()}
+			cur, forwardBaseline, err := w.cursorFor(ctx, policy, found)
 			if err != nil {
+				if errors.Is(err, errDeferTracking) {
+					return nil
+				}
 				return err
 			}
 			w.tracked[key] = &trackedFile{cursor: cur, root: root, path: path, locator: locator, dev: dev, ino: ino, policy: policy, forwardBaseline: forwardBaseline}
@@ -504,11 +545,16 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		// root enumerates nothing, and committing there would record zero baselines and hand every
 		// pre-existing file a byte-zero cursor once the root appeared. Leaving the marker uncommitted
 		// retries the metadata-only seal on the next poll, which is the fail-closed direction.
-		if policy != nil && !policy.control.Committed && rootEnumerated && !rootWalkFailed[root] {
-			policy.control.Committed = true
-			if err := policy.persistControl(); err != nil {
-				return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
+		if policy != nil && rootEnumerated && !rootWalkFailed[root] {
+			if !policy.control.Committed {
+				policy.control.Committed = true
+				if err := policy.persistControl(); err != nil {
+					return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)
+				}
 			}
+			// The same complete-walk evidence retires the seal lineages of locators that are now
+			// empty. Anything less than a complete walk leaves every fence standing.
+			policy.forgetAbsentLineages(seenLocators)
 		}
 	}
 	for key := range present {
@@ -561,13 +607,14 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 // generation-local floor, and the content side channel's per-identity state. It is the single point
 // both the corroborated-absence GC and the reused-inode path go through, so a later file that lands
 // on this (device,inode) can neither resurrect a stale cursor nor be mistaken for a pre-consent
-// baseline. The floor removal is only marked dirty here; flushPolicyControls persists it once per
-// root per poll instead of once per identity.
+// baseline. What it does NOT drop is the locator's seal lineage: an identity can leave a path that
+// another file has already taken, and that replacement is exactly the case the lineage exists for.
+// The floor removal is only marked dirty here; flushPolicyControls persists it once per root per
+// poll instead of once per identity.
 func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
 	_ = os.Remove(tf.cursor.StatePath())
 	if tf.policy != nil && tf.forwardBaseline {
-		delete(tf.policy.control.Baselines, identityString(key.dev, key.ino))
-		tf.policy.dirty = true
+		tf.policy.dropBaseline(key.dev, key.ino)
 	}
 	delete(w.tracked, key)
 	if w.cfg.ContentObserver != nil {
@@ -593,13 +640,14 @@ func (w *Watcher) flushPolicyControls() error {
 // cursorFor returns a cursor constrained to the root's policy generation. During a forward-only
 // activation it performs only stat-derived sealing and durable writes; it never opens or reads the
 // transcript. The committed baseline map is the fail-closed recovery path when one cursor file is
-// lost after the activation marker has been written.
-func (w *Watcher) cursorFor(policy *rootPolicyState, dev, ino uint64, size, mod int64) (*Cursor, bool, error) {
+// lost after the activation marker has been written, and the committed lineage map is the same
+// recovery for the case no identity-keyed record can cover: the sealed file was replaced.
+func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d discovered) (*Cursor, bool, error) {
 	if policy == nil {
-		cur, err := LoadCursor(w.cfg.StateDir, dev, ino, size, mod, w.cfg.MaxPartialLine)
+		cur, err := LoadCursor(w.cfg.StateDir, d.dev, d.ino, d.size, d.mod, w.cfg.MaxPartialLine)
 		return cur, false, err
 	}
-	cur, err := LoadScopedCursor(w.cfg.StateDir, dev, ino, size, mod, w.cfg.MaxPartialLine, policy.scope)
+	cur, err := LoadScopedCursor(w.cfg.StateDir, d.dev, d.ino, d.size, d.mod, w.cfg.MaxPartialLine, policy.scope)
 	if err != nil {
 		return nil, false, err
 	}
@@ -609,35 +657,133 @@ func (w *Watcher) cursorFor(policy *rootPolicyState, dev, ino uint64, size, mod 
 	if !policy.control.Committed {
 		// Stat-only seal: the floor is the size the walk observed, and no fingerprint is taken here
 		// because taking one would open and read the file during activation.
-		policy.setBaseline(dev, ino, baselineRecord{Floor: size})
-		cur.SealAt(size)
-		cur.observe(size, mod)
+		policy.setBaseline(d.locator, d.dev, d.ino, baselineRecord{Floor: d.size})
+		cur.SealAt(d.size)
+		cur.observe(d.size, d.mod)
 		if err := cur.Save(); err != nil {
 			return nil, false, err
 		}
 		return cur, true, nil
 	}
-	base, baseline := policy.baseline(dev, ino)
+	base, baseline := policy.baseline(d.dev, d.ino)
+	fromLineage := false
+	if !baseline {
+		// No floor for THIS identity, but the PATH may still be sealed. An atomic rewrite (temp
+		// file + rename) leaves the locator the owner was told is sealed exactly where it was and
+		// makes the inode brand new, so every identity-keyed record misses while the transcript is,
+		// to the owner, the same file.
+		inherited, ok, err := w.inheritSealLineage(ctx, policy, d)
+		if err != nil {
+			return nil, false, err
+		}
+		base, baseline, fromLineage = inherited, ok, ok
+	}
 	// A missing/corrupt individual cursor must not reopen a baseline at byte zero, and neither must a
 	// cursor left behind a raised floor by a crash between the control write and the cursor write:
 	// the committed floor is authoritative whenever the cursor sits below it.
 	if baseline && (!cur.IsSealed() || cur.Consumed() < base.Floor) {
 		floor := base.Floor
-		if size < floor {
+		// A22 reconciles a floor recovered from durable state against the walk's stat. An INHERITED
+		// floor needs no such reconciliation: it was just derived from this file through the
+		// validated handle and never sits above the bytes that handle saw. Lowering it back to a
+		// stat a concurrent rewrite has already outgrown would deliver bytes the floor was chosen
+		// to fence.
+		if !fromLineage && d.size < floor {
 			// The lowered floor is flushed with the rest of this poll's control changes; the cursor
 			// saved just below already fences the same bytes, so a crash in between reseals no lower.
 			// The recorded fingerprint described bytes that no longer exist, so it is dropped with the
 			// floor and recorded again, from the new floor, on this file's next drain.
-			floor = size
-			policy.setBaseline(dev, ino, baselineRecord{Floor: floor})
+			floor = d.size
+			policy.setBaseline(d.locator, d.dev, d.ino, baselineRecord{Floor: floor})
 		}
 		cur.SealAt(floor)
-		cur.observe(size, mod)
+		cur.observe(d.size, d.mod)
 		if err := cur.Save(); err != nil {
 			return nil, false, err
 		}
 	}
 	return cur, baseline, nil
+}
+
+// inheritSealLineage decides what a brand-new identity discovered at the locator of a sealed
+// transcript inherits (A1). It is the cross-inode twin of drain's corroboration and uses the same
+// evidence: one bounded pread of the window ending at the recorded floor, through the same
+// race-free validated open a drain reads through, hashed and dropped - never parsed, never
+// delivered. A byte-identical window means the sealed history is still there under a new inode, so
+// the floor and its fingerprint carry over untouched and the replacement is silent.
+//
+// The two ways of being wrong are not symmetric, so the ambiguous cases do not split the
+// difference. Capturing from byte zero publishes a prefix the owner was told was sealed and can
+// never be taken back; inheriting a floor loses capture of a file that may be genuinely new, which
+// costs history the owner can still choose to backfill. So only a DEMONSTRABLE divergence - a
+// window that is there to read and does not match - treats the file as unrelated content, and even
+// then it reseals at the current EOF rather than draining from zero, because a diverged prefix is a
+// rewrite of the sealed range, not a new session. A floor that was never fingerprinted (sealed and
+// replaced before any drain recorded the window) is inherited with a diagnostic naming the
+// ambiguity, and a replacement too short to hold the window is fenced at its own EOF.
+//
+// ok is false only when the locator carries no lineage at all, which is the ordinary case: a new
+// transcript at a path no sealed file has occupied in this generation is captured in full.
+func (w *Watcher) inheritSealLineage(ctx context.Context, policy *rootPolicyState, d discovered) (baselineRecord, bool, error) {
+	lin, ok := policy.lineage(d.locator)
+	if !ok {
+		return baselineRecord{}, false, nil
+	}
+	f, size, _, err := openValidatedTranscript(d.root, d.locator, d.dev, d.ino)
+	if err != nil {
+		if isSkippableDrainErr(err) {
+			return baselineRecord{}, false, errDeferTracking
+		}
+		return baselineRecord{}, false, fmt.Errorf("opening replaced transcript %s: %w", d.locator, err)
+	}
+	defer f.Close()
+
+	rec := lin.baseline()
+	window, readable, err := readFloorWindow(f, rec.Floor)
+	if err != nil {
+		return baselineRecord{}, false, fmt.Errorf("corroborating replaced transcript %s: %w", d.locator, err)
+	}
+	switch {
+	case !readable:
+		// The replacement does not even reach the floor, so the window that would corroborate it is
+		// not there to read. Fence everything that exists, which is A22's lowered floor applied
+		// across the replacement.
+		return w.resealReplacement(ctx, policy, d, size, sealReplacedShort, rec.Floor)
+	case !rec.hasFingerprint():
+		// Sealed and replaced before any drain recorded the window: the prefix can be neither
+		// confirmed nor refuted. Prefer privacy: inherit the floor, and say so.
+		if err := w.reportSealReplacement(ctx, d, sealReplacedUnverifiable, rec.Floor, size); err != nil {
+			return baselineRecord{}, false, err
+		}
+		policy.setBaseline(d.locator, d.dev, d.ino, rec)
+		return rec, true, nil
+	case rec.FingerprintLen == len(window) && rec.FingerprintHash == hashBytes(window):
+		policy.setBaseline(d.locator, d.dev, d.ino, rec)
+		return rec, true, nil
+	default:
+		return w.resealReplacement(ctx, policy, d, size, sealReplacedDiverged, rec.Floor)
+	}
+}
+
+// resealReplacement fences everything a replaced locator currently holds and reports the capture
+// gap, exactly as an in-place rewrite of the same inode does: no byte that exists now is delivered
+// on either channel, and capture resumes at the first byte appended after this poll. The new floor's
+// fingerprint is left to the first drain, the same way the activation seal leaves it, so discovery
+// stays one pread per replaced file.
+func (w *Watcher) resealReplacement(ctx context.Context, policy *rootPolicyState, d discovered, size int64, outcome sealReplacement, floor int64) (baselineRecord, bool, error) {
+	if err := w.reportSealReplacement(ctx, d, outcome, floor, size); err != nil {
+		return baselineRecord{}, false, err
+	}
+	rec := baselineRecord{Floor: size}
+	policy.setBaseline(d.locator, d.dev, d.ino, rec)
+	return rec, true, nil
+}
+
+// reportSealReplacement delivers the replacement diagnostic BEFORE the floor it describes is
+// recorded, matching drain's ordering: a delivery failure fails the poll with nothing yet committed,
+// and the next poll re-derives the same decision from the same lineage.
+func (w *Watcher) reportSealReplacement(ctx context.Context, d discovered, outcome sealReplacement, floor, size int64) error {
+	return w.cfg.Sink.DeliverCandidates(ctx, d.ref(), []*Candidate{sealReplacementDiagnostic(outcome, floor, size)})
 }
 
 // drain reads and parses the bytes appended to one tracked file since its cursor offset and
@@ -959,7 +1105,7 @@ func (w *Watcher) corroborateOffset(f *os.File, tf *trackedFile, size int64) (se
 	}
 	if !base.hasFingerprint() {
 		base.FingerprintHash, base.FingerprintLen = hashBytes(window), len(window)
-		tf.policy.setBaseline(tf.dev, tf.ino, base)
+		tf.policy.setBaseline(tf.locator, tf.dev, tf.ino, base)
 		return sealIntact, nil
 	}
 	if base.FingerprintLen != len(window) || base.FingerprintHash != hashBytes(window) {
@@ -986,7 +1132,7 @@ func (w *Watcher) resealFloor(f *os.File, tf *trackedFile, eof int64) error {
 	if readable {
 		rec.FingerprintHash, rec.FingerprintLen = hashBytes(window), len(window)
 	}
-	tf.policy.setBaseline(tf.dev, tf.ino, rec)
+	tf.policy.setBaseline(tf.locator, tf.dev, tf.ino, rec)
 	return tf.policy.persistControl()
 }
 
@@ -1191,6 +1337,46 @@ func divergenceDiagnostic(d sealDivergence, oldOffset, newSize int64) *Candidate
 		Context:            reason,
 	}
 	return &Candidate{Kind: KindDiagnostic, Diagnostic: &diag}
+}
+
+// sealReplacement classifies what a new inode found at a sealed locator turned out to be, and so
+// what the watcher did with the floor it inherited there.
+type sealReplacement int
+
+const (
+	// sealReplacedDiverged: the window ending at the floor was readable and did not match the bytes
+	// that were sealed over. The path was rewritten, and the floor describes no boundary in this
+	// file.
+	sealReplacedDiverged sealReplacement = iota
+	// sealReplacedShort: the replacement is too small to hold the window, so nothing corroborates it.
+	sealReplacedShort
+	// sealReplacedUnverifiable: the floor was never fingerprinted, so there is nothing to compare.
+	sealReplacedUnverifiable
+)
+
+// sealReplacementDiagnostic reports that the file at a sealed path was replaced by a new one and
+// states which floor capture is now standing on and why. It names byte offsets only, never
+// transcript content and never the path. The three texts are deliberately distinct: two of them
+// describe a capture gap (the replaced file's current content is fenced and never delivered) while
+// the unverifiable one describes an inherited floor that may be fencing bytes written after consent
+// and the owner can tell those apart only if the diagnostic does.
+func sealReplacementDiagnostic(outcome sealReplacement, floor, size int64) *Candidate {
+	var reason string
+	switch outcome {
+	case sealReplacedShort:
+		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path and holds only %d bytes, too few to corroborate the sealed prefix; resealing capture at the current end of file; no bytes below it are delivered", floor, size)
+	case sealReplacedUnverifiable:
+		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path before that prefix was ever fingerprinted (the file is now %d bytes), so the replacement can be neither confirmed nor refuted; inheriting the sealed floor and capturing only the bytes above it", floor, size)
+	default:
+		reason = fmt.Sprintf("a new file replaced the transcript sealed at offset %d at this path and its prefix diverged from the bytes that were sealed (the file is now %d bytes); resealing capture at the current end of file; the replaced interval is not captured and no bytes are re-delivered", floor, size)
+	}
+	d := evidence.DiagnosticCandidate{
+		Code:               wire.CaptureDiagnosticPayloadCodeCAPTURELOSS,
+		Severity:           wire.CaptureDiagnosticPayloadSeverityWARNING,
+		CompletenessEffect: wire.CaptureDiagnosticPayloadCompletenessEffectPARTIAL,
+		Context:            reason,
+	}
+	return &Candidate{Kind: KindDiagnostic, Diagnostic: &d}
 }
 
 // refusalDiagnostic reports that a candidate transcript path was refused for a safety reason. It

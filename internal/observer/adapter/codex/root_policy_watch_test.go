@@ -636,6 +636,373 @@ func TestRootPolicyControlUpgradeKeepsV1Floors(t *testing.T) {
 	}
 }
 
+// TestSealedFloorSurvivesIdenticalRewriteViaRename is the A1 proof. sed -i, an editor save, and most
+// sync tools do not write in place: they write a temp file and rename it over the original. The path
+// the owner was told is sealed never changes, but the inode does, so every cursor and floor keyed on
+// identity misses and the whole pre-consent history would drain - and, no longer looking like a
+// baseline, upload whole-file too. The locator's seal lineage carries the floor across.
+func TestSealedFloorSurvivesIdenticalRewriteViaRename(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret-that-must-never-be-delivered") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	obs := &recordingContentObserver{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink, ContentObserver: obs,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	sealed := mustBaseline(t, readRootControl(t, state, root), p)
+	if sealed.Floor != int64(len(pre)) || !sealed.hasFingerprint() {
+		t.Fatalf("sealed baseline = %+v, want floor %d with the window recorded by the first drain", sealed, len(pre))
+	}
+
+	before := inodeOf(t, p)
+	replaceViaRename(t, p, pre)
+	if after := inodeOf(t, p); after == before {
+		t.Fatalf("replacement kept inode %d, so the rewrite-via-rename path is not exercised", after)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("replacement poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("replacement poll read %v, want nothing below the inherited floor", reads)
+	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("replacement poll delivered %d candidates, want none for a byte-identical rewrite", len(got))
+	}
+	if o, ok := obs.last(); ok {
+		t.Fatalf("replaced transcript reached the content channel: %+v", o)
+	}
+	if got := mustBaseline(t, readRootControl(t, state, root), p); got != sealed {
+		t.Fatalf("inherited baseline = %+v, want the floor and window sealed before the rename %+v", got, sealed)
+	}
+
+	post := msgLine("after-the-rename") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-rename append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("post-rename reads = %v, want only the bytes appended above the inherited floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-the-rename" {
+		t.Fatalf("post-rename messages = %v, want only the record appended after the rewrite", got)
+	}
+}
+
+// TestSealedFloorReplacementWithDivergedPrefixResealsAtEOF covers the other half of A1: the
+// replacement's prefix demonstrably is not the sealed one, so the floor describes no boundary in
+// this file. It is the same situation an in-place rewrite of the same inode produces and takes the
+// same recovery - reseal at the current EOF - rather than draining a rewritten history from zero.
+func TestSealedFloorReplacementWithDivergedPrefixResealsAtEOF(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+
+	replacement := msgLine("a-completely-different-first-record-written-by-the-rewrite") + "\n" + msgLine("and-a-second") + "\n"
+	if len(replacement) <= len(pre) {
+		t.Fatalf("replacement is %d bytes, must grow past the %d-byte floor", len(replacement), len(pre))
+	}
+	replaceViaRename(t, p, replacement)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("replacement poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("diverged replacement read %v, want no bytes from a file whose sealed prefix is gone", reads)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("diverged replacement delivered %v, want no pre-rename bytes", got)
+	}
+	diags := diagnostics(sink.all())
+	if len(diags) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one replacement report", len(diags))
+	}
+	ctxText := diags[0].Diagnostic.Context
+	for _, want := range []string{"a new file replaced the transcript sealed at offset", "diverged", "resealing capture at the current end of file", "no bytes are re-delivered"} {
+		if !strings.Contains(ctxText, want) {
+			t.Fatalf("replacement diagnostic = %q, want it to state %q", ctxText, want)
+		}
+	}
+	resealed := mustBaseline(t, readRootControl(t, state, root), p)
+	if resealed.Floor != int64(len(replacement)) {
+		t.Fatalf("floor = %d, want the replacement's EOF %d", resealed.Floor, len(replacement))
+	}
+
+	post := msgLine("after-the-diverged-replacement") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("post-replacement append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(replacement)), int64(len(post))} {
+		t.Fatalf("post-replacement reads = %v, want only the bytes appended above the new floor", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "after-the-diverged-replacement" {
+		t.Fatalf("post-replacement messages = %v, want only the record appended after the reseal", got)
+	}
+}
+
+// TestSealedFloorReplacementWithoutFingerprintInheritsFloor stages the crash window between the
+// stat-only activation seal and the first drain, where a floor exists but the window that would
+// corroborate it was never recorded. Nothing can confirm or refute the replacement, and the two ways
+// to be wrong are not symmetric: capture would publish a prefix the owner was told was sealed, while
+// inheriting only defers history the owner can still backfill. It inherits, and says why.
+func TestSealedFloorReplacementWithoutFingerprintInheritsFloor(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("sealed-before-any-drain-recorded-a-window") + "\n"
+	writeFileString(t, p, pre)
+	dev, ino := identityOf(t, p)
+	writeRootControl(t, state, root, rootPolicyControl{
+		Version: rootPolicyControlVersion, Root: root, Generation: 1, Active: true,
+		Mode: rootpolicy.ForwardOnly, Committed: true,
+		Baselines: map[string]baselineRecord{identityString(dev, ino): {Floor: int64(len(pre))}},
+		Lineages: map[string]sealLineage{
+			"session.jsonl": {Floor: int64(len(pre)), Generation: 1, Device: dev, Inode: ino},
+		},
+	})
+
+	post := msgLine("appended-by-the-rewrite") + "\n"
+	replaceViaRename(t, p, pre+post)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("replacement poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want only the bytes above the inherited floor %d", reads, len(pre))
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "appended-by-the-rewrite" {
+		t.Fatalf("messages = %v, want nothing from below the inherited floor", got)
+	}
+	diags := diagnostics(sink.all())
+	if len(diags) != 1 {
+		t.Fatalf("diagnostics = %d, want exactly one ambiguity report", len(diags))
+	}
+	ctxText := diags[0].Diagnostic.Context
+	for _, want := range []string{"before that prefix was ever fingerprinted", "neither confirmed nor refuted", "inheriting the sealed floor"} {
+		if !strings.Contains(ctxText, want) {
+			t.Fatalf("ambiguity diagnostic = %q, want it to state %q", ctxText, want)
+		}
+	}
+	if got := mustBaseline(t, readRootControl(t, state, root), p); got.Floor != int64(len(pre)) {
+		t.Fatalf("floor = %d, want the inherited %d", got.Floor, len(pre))
+	}
+}
+
+// TestNewTranscriptAtNeverSealedLocatorIsCapturedInFull keeps the inheritance narrow: a post-consent
+// session at a path no sealed transcript has occupied is still captured from its first byte.
+func TestNewTranscriptAtNeverSealedLocatorIsCapturedInFull(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	writeFileString(t, filepath.Join(root, "old.jsonl"), msgLine("pre-consent")+"\n")
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	fresh := msgLine("brand-new-session") + "\n"
+	writeFileString(t, filepath.Join(root, "new.jsonl"), fresh)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("new-file poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{0, int64(len(fresh))} {
+		t.Fatalf("reads = %v, want the new transcript read from byte zero", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "brand-new-session" {
+		t.Fatalf("messages = %v, want the new transcript captured in full", got)
+	}
+	if got := diagnostics(sink.all()); len(got) != 0 {
+		t.Fatalf("diagnostics = %d, want none for a locator no sealed file has held", len(got))
+	}
+}
+
+// TestSealLineageDoesNotSurviveGenerationBump proves re-registration fences the inheritance: consent
+// given again is consent to seal again, so a replacement is sealed at ITS own EOF by the new
+// generation's activation rather than inheriting the retired generation's floor.
+func TestSealLineageDoesNotSurviveGenerationBump(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("sealed-under-generation-one") + "\n"
+	writeFileString(t, p, pre)
+	if err := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: &recordingSink{},
+	}).Poll(ctx); err != nil {
+		t.Fatalf("generation-1 activation poll: %v", err)
+	}
+
+	// An identical prefix: under generation 1 this would inherit the smaller floor.
+	extra := msgLine("written-between-the-registrations") + "\n"
+	replaceViaRename(t, p, pre+extra)
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 2, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("generation-2 activation poll: %v", err)
+	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("generation-2 activation delivered %d candidates, want a silent re-seal", len(got))
+	}
+	control := readRootControl(t, state, root)
+	if got := mustBaseline(t, control, p); got.Floor != int64(len(pre)+len(extra)) {
+		t.Fatalf("floor = %d, want the whole file resealed at %d by the new generation", got.Floor, len(pre)+len(extra))
+	}
+	if got := control.Lineages["session.jsonl"]; got.Generation != 2 {
+		t.Fatalf("lineage = %+v, want it re-stamped to the current generation", got)
+	}
+}
+
+// TestSealLineageFromARetiredGenerationIsIgnored checks the fence directly rather than through the
+// control record's rewrite: an entry stamped with a generation that is no longer current cannot
+// fence anything, so the file at that locator is a new transcript and is captured in full.
+func TestSealLineageFromARetiredGenerationIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	body := msgLine("captured-under-the-current-generation") + "\n"
+	writeFileString(t, p, body)
+	dev, ino := identityOf(t, p)
+	writeRootControl(t, state, root, rootPolicyControl{
+		Version: rootPolicyControlVersion, Root: root, Generation: 2, Active: true,
+		Mode: rootpolicy.ForwardOnly, Committed: true,
+		Lineages: map[string]sealLineage{
+			"session.jsonl": {Floor: int64(len(body)), Generation: 1, Device: dev, Inode: ino + 1},
+		},
+	})
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 2, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("retired-lineage poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "captured-under-the-current-generation" {
+		t.Fatalf("messages = %v, want a retired lineage to fence nothing", got)
+	}
+}
+
+// TestSealLineageSurvivesATransientWalkError pairs the lineage with the fail-closed absence rule it
+// rides on. A store subdirectory that cannot be read for one poll looks exactly like an emptied
+// path, and retiring the lineage on that evidence would unseal the very next rewrite.
+func TestSealLineageSurvivesATransientWalkError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits, so the unreadable poll cannot be staged")
+	}
+	ctx := context.Background()
+	root, state := t.TempDir(), t.TempDir()
+	store := filepath.Join(root, "projects")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(store, "session.jsonl")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	if err := os.Chmod(store, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("unreadable poll: %v", err)
+	}
+	if err := os.Chmod(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replaceViaRename(t, p, pre)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("replacement poll: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("replacement after a transient walk error read %v, want the floor still inherited", reads)
+	}
+	if got := sink.all(); len(got) != 0 {
+		t.Fatalf("replacement after a transient walk error delivered %d candidates, want none", len(got))
+	}
+}
+
+// replaceViaRename rewrites path the way sed -i, an editor save, and most sync tools do: write a
+// temp file beside it and rename it over the original, leaving the path in place and the inode new.
+func replaceViaRename(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := path + ".rewrite"
+	writeFileString(t, tmp, content)
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("rename %s over %s: %v", tmp, path, err)
+	}
+}
+
+func writeRootControl(t *testing.T, stateDir, root string, control rootPolicyControl) {
+	t.Helper()
+	data, err := json.Marshal(control)
+	if err != nil {
+		t.Fatalf("encode root-policy control: %v", err)
+	}
+	writeFileString(t, filepath.Join(stateDir, "root-policy-"+rootPolicyID(root)+".json"), string(data))
+}
+
 func readRootControl(t *testing.T, stateDir, root string) rootPolicyControl {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(stateDir, "root-policy-"+rootPolicyID(root)+".json"))

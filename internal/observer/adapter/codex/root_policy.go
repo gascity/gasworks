@@ -26,6 +26,14 @@ const (
 	// cursor's anchor window: wide enough that a rewritten prefix cannot land on the same hash by
 	// coincidence, narrow enough that corroborating a floor stays one bounded pread per drain.
 	floorFingerprintLen = 64
+
+	// maxSealLineages is a backstop on how many per-locator seal lineages one root retains. It is not
+	// the operative bound: an entry exists only for a locator that is occupied in the current
+	// generation and is dropped the moment a complete walk finds that locator empty, so the steady
+	// state is one entry per sealed transcript - the cardinality the baseline map already carries.
+	// Past the cap new locators are simply not admitted, which degrades toward capture for files
+	// discovered later rather than trading away a fence that is already established.
+	maxSealLineages = 65536
 )
 
 // baselineRecord is one identity's durable forward-only seal: the floor no delivery may reach below,
@@ -57,9 +65,36 @@ func (b *baselineRecord) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &b.Floor)
 }
 
+// sealLineage is a locator's memory of the floor sealed over whatever file occupies it, kept so a
+// NEW inode appearing at the path of a sealed transcript can inherit that floor instead of being
+// captured from byte zero. That is the rewrite-via-rename hole: sed -i, an editor save, and most
+// sync tools write a temp file and rename it over the original, which leaves the path the owner was
+// told is sealed untouched while the inode - the identity every cursor and baseline keys on - is
+// brand new.
+type sealLineage struct {
+	Floor           int64  `json:"floor"`
+	FingerprintHash uint64 `json:"fingerprint_hash,omitempty"`
+	FingerprintLen  int    `json:"fingerprint_len,omitempty"`
+	// Generation fences a lineage to the consent interval that sealed it. The control record is
+	// rewritten from scratch when the generation advances, so this is defence in depth: an entry that
+	// somehow survived a re-registration still cannot fence the new generation's files.
+	Generation uint64 `json:"generation"`
+	// Device / Inode name the identity that last held this locator, so a rename moves only the entry
+	// that identity actually owns.
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
+func (l sealLineage) baseline() baselineRecord {
+	return baselineRecord{Floor: l.Floor, FingerprintHash: l.FingerprintHash, FingerprintLen: l.FingerprintLen}
+}
+
 // rootPolicyControl is the durable high-water record for one canonical root. Baselines are kept
 // in the committed control record (as well as in individual cursors) so losing one cursor cannot
-// turn a pre-consent identity into a byte-zero capture after restart.
+// turn a pre-consent identity into a byte-zero capture after restart. Lineages index the same
+// floors by locator, which is what survives the one thing an identity cannot: being replaced.
+// Lineages is a v2 addition rather than a schema bump - it is optional, an older build ignores it,
+// and a control record without it loses only the cross-rename fence, never a floor.
 type rootPolicyControl struct {
 	Version    int                       `json:"version"`
 	Root       string                    `json:"root"`
@@ -68,6 +103,7 @@ type rootPolicyControl struct {
 	Mode       rootpolicy.Mode           `json:"mode,omitempty"`
 	Committed  bool                      `json:"committed"`
 	Baselines  map[string]baselineRecord `json:"baselines,omitempty"`
+	Lineages   map[string]sealLineage    `json:"lineages,omitempty"`
 }
 
 type rootPolicyState struct {
@@ -154,15 +190,103 @@ func (s *rootPolicyState) baseline(dev, ino uint64) (baselineRecord, bool) {
 	return v, ok
 }
 
-// setBaseline records one identity's floor (and whatever fingerprint accompanies it) in memory and
-// marks the root for this poll's single control write. A caller that must not lose the change across
-// a crash (a reseal onto a diverged file) persists the control itself right after.
-func (s *rootPolicyState) setBaseline(dev, ino uint64, b baselineRecord) {
+// setBaseline records one identity's floor (and whatever fingerprint accompanies it) in memory,
+// carries it into the locator's seal lineage, and marks the root for this poll's single control
+// write. A caller that must not lose the change across a crash (a reseal onto a diverged file)
+// persists the control itself right after.
+func (s *rootPolicyState) setBaseline(locator string, dev, ino uint64, b baselineRecord) {
 	if s.control.Baselines == nil {
 		s.control.Baselines = map[string]baselineRecord{}
 	}
 	s.control.Baselines[identityString(dev, ino)] = b
+	s.setLineage(locator, dev, ino, b)
 	s.dirty = true
+}
+
+// setLineage points a locator at the floor the identity now sitting there is sealed over. A floor at
+// byte zero has no pre-consent prefix beneath it and so carries nothing worth inheriting: it drops
+// the entry instead, which is also how a truncation all the way to zero lowers a lineage.
+func (s *rootPolicyState) setLineage(locator string, dev, ino uint64, b baselineRecord) {
+	if locator == "" {
+		return
+	}
+	if b.Floor <= 0 {
+		delete(s.control.Lineages, locator)
+		return
+	}
+	if _, known := s.control.Lineages[locator]; !known && len(s.control.Lineages) >= maxSealLineages {
+		return
+	}
+	if s.control.Lineages == nil {
+		s.control.Lineages = map[string]sealLineage{}
+	}
+	s.control.Lineages[locator] = sealLineage{
+		Floor:           b.Floor,
+		FingerprintHash: b.FingerprintHash,
+		FingerprintLen:  b.FingerprintLen,
+		Generation:      s.control.Generation,
+		Device:          dev,
+		Inode:           ino,
+	}
+}
+
+// dropBaseline releases one identity's floor while deliberately LEAVING the locator's lineage in
+// place. An identity that leaves a path something else already occupies has been REPLACED, and the
+// replacement inherits through exactly that lineage; a lineage whose locator is genuinely empty is
+// dropped by forgetAbsentLineages instead, on the evidence of a complete walk.
+func (s *rootPolicyState) dropBaseline(dev, ino uint64) {
+	delete(s.control.Baselines, identityString(dev, ino))
+	s.dirty = true
+}
+
+// moveLineage follows a renamed transcript. The sealed content the lineage describes moved with the
+// file, so afterwards a new inode at the OLD path is a genuinely new transcript while one at the new
+// path is a rewrite candidate.
+func (s *rootPolicyState) moveLineage(oldLocator, newLocator string, dev, ino uint64) {
+	if oldLocator == "" || oldLocator == newLocator {
+		return
+	}
+	lin, ok := s.control.Lineages[oldLocator]
+	if !ok || lin.Device != dev || lin.Inode != ino {
+		return
+	}
+	delete(s.control.Lineages, oldLocator)
+	if newLocator != "" {
+		s.control.Lineages[newLocator] = lin
+	}
+	s.dirty = true
+}
+
+// lineage returns the sealed floor a new identity discovered at locator may inherit. Like baseline
+// it is available only on a committed forward-only root, and only within the generation that sealed
+// it: a re-registration mints a new generation, and consent given again is consent to fence again.
+func (s *rootPolicyState) lineage(locator string) (sealLineage, bool) {
+	if !s.control.Committed || s.record.Mode != rootpolicy.ForwardOnly || locator == "" {
+		return sealLineage{}, false
+	}
+	lin, ok := s.control.Lineages[locator]
+	if !ok || lin.Generation != s.control.Generation || lin.Floor <= 0 {
+		return sealLineage{}, false
+	}
+	return lin, true
+}
+
+// forgetAbsentLineages drops the lineage of every locator a COMPLETE, error-free walk of the root
+// just found empty, and is what keeps the inheritance narrow. An unlinked path with nothing put back
+// in its place is a deleted transcript, not a rewritten one, so the next file created there is a
+// genuinely new transcript and is captured in full; only a replacement the walk never saw the path
+// empty for - which is precisely what an atomic temp-write+rename produces - inherits a floor.
+// Callers must pass the locators of a walk that enumerated the whole root: a walk that hit any error
+// proves nothing about what is missing, and dropping a fence on that evidence would republish a
+// sealed prefix the first time a directory was briefly unreadable.
+func (s *rootPolicyState) forgetAbsentLineages(seen map[string]struct{}) {
+	for locator := range s.control.Lineages {
+		if _, ok := seen[locator]; ok {
+			continue
+		}
+		delete(s.control.Lineages, locator)
+		s.dirty = true
+	}
 }
 
 // The indirections keep the policy state small and give tests a narrow seam without exposing it.
