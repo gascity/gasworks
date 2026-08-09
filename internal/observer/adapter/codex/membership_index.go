@@ -29,7 +29,9 @@ type membershipEntry struct {
 	// path is where the identity was standing when the verdict was reached. A4: the same inode seen
 	// at a different path is a different file (inode reuse across projects), so the verdict dies.
 	path string
-	// stat is the {size, ctime} a negative verdict is anchored to.
+	// stat is the corroboration snapshot the verdict currently stands on. It starts as the stat the
+	// peek reached the verdict under and is re-anchored by every lookup that keeps the entry, so a
+	// member's growth is judged against the length last observed rather than an ever-staler one.
 	stat TranscriptStat
 }
 
@@ -44,13 +46,9 @@ func NewMembershipIndex() *MembershipIndex {
 // Lookup returns the cached verdict for the identity (dev, ino) as currently seen at path with stat
 // st, reporting false when there is nothing usable and the caller must peek.
 //
-// A cached entry is discarded when the identity has moved to a different path (A4), and — for a
-// NEGATIVE verdict — when its size or ctime has changed since the verdict, which is what makes an
-// inode reused by a new file at the same path re-peek instead of inheriting a stale "not yours".
-// A POSITIVE verdict is deliberately not stat-corroborated: a member transcript's size and ctime
-// change on every append, so anchoring it to a stat would defeat the cache entirely. Its protection
-// is the path check plus EvictPath, and the failure it forgives — an inode reused at the identical
-// path inside the same consented project directory — resolves to the same project anyway.
+// A cached entry is discarded when the identity has moved to a different path (A4), and whenever the
+// live stat no longer corroborates the verdict. Dropping an entry never substitutes a verdict: it
+// only costs the caller a fresh bounded peek, which re-decides the file the identity is now.
 func (ix *MembershipIndex) Lookup(dev, ino uint64, path string, st TranscriptStat) (Membership, bool) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -59,15 +57,46 @@ func (ix *MembershipIndex) Lookup(dev, ino uint64, path string, st TranscriptSta
 	if !ok {
 		return Membership{}, false
 	}
-	if e.path != path {
+	if e.path != path || !corroborates(e.verdict.State, e.stat, st) {
 		ix.dropLocked(id, e)
 		return Membership{}, false
 	}
-	if e.verdict.State == MembershipNonMember && (e.stat.Size != st.Size || e.stat.CtimeNanos != st.CtimeNanos) {
-		ix.dropLocked(id, e)
-		return Membership{}, false
+	if e.stat != st {
+		e.stat = st
+		ix.entries[id] = e
 	}
 	return e.verdict, true
+}
+
+// corroborates reports whether the live stat st still supports a verdict reached under snap.
+//
+// A NEGATIVE verdict is anchored rigidly: the file was shown not to be ours at exactly this
+// {size, ctime}, so either half moving means the bytes changed under the inode and the verdict is
+// re-derived. Nothing legitimate rewrites a non-member in place and expects to stay one.
+//
+// A POSITIVE verdict cannot be anchored that way — a member transcript's size and ctime move on
+// every append, which is the case the cache exists for — so it is anchored to the SHAPE of the
+// movement instead. A file that is only appended to either sat still or grew, and growth carries the
+// change time forward with it. Everything else is rewrite evidence: a shrink (a truncate, or a
+// shorter session copied over the inode), a change at unchanged length (an in-place overwrite), a
+// ctime that ran backwards (a restore over the same inode), or a change of owner (which also retires
+// the peek's uid corroboration). A rewritten file's recorded cwd is no longer the one the verdict
+// was read from, so the entry goes and the next peek decides it again.
+//
+// Growth at an unchanged ctime is treated as an append: ctime granularity is coarse enough that two
+// observations of a busy transcript can share one, and refusing it would evict exactly the files the
+// cache is for while catching no rewrite the size test does not already see.
+func corroborates(state MembershipState, snap, st TranscriptStat) bool {
+	if state == MembershipNonMember {
+		return snap.Size == st.Size && snap.CtimeNanos == st.CtimeNanos
+	}
+	if snap.UID != st.UID {
+		return false
+	}
+	if st.Size == snap.Size {
+		return st.CtimeNanos == snap.CtimeNanos
+	}
+	return st.Size > snap.Size && st.CtimeNanos >= snap.CtimeNanos
 }
 
 // Record caches a decided verdict for the identity (dev, ino) seen at path, anchored to the stat

@@ -31,18 +31,44 @@ func fillerLine(n int) string {
 }
 
 // writeStraddlingTranscript writes a byte-cap fixture and returns its size, having checked that the
-// fixture leaves the line cap slack — otherwise a peek-cap-exhausted verdict would prove nothing
+// fixture leaves the garbage cap slack — otherwise a peek-cap-exhausted verdict would prove nothing
 // about the byte budget under test.
 func writeStraddlingTranscript(t *testing.T, store, locator string, lines []string) int64 {
 	t.Helper()
-	if cwdLess := len(lines) - 1; cwdLess >= maxPeekCWDLines {
-		t.Fatalf("fixture spends %d cwd-less records, at or over the %d-record line cap", cwdLess, maxPeekCWDLines)
+	if run := longestParseFailureRun(lines); run >= maxPeekParseFailures {
+		t.Fatalf("fixture has a %d-record unparseable run, at or over the %d-failure cap", run, maxPeekParseFailures)
 	}
 	info, err := os.Stat(writeTranscript(t, store, locator, lines...))
 	if err != nil {
 		t.Fatalf("stat %s: %v", locator, err)
 	}
 	return info.Size()
+}
+
+// longestParseFailureRun is the longest run of consecutive unparseable records in a fixture, which
+// is the only thing the peek still caps by record count.
+func longestParseFailureRun(lines []string) int {
+	worst, run := 0, 0
+	for _, l := range lines {
+		if _, _, parsed := peekCWD([]byte(l)); parsed {
+			run = 0
+			continue
+		}
+		run++
+		if run > worst {
+			worst = run
+		}
+	}
+	return worst
+}
+
+func mustStat(t *testing.T, path string) TranscriptStat {
+	t.Helper()
+	st, err := StatTranscript(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return st
 }
 
 func peekerFor(t *testing.T, store string, projects ...string) *MembershipPeeker {
@@ -134,16 +160,44 @@ func TestPeekIgnoresAnUnterminatedTrailingLine(t *testing.T) {
 	wantVerdict(t, m, MembershipUndetermined, "", ReasonNone)
 }
 
-func TestPeekLineCapExhaustionIsNonMember(t *testing.T) {
+// The head scan is governed by the byte budget alone, never by a count of parsed cwd-less records:
+// a genuine member session that opens with a long run of bookkeeping records is precisely the
+// session the 4MiB budget was raised for, so a record count that pre-empted it would cache a
+// permanent misclassification of the sessions the amendment was written to admit.
+func TestPeekByteBudgetGovernsRunsOfCWDLessRecords(t *testing.T) {
+	store, project := t.TempDir(), t.TempDir()
+	locator := filepath.Join(mungeClaudeProjectDir(project), "session.jsonl")
+
+	const cwdLess = 40
+	if cwdLess <= maxPeekParseFailures {
+		t.Fatalf("fixture spends %d cwd-less records, want more than the %d-failure garbage cap",
+			cwdLess, maxPeekParseFailures)
+	}
+	lines := make([]string, 0, cwdLess+1)
+	for i := 0; i < cwdLess; i++ {
+		lines = append(lines, queueLine)
+	}
+	lines = append(lines, claudeCWDLine(project))
+	writeTranscript(t, store, locator, lines...)
+
+	m, _ := mustPeek(t, peekerFor(t, store, project), store, locator)
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+}
+
+// What stays bounded by a record count is unparseable garbage: a file that is not JSONL at all must
+// not be scanned to the full byte budget on the chance a cwd record appears in it. The bound counts
+// CONSECUTIVE failures, so a run broken by a real (if cwd-less) record starts over.
+func TestPeekParseFailureCapExhaustionIsNonMember(t *testing.T) {
 	store, project := t.TempDir(), t.TempDir()
 	dir := mungeClaudeProjectDir(project)
 	p := peekerFor(t, store, project)
 
-	atCap := make([]string, 0, maxPeekCWDLines+1)
-	for i := 0; i < maxPeekCWDLines; i++ {
-		atCap = append(atCap, queueLine)
+	atCap := make([]string, maxPeekParseFailures)
+	for i := range atCap {
+		atCap[i] = "not json at all"
 	}
-	underCap := append(append([]string(nil), atCap[:maxPeekCWDLines-1]...), claudeCWDLine(project))
+
+	underCap := append(append([]string(nil), atCap[:maxPeekParseFailures-1]...), claudeCWDLine(project))
 	writeTranscript(t, store, filepath.Join(dir, "under.jsonl"), underCap...)
 	m, _ := mustPeek(t, p, store, filepath.Join(dir, "under.jsonl"))
 	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
@@ -152,6 +206,13 @@ func TestPeekLineCapExhaustionIsNonMember(t *testing.T) {
 	writeTranscript(t, store, filepath.Join(dir, "over.jsonl"), overCap...)
 	m, _ = mustPeek(t, p, store, filepath.Join(dir, "over.jsonl"))
 	wantVerdict(t, m, MembershipNonMember, "", ReasonPeekCapExhausted)
+
+	split := append(append([]string(nil), atCap[:maxPeekParseFailures-1]...), queueLine)
+	split = append(split, atCap[:maxPeekParseFailures-1]...)
+	split = append(split, claudeCWDLine(project))
+	writeTranscript(t, store, filepath.Join(dir, "split.jsonl"), split...)
+	m, _ = mustPeek(t, p, store, filepath.Join(dir, "split.jsonl"))
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
 }
 
 func TestPeekByteCapExhaustionIsNonMember(t *testing.T) {
@@ -358,6 +419,53 @@ func TestPeekReportsTheStatTheVerdictWasReachedUnder(t *testing.T) {
 	}
 	if walked != st {
 		t.Fatalf("StatTranscript = %+v, want the peek's %+v", walked, st)
+	}
+}
+
+// The peek and the index together, over a file that is rewritten in place. Copying another session
+// over a transcript — or truncating and rewriting it — preserves both the inode and the path, so the
+// cached member verdict has nothing left to stand on but the stat corroboration. Without it the
+// index would keep answering "member" for content whose recorded cwd lies outside every registered
+// root, and no re-peek would ever run.
+func TestIndexedMemberIsRePeekedAfterAnInPlaceRewrite(t *testing.T) {
+	store, project := t.TempDir(), t.TempDir()
+	// The date-sharded codex layout carries no directory witness, so the verdict turns purely on the
+	// cwd the content records — exactly the evidence a rewrite replaces.
+	locator := filepath.Join("2026", "08", "09", "rollout-019c-0003.jsonl")
+	lines := []string{codexMetaLine(project)}
+	for i := 0; i < 8; i++ {
+		lines = append(lines, fillerLine(256))
+	}
+	path := writeTranscript(t, store, locator, lines...)
+	p := peekerFor(t, store, project)
+	ix := NewMembershipIndex()
+
+	dev, ino := identityOf(t, path)
+	m, st := mustPeek(t, p, store, locator)
+	wantVerdict(t, m, MembershipMember, rootPolicyID(project), ReasonNone)
+	ix.Record(dev, ino, path, st, m)
+
+	// Appending is the normal case: the cache must answer it without a re-peek.
+	appendString(t, path, fillerLine(256)+"\n")
+	if got := mustLookup(t, ix, dev, ino, path, mustStat(t, path)); got != m {
+		t.Fatalf("verdict after an append = %+v, want the cached %+v", got, m)
+	}
+
+	// cp another session over the file: same inode, same path, a cwd in no registered root.
+	foreign := t.TempDir()
+	writeFileString(t, path, codexMetaLine(foreign)+"\n")
+	if dev2, ino2 := identityOf(t, path); dev2 != dev || ino2 != ino {
+		t.Fatalf("the rewrite moved the identity to (%d,%d), want the original (%d,%d) — "+
+			"the fixture must exercise an in-place rewrite, not a replacement", dev2, ino2, dev, ino)
+	}
+	wantMiss(t, ix, dev, ino, path, mustStat(t, path))
+
+	// The forced re-peek decides the file it is now, not the one it was.
+	m2, st2 := mustPeek(t, p, store, locator)
+	wantVerdict(t, m2, MembershipNonMember, "", ReasonOutsideProjectRoots)
+	ix.Record(dev, ino, path, st2, m2)
+	if got := mustLookup(t, ix, dev, ino, path, mustStat(t, path)); got != m2 {
+		t.Fatalf("verdict after the re-peek = %+v, want the fresh non-member %+v", got, m2)
 	}
 }
 

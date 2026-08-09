@@ -83,6 +83,57 @@ func TestMembershipIndexKeepsMemberVerdictAcrossAppends(t *testing.T) {
 	}
 }
 
+// A file whose clock has not ticked between two observations still grew by appending; the corroboration
+// must not read that as a rewrite, because coarse ctime granularity would then evict busy transcripts.
+func TestMembershipIndexKeepsMemberWhenGrowthSharesACtime(t *testing.T) {
+	ix := NewMembershipIndex()
+	st := TranscriptStat{Size: 100, CtimeNanos: 7, UID: 1000}
+	ix.Record(1, 10, "/store/a.jsonl", st, memberVerdict("root-a"))
+	if got := mustLookup(t, ix, 1, 10, "/store/a.jsonl", TranscriptStat{Size: 180, CtimeNanos: 7, UID: 1000}); got != memberVerdict("root-a") {
+		t.Fatalf("member entry after a same-ctime append = %+v", got)
+	}
+}
+
+// A positive verdict is only as good as the bytes it was read from. An in-place rewrite keeps both
+// the inode and the path, so the path check alone would hand back "member" forever; what refuses it
+// is that a file which is only appended to may sit still or grow and nothing else. Every other shape
+// of movement is rewrite evidence and costs the entry its place in the index.
+func TestMembershipIndexEvictsMemberOnRewriteEvidence(t *testing.T) {
+	snap := TranscriptStat{Size: 4096, CtimeNanos: 100, UID: 1000}
+	for _, tc := range []struct {
+		name string
+		live TranscriptStat
+	}{
+		{"truncated and rewritten shorter", TranscriptStat{Size: 512, CtimeNanos: 200, UID: 1000}},
+		{"truncated to nothing", TranscriptStat{Size: 0, CtimeNanos: 200, UID: 1000}},
+		{"overwritten at the same length", TranscriptStat{Size: 4096, CtimeNanos: 200, UID: 1000}},
+		{"ctime went backwards", TranscriptStat{Size: 8192, CtimeNanos: 99, UID: 1000}},
+		{"owner changed", TranscriptStat{Size: 8192, CtimeNanos: 200, UID: 1001}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ix := NewMembershipIndex()
+			ix.Record(1, 10, "/store/a.jsonl", snap, memberVerdict("root-a"))
+			wantMiss(t, ix, 1, 10, "/store/a.jsonl", tc.live)
+			// The entry is gone, not merely skipped for one poll: the original stat does not
+			// resurrect it either.
+			wantMiss(t, ix, 1, 10, "/store/a.jsonl", snap)
+		})
+	}
+}
+
+// A surviving entry re-anchors to the stat that corroborated it, so growth is judged against the
+// file's last observed length rather than against the (much smaller) length it was peeked at.
+func TestMembershipIndexReanchorsMemberOnEveryCorroboration(t *testing.T) {
+	ix := NewMembershipIndex()
+	ix.Record(1, 10, "/store/a.jsonl", TranscriptStat{Size: 100, CtimeNanos: 7, UID: 1000}, memberVerdict("root-a"))
+	if got := mustLookup(t, ix, 1, 10, "/store/a.jsonl", TranscriptStat{Size: 4096, CtimeNanos: 99, UID: 1000}); got != memberVerdict("root-a") {
+		t.Fatalf("member entry after append = %+v", got)
+	}
+	// 200 bytes is more than the 100 the verdict was peeked at but far less than the 4096 last seen:
+	// the file was rewritten, not appended to.
+	wantMiss(t, ix, 1, 10, "/store/a.jsonl", TranscriptStat{Size: 200, CtimeNanos: 120, UID: 1000})
+}
+
 // A4: an identity seen at a NEW path is a reused inode, never the same file.
 func TestMembershipIndexInvalidatesOnNewPath(t *testing.T) {
 	ix := NewMembershipIndex()

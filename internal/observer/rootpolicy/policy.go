@@ -163,9 +163,6 @@ func LoadPolicy(path string) (Policy, error) {
 			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 				return Policy{}, fmt.Errorf("root policy record %d active path must name a canonical directory", i)
 			}
-			if err != nil {
-				return Policy{}, fmt.Errorf("resolve root policy record %d path: %w", i, err)
-			}
 			if resolved != canonical {
 				return Policy{}, fmt.Errorf("root policy record %d active path must not cross a symlink", i)
 			}
