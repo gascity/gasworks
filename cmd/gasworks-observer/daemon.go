@@ -41,8 +41,8 @@ func runDaemon(args []string) int {
 	allowLoopbackHTTP := fs.Bool("allow-loopback-http", false, "permit a plain-http loopback collector (dev only)")
 	// Content upload (Phase 1b) is opt-in and OFF by default: with it off the daemon is metadata-only,
 	// exactly as before. It reuses the -collector base + -token-file credential (no second endpoint or
-	// credential) and requires the watcher (-approved-root). OBSERVER_CONTENT_UPLOAD=1 sets the default.
-	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and -approved-root)")
+	// credential) and requires an explicitly configured watcher. OBSERVER_CONTENT_UPLOAD=1 sets the default.
+	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and an explicit root policy/root)")
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
@@ -61,6 +61,23 @@ func runDaemon(args []string) int {
 	if *sourceID == "" {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -source-id is required")
 		return 2
+	}
+	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy and -approved-root are mutually exclusive")
+		return 2
+	}
+	var policyRecords []rootpolicy.Record
+	if *rootPolicyFile != "" {
+		var err error
+		policyRecords, err = rootpolicy.Load(*rootPolicyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+			return 2
+		}
+		if *cursorDir == "" {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy")
+			return 2
+		}
 	}
 	stateDir, err := observerDir(*dir)
 	if err != nil {
@@ -91,8 +108,8 @@ func runDaemon(args []string) int {
 		}
 		cfg.Upload = &daemon.UploadLoopConfig{Sender: client}
 		if *contentUpload {
-			if len(approvedRoots) == 0 {
-				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root; running metadata-only")
+			if len(approvedRoots) == 0 && len(policyRecords) == 0 {
+				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root or -root-policy; running metadata-only")
 			} else {
 				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
 				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
@@ -101,21 +118,8 @@ func runDaemon(args []string) int {
 	} else if *contentUpload {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
 	}
-	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy and -approved-root are mutually exclusive")
-		return 2
-	}
 	if *rootPolicyFile != "" {
-		records, err := rootpolicy.Load(*rootPolicyFile)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
-			return 2
-		}
-		if *cursorDir == "" {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy")
-			return 2
-		}
-		cfg.Watch = newPolicyWatchLoopConfig(records, *cursorDir, *pollInterval)
+		cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval)
 	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
