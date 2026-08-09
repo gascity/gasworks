@@ -3,6 +3,7 @@
 package codex
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -207,6 +208,12 @@ type WatchConfig struct {
 	// RootPolicies are explicit, canonical companion consent records. They are mutually exclusive
 	// with ApprovedRoots; the legacy field remains unchanged for existing deployments.
 	RootPolicies []rootpolicy.Record
+	// Stores are the absolute provider store directories (the Claude projects dir, the Codex sessions
+	// dir) that kind=project consent roots draw their sessions from. A store holds every session on the
+	// machine, so it is never itself an approved root: a transcript beneath a store is captured only
+	// once membership classifies it into an active project root, and every other session is left
+	// untouched. Stores are meaningful only alongside kind=project RootPolicies.
+	Stores []string
 	// StateDir is the owner-only directory where per-file durable cursor state is persisted. It
 	// must be OUTSIDE the transcript roots so cursor files are never themselves treated as
 	// transcripts.
@@ -254,6 +261,10 @@ type trackedFile struct {
 	gcMetaCheckedAt time.Time
 	policy          *rootPolicyState
 	forwardBaseline bool
+	// member marks a transcript admitted by project membership rather than by direct root containment.
+	// It is what the content gate reads to require the A5 seal-completion conditions of a project
+	// session while leaving a legacy transcripts-root file's gate on forwardBaseline alone.
+	member bool
 	// absentPolls counts consecutive polls whose walk positively established that this identity is
 	// no longer under its root (a clean walk plus a readable parent directory). Walk errors leave it
 	// untouched, so an unreadable directory never counts as evidence of absence.
@@ -291,6 +302,18 @@ type Watcher struct {
 	tracked      map[identityKey]*trackedFile
 	refused      map[string]bool
 	rootPolicies map[string]*rootPolicyState
+	// stores are the provider store directories walked for kind=project consent. They are disjoint from
+	// ApprovedRoots: a store file reaches tracking through membership, never through root containment.
+	stores []string
+	// projectPolicies indexes the kind=project policy states by their ProjectRootID (the same id
+	// membership stamps on a positive verdict), so a member transcript is routed to the root it belongs
+	// to rather than the directory it was found under.
+	projectPolicies map[string]*rootPolicyState
+	// membership and membershipIndex are the peek engine and its corroborated verdict cache, built once
+	// when there is at least one active kind=project root. Both are nil in a legacy or transcripts-only
+	// deployment, which is the flag reconcileStores checks before doing any store work.
+	membership      *MembershipPeeker
+	membershipIndex *MembershipIndex
 }
 
 // NewWatcher validates cfg and returns a Watcher ready to Poll. It requires at least one absolute
@@ -305,7 +328,11 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 			if !filepath.IsAbs(p.Path) || p.Generation == 0 || (p.Active && p.Mode != rootpolicy.ForwardOnly && p.Mode != rootpolicy.Backfill) || (!p.Active && p.Mode != "") {
 				return nil, fmt.Errorf("codex watcher: invalid root policy for %q", p.Path)
 			}
-			if p.Active {
+			// Only a transcripts-kind root is a directory to tail directly. A kind=project root's path is
+			// the owner's project folder, whose sessions live in the recorded stores and are selected by
+			// membership, so it is never added to the tailed roots — walking it would seal and capture the
+			// project's own files.
+			if p.Active && !p.IsProject() {
 				cfg.ApprovedRoots = append(cfg.ApprovedRoots, p.Path)
 			}
 		}
@@ -351,6 +378,40 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 			policyStates[p.Path] = st
 		}
 	}
+	// A kind=project root draws its sessions from the recorded stores, indexed here by the id membership
+	// stamps on a member so a verdict routes straight to the root's state. The peek engine is built only
+	// when at least one such root is active; a legacy or transcripts-only deployment leaves it nil and
+	// reconcileStores stays a no-op.
+	projectPolicies := map[string]*rootPolicyState{}
+	hasProject := false
+	for _, p := range cfg.RootPolicies {
+		if p.Active && p.IsProject() {
+			hasProject = true
+			projectPolicies[rootPolicyID(p.Path)] = policyStates[p.Path]
+		}
+	}
+	for _, store := range cfg.Stores {
+		if !filepath.IsAbs(store) {
+			return nil, fmt.Errorf("codex watcher: store %q must be absolute", store)
+		}
+		// A store is walked like a root, so the same self-feed hazard applies: cursor state must not sit
+		// inside it, nor a store inside the state dir.
+		storeReal := resolvePathForCheck(store)
+		if pathContains(storeReal, stateReal) || pathContains(stateReal, storeReal) {
+			return nil, fmt.Errorf("codex watcher: state dir %q must be outside store %q", cfg.StateDir, store)
+		}
+	}
+	if hasProject && len(cfg.Stores) == 0 {
+		return nil, errors.New("codex watcher: a project root requires at least one recorded store")
+	}
+	var (
+		membership      *MembershipPeeker
+		membershipIndex *MembershipIndex
+	)
+	if hasProject {
+		membership = NewMembershipPeeker(rootpolicy.Policy{Roots: cfg.RootPolicies, Stores: cfg.Stores})
+		membershipIndex = NewMembershipIndex()
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -363,12 +424,16 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 		chunk = DefaultMaxReadChunk
 	}
 	return &Watcher{
-		cfg:          cfg,
-		readRange:    rr,
-		maxReadChunk: chunk,
-		tracked:      map[identityKey]*trackedFile{},
-		refused:      map[string]bool{},
-		rootPolicies: policyStates,
+		cfg:             cfg,
+		readRange:       rr,
+		maxReadChunk:    chunk,
+		tracked:         map[identityKey]*trackedFile{},
+		refused:         map[string]bool{},
+		rootPolicies:    policyStates,
+		stores:          append([]string(nil), cfg.Stores...),
+		projectPolicies: projectPolicies,
+		membership:      membership,
+		membershipIndex: membershipIndex,
 	}, nil
 }
 
@@ -502,6 +567,13 @@ func (w *Watcher) reconcileRoots(ctx context.Context) ([]*trackedFile, error) {
 			continue
 		}
 		policy.forgetLineageAbsence()
+	}
+	// Project roots draw their sessions from the shared stores rather than from a directory of their
+	// own, so they are reconciled in a separate membership-routed pass over those stores. It populates
+	// present and w.tracked (and rootCorroborated for each store) exactly as the loop above does for
+	// transcripts roots, so the absence GC below governs members on the same evidence.
+	if err := w.reconcileStores(ctx, present, dirsRead, rootCorroborated); err != nil {
+		return nil, err
 	}
 	for key := range present {
 		if tf := w.tracked[key]; tf != nil {
@@ -827,10 +899,49 @@ func (w *Watcher) flushPolicyControls() error {
 	return nil
 }
 
-// cursorFor returns a cursor constrained to the root's policy generation. During a forward-only
-// activation it performs only stat-derived sealing and durable writes; it never opens or reads the
-// transcript. The committed baseline map is the fail-closed recovery path when one cursor file is
-// lost after the activation marker has been written, and the committed lineage map is the same
+// sealFloor computes the byte floor a forward-only seal fences a discovered file at. A transcripts-
+// root seal stays stat-only — the floor is exactly the size the walk observed, taken without opening
+// the file — preserving the activation pass's no-read guarantee. A project member's floor is aligned
+// to the last complete record boundary at or before that size instead (A6), so a drain resuming at
+// the floor never begins mid-record and never splits one across the fence; the bytes of a partial
+// tail line still being written at seal time fall above the floor and count as post-seal. Locating
+// the boundary reads a bounded window ending at the size through the same validated open the tail
+// reader uses — it inspects bytes to find a newline, never delivers one — which is admissible for a
+// member whose head the peek has already read.
+func (w *Watcher) sealFloor(policy *rootPolicyState, d discovered) (int64, error) {
+	if !policy.record.IsProject() || d.size <= 0 {
+		return d.size, nil
+	}
+	f, _, _, err := openValidatedTranscript(d.root, d.locator, d.dev, d.ino)
+	if err != nil {
+		if isSkippableDrainErr(err) {
+			return 0, errDeferTracking
+		}
+		return 0, fmt.Errorf("aligning the seal floor for %s: %w", d.locator, err)
+	}
+	defer f.Close()
+	start := int64(0)
+	if d.size > w.maxReadChunk {
+		start = d.size - w.maxReadChunk
+	}
+	window, err := w.readRange(f, start, d.size-start)
+	if err != nil {
+		return 0, fmt.Errorf("aligning the seal floor for %s: %w", d.locator, err)
+	}
+	nl := bytes.LastIndexByte(window, '\n')
+	if nl < 0 {
+		// No record boundary within the bounded window (a single line longer than the read chunk):
+		// fence the whole partial at the observed size rather than split a record — the conservative
+		// direction, an over-fence that is backfillable rather than a mid-record publish.
+		return d.size, nil
+	}
+	return start + int64(nl) + 1, nil
+}
+
+// cursorFor returns a cursor constrained to the root's policy generation. During a transcripts-root
+// forward-only activation it performs only stat-derived sealing and durable writes; it never opens or
+// reads the transcript. The committed baseline map is the fail-closed recovery path when one cursor
+// file is lost after the activation marker has been written, and the committed lineage map is the same
 // recovery for the case no identity-keyed record can cover: the sealed file was replaced.
 func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d discovered, scan *rootScan) (*Cursor, bool, error) {
 	if policy == nil {
@@ -845,10 +956,12 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 		return cur, false, nil
 	}
 	if !policy.control.Committed {
-		// Stat-only seal: the floor is the size the walk observed, and no fingerprint is taken here
-		// because taking one would open and read the file during activation.
-		policy.setBaseline(d.locator, d.dev, d.ino, baselineRecord{Floor: d.size})
-		cur.SealAt(d.size)
+		floor, err := w.sealFloor(policy, d)
+		if err != nil {
+			return nil, false, err
+		}
+		policy.setBaseline(d.locator, d.dev, d.ino, baselineRecord{Floor: floor})
+		cur.SealAt(floor)
 		cur.observe(d.size, d.mod)
 		if err := cur.Save(); err != nil {
 			return nil, false, fmt.Errorf("saving the activation seal for %s: %w", d.locator, err)
@@ -867,6 +980,26 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 			return nil, false, err
 		}
 		base, baseline, fromLineage = inherited, ok, ok
+	}
+	if !baseline && policy.record.IsProject() {
+		// Late-member rule (A3/A5). A store transcript first classified a member AFTER the seal pass
+		// committed has neither a durable baseline nor a seal lineage to inherit: it was undetermined or
+		// non-member when the pass ran, so its identity was never sealed. The committed branch below
+		// would hand it a byte-zero cursor and publish everything it wrote before it became a member, so
+		// it is sealed here at its size at classification time instead — its pre-classification bytes are
+		// fenced as pre-consent and only what it appends afterward is captured. A transcripts-root file
+		// takes no such seal: a new file under a consented directory is post-consent in full.
+		floor, err := w.sealFloor(policy, d)
+		if err != nil {
+			return nil, false, err
+		}
+		policy.setBaseline(d.locator, d.dev, d.ino, baselineRecord{Floor: floor})
+		cur.SealAt(floor)
+		cur.observe(d.size, d.mod)
+		if err := cur.Save(); err != nil {
+			return nil, false, fmt.Errorf("saving the late-member seal for %s: %w", d.locator, err)
+		}
+		return cur, true, nil
 	}
 	// A missing/corrupt individual cursor must not reopen a baseline at byte zero, and neither must a
 	// cursor left behind a raised floor by a crash between the control write and the cursor write:
@@ -1157,7 +1290,7 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 // stat. It is a no-op when no observer is configured, and the observer's contract forbids blocking,
 // so this never delays the poll.
 func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, modNanos int64) {
-	if w.cfg.ContentObserver == nil || tf.forwardBaseline {
+	if w.cfg.ContentObserver == nil || !w.contentGateOpen(tf) {
 		return
 	}
 	// The sidecar uses the same anchored, no-symlink open discipline as transcript reads. Cache
