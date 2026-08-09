@@ -72,19 +72,6 @@ func writeTranscript(t *testing.T, store, locator string, lines ...string) strin
 	return path
 }
 
-func identityOf(t *testing.T, path string) (uint64, uint64) {
-	t.Helper()
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat %s: %v", path, err)
-	}
-	dev, ino, ok := fileIdentityOf(info)
-	if !ok {
-		t.Fatalf("no filesystem identity for %s", path)
-	}
-	return dev, ino
-}
-
 func mustPeek(t *testing.T, p *MembershipPeeker, store, locator string) (Membership, TranscriptStat) {
 	t.Helper()
 	dev, ino := identityOf(t, filepath.Join(store, locator))

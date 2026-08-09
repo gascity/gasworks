@@ -245,12 +245,20 @@ func TestWatcherForgetsContentOnDrop(t *testing.T) {
 		t.Fatalf("forgot before drop: %v", obs.forgotten())
 	}
 
-	// Remove the transcript; the next poll must GC the identity and forget the content state.
+	// Remove the transcript. The identity is released once its absence is corroborated by a second
+	// clean walk (one empty walk can also mean an unreadable directory), and that reconcile must
+	// forget the content state at the same point it GCs the cursor.
 	if err := os.Remove(p); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("poll 2: %v", err)
+	}
+	if got := obs.forgotten(); len(got) != 0 {
+		t.Fatalf("forgot %v after a single absent poll, want corroboration first", got)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("poll 3: %v", err)
 	}
 	got := obs.forgotten()
 	if len(got) != 1 || got[0] != [2]uint64{dev, ino} {
