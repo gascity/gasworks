@@ -403,6 +403,7 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 	rootWalkFailed := map[string]bool{}
 	for _, root := range w.cfg.ApprovedRoots {
 		policy := w.rootPolicies[root]
+		rootEnumerated := false
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				// Skip the unreadable entry and keep walking the rest of the tree, but remember that
@@ -413,12 +414,18 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 				if d != nil && d.IsDir() {
 					delete(dirsRead, filepath.Clean(path))
 				}
+				if path == root {
+					rootEnumerated = false
+				}
 				return nil // skip an unreadable entry; keep walking the rest of the tree
 			}
 			if d.IsDir() {
 				// Provisional: a readdir failure on this directory arrives as a second callback and
 				// takes the entry back out above.
 				dirsRead[filepath.Clean(path)] = struct{}{}
+				if path == root {
+					rootEnumerated = true
+				}
 				return nil
 			}
 			name := d.Name()
@@ -490,7 +497,11 @@ func (w *Watcher) reconcile(ctx context.Context) ([]*trackedFile, error) {
 		if err != nil && !os.IsNotExist(err) {
 			return nil, fmt.Errorf("scanning transcript root %s: %w", root, err)
 		}
-		if policy != nil && !policy.control.Committed {
+		// Activation commits only over a walk that actually saw the root: a missing or unreadable
+		// root enumerates nothing, and committing there would record zero baselines and hand every
+		// pre-existing file a byte-zero cursor once the root appeared. Leaving the marker uncommitted
+		// retries the metadata-only seal on the next poll, which is the fail-closed direction.
+		if policy != nil && !policy.control.Committed && rootEnumerated && !rootWalkFailed[root] {
 			policy.control.Committed = true
 			if err := policy.persistControl(); err != nil {
 				return nil, fmt.Errorf("commit root-policy activation %q: %w", root, err)

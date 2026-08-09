@@ -253,6 +253,56 @@ func TestForwardOnlyTransientUnreadableDirKeepsSealedPrefixFenced(t *testing.T) 
 	}
 }
 
+// TestForwardOnlyMissingRootDefersActivationCommit proves activation does not commit over a root the
+// walk never enumerated. Committing with zero baselines would mark every file discovered later as
+// post-consent and upload it in full.
+func TestForwardOnlyMissingRootDefersActivationCommit(t *testing.T) {
+	ctx := context.Background()
+	parent, state := t.TempDir(), t.TempDir()
+	root := filepath.Join(parent, "store")
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("missing-root poll: %v", err)
+	}
+	if w.rootPolicies[root].control.Committed {
+		t.Fatal("activation committed over a root the walk never read")
+	}
+
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(root, "session.jsonl")
+	pre := msgLine("pre-consent-secret") + "\n"
+	writeFileString(t, p, pre)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("appeared-root poll: %v", err)
+	}
+	if !w.rootPolicies[root].control.Committed {
+		t.Fatal("activation did not commit after the root was enumerated")
+	}
+
+	post := msgLine("post-consent") + "\n"
+	appendString(t, p, post)
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("append poll: %v", err)
+	}
+	if len(reads) != 1 || reads[0] != [2]int64{int64(len(pre)), int64(len(post))} {
+		t.Fatalf("reads = %v, want the pre-existing file sealed at its EOF", reads)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "post-consent" {
+		t.Fatalf("messages = %v, want no historical bytes", got)
+	}
+}
+
 func TestRootPolicyRejectsStaleGenerationAndBackfillIsPerRoot(t *testing.T) {
 	ctx := context.Background()
 	rootA, rootB, state := t.TempDir(), t.TempDir(), t.TempDir()
