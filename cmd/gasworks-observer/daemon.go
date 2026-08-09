@@ -16,6 +16,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/daemon"
 	"github.com/gascity/gasworks/internal/observer/evidence"
+	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 	"github.com/gascity/gasworks/internal/observer/spool"
 	"github.com/gascity/gasworks/internal/observer/upload"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -45,6 +46,7 @@ func runDaemon(args []string) int {
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
+	rootPolicyFile := fs.String("root-policy", "", "owner-supplied companion transcript root policy (mutually exclusive with -approved-root)")
 	cursorDir := fs.String("cursor-dir", "", "transcript cursor state dir (required with -approved-root)")
 	// The watcher re-walks and stats every file under the approved roots on each poll (change
 	// detection is a bounded poll, not fsnotify), so its steady-state CPU is O(files under the roots)
@@ -99,7 +101,22 @@ func runDaemon(args []string) int {
 	} else if *contentUpload {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
 	}
-	if len(approvedRoots) > 0 {
+	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy and -approved-root are mutually exclusive")
+		return 2
+	}
+	if *rootPolicyFile != "" {
+		records, err := rootpolicy.Load(*rootPolicyFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+			return 2
+		}
+		if *cursorDir == "" {
+			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy")
+			return 2
+		}
+		cfg.Watch = newPolicyWatchLoopConfig(records, *cursorDir, *pollInterval)
+	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
 			return 2
@@ -174,6 +191,19 @@ func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration
 		Policy:        watcherPolicy(),
 		Match:         transcriptNameMatch,
 		Interval:      interval,
+	}
+}
+
+// newPolicyWatchLoopConfig keeps companion consent records intact until the watcher, where the
+// generation fence and root-local baseline are applied. It intentionally does not infer any
+// provider home/root; every path arrived explicitly in the owner policy.
+func newPolicyWatchLoopConfig(records []rootpolicy.Record, cursorDir string, interval time.Duration) *daemon.WatchLoopConfig {
+	return &daemon.WatchLoopConfig{
+		RootPolicies: records,
+		StateDir:     cursorDir,
+		Policy:       watcherPolicy(),
+		Match:        transcriptNameMatch,
+		Interval:     interval,
 	}
 }
 

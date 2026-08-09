@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
+	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
@@ -192,6 +193,9 @@ type WatchConfig struct {
 	// refused unless it canonicalizes (no symlink, regular file, no parent-symlink escape) beneath
 	// one of these roots — the same rule the hook enforces.
 	ApprovedRoots []string
+	// RootPolicies are explicit, canonical companion consent records. They are mutually exclusive
+	// with ApprovedRoots; the legacy field remains unchanged for existing deployments.
+	RootPolicies []rootpolicy.Record
 	// StateDir is the owner-only directory where per-file durable cursor state is persisted. It
 	// must be OUTSIDE the transcript roots so cursor files are never themselves treated as
 	// transcripts.
@@ -256,6 +260,16 @@ type Watcher struct {
 // NewWatcher validates cfg and returns a Watcher ready to Poll. It requires at least one absolute
 // approved root, a state directory outside those roots, and a sink.
 func NewWatcher(cfg WatchConfig) (*Watcher, error) {
+	if len(cfg.RootPolicies) > 0 && len(cfg.ApprovedRoots) > 0 {
+		return nil, errors.New("codex watcher: root policies and approved roots are mutually exclusive")
+	}
+	if len(cfg.RootPolicies) > 0 {
+		for _, p := range cfg.RootPolicies {
+			if p.Active {
+				cfg.ApprovedRoots = append(cfg.ApprovedRoots, p.Path)
+			}
+		}
+	}
 	if len(cfg.ApprovedRoots) == 0 {
 		return nil, errors.New("codex watcher: at least one approved root is required")
 	}

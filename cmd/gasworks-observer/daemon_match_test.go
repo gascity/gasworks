@@ -5,6 +5,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 )
 
 // TestTranscriptNameMatch pins the transcript filename filter to the real session transcripts of
@@ -36,6 +38,20 @@ func TestTranscriptNameMatch(t *testing.T) {
 		if transcriptNameMatch(name) {
 			t.Errorf("transcriptNameMatch(%q) = true, want false (non-transcript)", name)
 		}
+	}
+}
+
+func TestNewPolicyWatchLoopConfigPreservesExplicitPerRootConsent(t *testing.T) {
+	records := []rootpolicy.Record{
+		{Path: "/explicit/claude", Generation: 4, Active: true, Mode: rootpolicy.ForwardOnly},
+		{Path: "/explicit/codex", Generation: 9, Active: false},
+	}
+	cfg := newPolicyWatchLoopConfig(records, "/tmp/cursors", 2*time.Second)
+	if len(cfg.ApprovedRoots) != 0 || len(cfg.RootPolicies) != len(records) {
+		t.Fatalf("watch config roots = legacy %v policy %v, want only policy records", cfg.ApprovedRoots, cfg.RootPolicies)
+	}
+	if cfg.RootPolicies[0] != records[0] || cfg.RootPolicies[1] != records[1] {
+		t.Fatalf("root policies = %+v, want %+v", cfg.RootPolicies, records)
 	}
 }
 
