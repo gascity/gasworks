@@ -291,7 +291,15 @@ func (w *Watcher) reconcileStoreScan(ctx context.Context, store string, scan *ro
 // membership, never by containment.
 func (w *Watcher) trackStoreMember(ctx context.Context, store string, scan *rootScan, f scannedFile, locator string, verdict Membership, present map[identityKey]struct{}, seenByPolicy map[string]map[string]struct{}) error {
 	if verdict.State != MembershipMember {
-		return nil // non-member or undetermined: never sealed, tracked, or observed
+		// Not a positive member (non-member OR still-undetermined), so nothing is sealed, tracked, or
+		// observed — but a file physically stood at this locator for the peek to reach at all, so the
+		// locator is OCCUPIED, not vacant. Record it exactly as the cold-tier and budget skips do; a
+		// locator the walk found holding a file must never feed retirement, or a live floor>0 fence whose
+		// current file merely stopped classifying (truncated, garbled, mid-write) would be un-fenced and
+		// its pre-consent prefix republished to the next member put back at that name (bd-main-1qh facet
+		// B). Marking only ADDS to seenByPolicy — it can hold a fence, never drop or lower one.
+		markLocatorOccupied(seenByPolicy, locator)
+		return nil
 	}
 	policy, ok := w.projectPolicies[verdict.ProjectRootID]
 	if !ok {
