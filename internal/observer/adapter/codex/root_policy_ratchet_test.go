@@ -286,9 +286,24 @@ func TestSameIdentityTruncationStillLowersItsOwnFence(t *testing.T) {
 // identity or deletes an entry). A writer added later that is on neither list - one that could lower or
 // clear a fence off the ratchet - fails here rather than in a customer's transcript, because `writers`
 // stays a whitelist: adding these two does not widen it to admit an unsanctioned direct write.
+//
+// A per-locator write is not the only way onto the map, though, and the other way names no locator at
+// all. `...Lineages = ...` rebinds the whole map, and `...control = ...` replaces the record that HOLDS
+// the map and takes Lineages to nil along with it. Neither shape is an index or a delete, so neither
+// meets the ratchet, and a probe watching only per-locator writes reads a build that drops every live
+// floor in a single statement as clean - which is exactly how the pre-consent history behind those
+// floors comes to be republished. Both shapes are held to the same whitelist discipline, on allowlists
+// of their own: the nil-map lazy init in setLineage and holdLineage, which only ever binds an empty map
+// immediately ahead of a reconciled write into it, and the create-and-generation-reset in
+// newRootPolicyState, the one place a root legitimately starts from no fences at all (a higher
+// generation is fresh consent, and consent given again is consent to reseal). Those allowlists are kept
+// SEPARATE from `writers` rather than folded into it: newRootPolicyState has no business making a
+// per-locator write, and folding it in would quietly grant it one.
 func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	writers := map[string]bool{"setLineage": true, "holdLineage": true, "retireAbsentLineages": true, "orphanLineagesNaming": true}
 	mustGuard := map[string]bool{"setLineage": true, "holdLineage": true}
+	mapRebinders := map[string]bool{"setLineage": true, "holdLineage": true}
+	controlRebinders := map[string]bool{"newRootPolicyState": true}
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -299,6 +314,7 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	}
 	guards := map[string]bool{}
 	found := 0
+	controlRebinds := 0
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			for _, decl := range file.Decls {
@@ -310,13 +326,22 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 					switch x := n.(type) {
 					case *ast.AssignStmt:
 						for _, lhs := range x.Lhs {
-							idx, isIndex := lhs.(*ast.IndexExpr)
-							if !isIndex || !isLineageMap(idx.X) {
-								continue
-							}
-							found++
-							if !writers[fn.Name.Name] {
-								t.Errorf("%s writes a locator's fence directly in %s; every write goes through setLineage or holdLineage", fset.Position(lhs.Pos()), fn.Name.Name)
+							switch {
+							case isLineageEntry(lhs):
+								found++
+								if !writers[fn.Name.Name] {
+									t.Errorf("%s writes a locator's fence directly in %s; every write goes through setLineage or holdLineage", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
+							case isLineageMap(lhs):
+								found++
+								if !mapRebinders[fn.Name.Name] {
+									t.Errorf("%s rebinds the whole fence map in %s, dropping every locator's floor with it; only setLineage and holdLineage may, and only to bind an empty map ahead of a reconciled write", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
+							case isControlRecord(lhs):
+								controlRebinds++
+								if !controlRebinders[fn.Name.Name] {
+									t.Errorf("%s reassigns the control record holding the fence map in %s, clearing every live floor with it; only newRootPolicyState may, and only to create a root or reset it to a higher generation", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
 							}
 						}
 					case *ast.CallExpr:
@@ -324,6 +349,17 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 							found++
 							if !writers[fn.Name.Name] {
 								t.Errorf("%s deletes a locator's fence in %s; un-fencing is retireAbsentLineages' alone", fset.Position(x.Pos()), fn.Name.Name)
+							}
+						}
+						// clear(map) drops EVERY entry in one call - at least as strong as the delete above, which
+						// un-fences one locator - and names no locator, so it is neither an IndexExpr nor a
+						// delete and slips both. It is already idiomatic in this file (clear on absentLineagePolls),
+						// so it is the likeliest off-ratchet whole-map drop to be typed next; hold it to the same
+						// writers whitelist. No site clears the map today, so any function that adds one fails.
+						if id, isIdent := x.Fun.(*ast.Ident); isIdent && id.Name == "clear" && len(x.Args) > 0 && isLineageMap(x.Args[0]) {
+							found++
+							if !writers[fn.Name.Name] {
+								t.Errorf("%s clears the whole fence map in %s, dropping every locator's floor at once; un-fencing is retireAbsentLineages' alone", fset.Position(x.Pos()), fn.Name.Name)
 							}
 						}
 						if sel, isSel := x.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "reconcileLineage" {
@@ -338,6 +374,13 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	if found == 0 {
 		t.Fatal("found no fence write at all; this probe has stopped watching the map it names")
 	}
+	// Counted apart from found on purpose. This shape matches on `control`, not on `Lineages`, so one
+	// total for both would let the two Lineages-keyed predicates go blind - a renamed field, a map moved
+	// behind an accessor - while the control matches alone held the total above zero and kept the probe
+	// quiet about a map it had stopped watching.
+	if controlRebinds == 0 {
+		t.Fatal("found no reassignment of the record holding the fence map; this probe has stopped watching the record it names")
+	}
 	for name := range mustGuard {
 		if !guards[name] {
 			t.Errorf("%s writes a locator's fence without routing through reconcileLineage; a live fence's identity must only be rebound or lowered by the identity it names", name)
@@ -349,6 +392,26 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 func isLineageMap(e ast.Expr) bool {
 	sel, ok := e.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "Lineages"
+}
+
+// isLineageEntry reports an expression naming ONE locator's entry in the fence map - the indexed write
+// that sets a single fence. Bare isLineageMap is the map itself, which as an assignment target is the
+// wholesale rebind instead.
+func isLineageEntry(e ast.Expr) bool {
+	idx, ok := e.(*ast.IndexExpr)
+	return ok && isLineageMap(idx.X)
+}
+
+// isControlRecord reports an expression naming the control record that HOLDS the fence map. Assigning
+// to it replaces Lineages wholesale - with a nil map, or with another root's - without any expression
+// in the statement naming Lineages at all, which is why the two predicates above cannot see it. The
+// match is on the selector NAME rather than on what is assigned: `control` names rootPolicyState's
+// rootPolicyControl field and nothing else in this package, whereas keying on a `rootPolicyControl{...}`
+// literal on the right-hand side would let `s.control = <anything else>` past. Only the selector itself
+// counts - `s.control.Committed = true` and the rest of the per-field writes leave the map alone.
+func isControlRecord(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "control"
 }
 
 // TestReleasedIdentityFenceSurvivesAReusedInodeNumber is the bd-main-fpj regression. Retirement keys
