@@ -119,8 +119,13 @@ func TestForwardOnlyIncompleteActivationDoesNotCommitOrDrainEarlierBytes(t *test
 		Sink:         sink,
 		Match:        func(name string) bool { return filepath.Ext(name) == ".jsonl" },
 	})
-	if err := w.Poll(ctx); err == nil {
-		t.Fatal("activation poll succeeded despite stat failure")
+	// bd-main-4qv: a dangling symlink is gone by the time the walk stats it — a mid-walk vanish
+	// (ENOENT), i.e. ordinary rotation churn, not a fault. The activation now DEFERS (returns nil) and
+	// retries on a later poll rather than returning fatal and terminating Run. The guarantee this test
+	// exists for is preserved by the checks below: the incomplete walk still does NOT commit its
+	// durable baseline, and it still never drains the pre-consent prefix.
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll over a mid-walk vanish should defer, not terminate Run: %v", err)
 	}
 	if w.rootPolicies[root].control.Committed {
 		t.Fatal("activation marker committed despite incomplete traversal")

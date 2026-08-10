@@ -752,7 +752,20 @@ func (w *Watcher) scanRoot(root string, forwardActivating bool, dirsRead map[str
 		info, err := os.Stat(path)
 		if err != nil {
 			if forwardActivating {
-				return fmt.Errorf("stat %s: %w", path, err)
+				// A file that vanished between readdir and stat is ordinary rotation churn, not a fault.
+				// Returning it fatal here propagates out of Poll and terminates Run, taking the daemon
+				// down until restart for a transient the steady-state path already tolerates below. So
+				// defer the activation and retry on the next poll, mirroring the not-yet-existent-root
+				// carve-out. A genuine, non-ENOENT stat fault (a real I/O or permission error, NOT churn)
+				// stays fatal. scan.failed both blocks the commit gate in reconcileRoots (which honors
+				// !scan.failed) and, because an uncommitted activation has no committed lineage to retire,
+				// suppresses no un-fencing that matters — so a churn-deferred walk provably cannot commit
+				// its durable baseline (bd-main-4qv).
+				if !os.IsNotExist(err) {
+					return fmt.Errorf("stat %s: %w", path, err)
+				}
+				scan.failed = true
+				return nil
 			}
 			if !os.IsNotExist(err) {
 				// An entry that cannot be statted is not an entry that is gone.
@@ -1105,6 +1118,16 @@ func (w *Watcher) cursorFor(ctx context.Context, policy *rootPolicyState, d disc
 		// stat a concurrent rewrite has already outgrown would deliver bytes the floor was chosen
 		// to fence.
 		if !fromLineage && d.size < floor {
+			// Lowering a recovered floor drops the sealed range between the surviving size and the old
+			// floor along with the fingerprint that described it, and it used to do so silently. Report
+			// that loss the way drain reports a truncation (same CAPTURE_LOSS/WARNING/PARTIAL wire codes),
+			// so the ambiguity is on the record instead of silent. Delivered BEFORE the floor is lowered,
+			// matching drain and reportSealReplacement: a sink failure fails the poll with nothing yet
+			// lowered, and the next poll re-derives the same decision from the durable baseline. The floor
+			// math below is unchanged.
+			if derr := w.cfg.Sink.DeliverCandidates(ctx, d.ref(), []*Candidate{divergenceDiagnostic(sealTruncated, floor, d.size)}); derr != nil {
+				return nil, false, fmt.Errorf("reporting the lowered recovered floor for %s: %w", d.locator, derr)
+			}
 			// The lowered floor is flushed with the rest of this poll's control changes; the cursor
 			// saved just below already fences the same bytes, so a crash in between reseals no lower.
 			// The recorded fingerprint described bytes that no longer exist, so it is dropped with the
