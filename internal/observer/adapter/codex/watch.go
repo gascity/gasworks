@@ -196,6 +196,26 @@ const (
 	// exactly the same absence as a deletion, and releasing a forward-only floor there would
 	// republish the whole pre-consent prefix the moment the directory came back.
 	absenceEvictionPolls = 2
+
+	// storePeekHotHorizon is how recently a store transcript must have been written to stay in the HOT
+	// classification tier, where it is eligible for a membership peek on every poll. A provider store
+	// is date-sharded and grows forever, and an undetermined verdict is deliberately never cached, so
+	// without a horizon every ancient shard would re-enter the undetermined set on each poll and spend
+	// the budget this poll's live sessions need. 90 days is far past any session still being appended
+	// to, so a transcript below the horizon has nothing left to say that a slow cadence would miss.
+	storePeekHotHorizon = 90 * 24 * time.Hour
+	// defaultStorePeekBudget caps how many membership peeks ONE poll spends classifying store
+	// transcripts the watcher is not already tailing. A peek reads a bounded head — a few KB for the
+	// overwhelming majority of transcripts, maxPeekBytes at the very worst — so 64 of them is a few
+	// hundred KB of reads in the common case and stays an order of magnitude inside the 500ms default
+	// poll interval even at the tail. It drains a 10k-transcript store in ~157 polls (~80s at the
+	// default cadence), which is well inside the window after a registration, while the tail of a
+	// transcript already being tailed is never charged against it.
+	defaultStorePeekBudget = 64
+	// defaultStorePeekColdPeriod is how many polls apart one COLD-tier transcript is reconsidered. At
+	// the default cadence that is one reconsideration per ~32s per pre-horizon file instead of two per
+	// second, which is what stops a store's accumulated history from crowding out its live sessions.
+	defaultStorePeekColdPeriod = 64
 )
 
 // WatchConfig is the endpoint-owned configuration a Watcher runs under. Everything the watcher
@@ -237,7 +257,8 @@ type WatchConfig struct {
 	// drained) with the file's current identity/path/stat, driving the optional whole-file content
 	// side channel. It never affects the metadata poll's success or cursor advancement.
 	ContentObserver ContentObserver
-	// Now overrides the clock (unused by Poll; Run's ticker uses Interval). nil uses time.Now.
+	// Now overrides the clock: the store scan reads it to tier a transcript by mtime, and Run's ticker
+	// uses Interval. nil uses time.Now.
 	Now func() time.Time
 }
 
@@ -314,6 +335,29 @@ type Watcher struct {
 	// deployment, which is the flag reconcileStores checks before doing any store work.
 	membership      *MembershipPeeker
 	membershipIndex *MembershipIndex
+	// peekMembership is the classification call the store scan spends its per-poll budget on. It is a
+	// field rather than a direct w.membership.Peek so a test can count the peeks one poll makes;
+	// production always holds the peeker's own method.
+	peekMembership func(store, locator string, dev, ino uint64) (Membership, TranscriptStat, error)
+	// storePeekBudget is how many peeks one poll may spend classifying store transcripts that are not
+	// already tracked, and storePeekColdPeriod is how many polls apart one cold-tier transcript is
+	// reconsidered. Both are fields, seeded from the package defaults, so a test can drive the
+	// scheduler without a config surface nobody deploying this would set.
+	storePeekBudget     int
+	storePeekColdPeriod uint64
+	// peekDeferred is the queue of identities the previous poll ran out of budget before classifying,
+	// IN THE ORDER they were deferred. It is the round-robin state: they are reconsidered ahead of the
+	// rest of the walk on the next poll, so no transcript is starved behind the same head of a store's
+	// enumeration. The order is load-bearing — an unordered set re-sorts into walk order on every poll,
+	// which hands the allowance back to the same low-sorting names and starves the tail just as badly.
+	peekDeferred []identityKey
+	// coldPeekDue is the poll each pre-horizon transcript may next be reconsidered on, so a store's
+	// accumulated history is re-read on a cadence instead of on every poll. Both maps are rebuilt from
+	// what each poll actually walked, so neither outlives the transcripts in it.
+	coldPeekDue map[identityKey]uint64
+	// pollSeq counts the store polls this watcher has run. It is the clock the cold tier's cadence is
+	// measured in.
+	pollSeq uint64
 }
 
 // NewWatcher validates cfg and returns a Watcher ready to Poll. It requires at least one absolute
@@ -423,18 +467,25 @@ func NewWatcher(cfg WatchConfig) (*Watcher, error) {
 	if chunk <= 0 {
 		chunk = DefaultMaxReadChunk
 	}
-	return &Watcher{
-		cfg:             cfg,
-		readRange:       rr,
-		maxReadChunk:    chunk,
-		tracked:         map[identityKey]*trackedFile{},
-		refused:         map[string]bool{},
-		rootPolicies:    policyStates,
-		stores:          append([]string(nil), cfg.Stores...),
-		projectPolicies: projectPolicies,
-		membership:      membership,
-		membershipIndex: membershipIndex,
-	}, nil
+	w := &Watcher{
+		cfg:                 cfg,
+		readRange:           rr,
+		maxReadChunk:        chunk,
+		tracked:             map[identityKey]*trackedFile{},
+		refused:             map[string]bool{},
+		rootPolicies:        policyStates,
+		stores:              append([]string(nil), cfg.Stores...),
+		projectPolicies:     projectPolicies,
+		membership:          membership,
+		membershipIndex:     membershipIndex,
+		storePeekBudget:     defaultStorePeekBudget,
+		storePeekColdPeriod: defaultStorePeekColdPeriod,
+		coldPeekDue:         map[identityKey]uint64{},
+	}
+	if membership != nil {
+		w.peekMembership = membership.Peek
+	}
+	return w, nil
 }
 
 // Run polls at the configured interval until ctx is cancelled, returning ctx.Err(). A per-poll
