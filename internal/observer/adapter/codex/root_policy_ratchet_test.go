@@ -286,9 +286,24 @@ func TestSameIdentityTruncationStillLowersItsOwnFence(t *testing.T) {
 // identity or deletes an entry). A writer added later that is on neither list - one that could lower or
 // clear a fence off the ratchet - fails here rather than in a customer's transcript, because `writers`
 // stays a whitelist: adding these two does not widen it to admit an unsanctioned direct write.
+//
+// A per-locator write is not the only way onto the map, though, and the other way names no locator at
+// all. `...Lineages = ...` rebinds the whole map, and `...control = ...` replaces the record that HOLDS
+// the map and takes Lineages to nil along with it. Neither shape is an index or a delete, so neither
+// meets the ratchet, and a probe watching only per-locator writes reads a build that drops every live
+// floor in a single statement as clean - which is exactly how the pre-consent history behind those
+// floors comes to be republished. Both shapes are held to the same whitelist discipline, on allowlists
+// of their own: the nil-map lazy init in setLineage and holdLineage, which only ever binds an empty map
+// immediately ahead of a reconciled write into it, and the create-and-generation-reset in
+// newRootPolicyState, the one place a root legitimately starts from no fences at all (a higher
+// generation is fresh consent, and consent given again is consent to reseal). Those allowlists are kept
+// SEPARATE from `writers` rather than folded into it: newRootPolicyState has no business making a
+// per-locator write, and folding it in would quietly grant it one.
 func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	writers := map[string]bool{"setLineage": true, "holdLineage": true, "retireAbsentLineages": true, "orphanLineagesNaming": true}
 	mustGuard := map[string]bool{"setLineage": true, "holdLineage": true}
+	mapRebinders := map[string]bool{"setLineage": true, "holdLineage": true}
+	controlRebinders := map[string]bool{"newRootPolicyState": true}
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
@@ -299,6 +314,7 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	}
 	guards := map[string]bool{}
 	found := 0
+	controlRebinds := 0
 	for _, pkg := range pkgs {
 		for _, file := range pkg.Files {
 			for _, decl := range file.Decls {
@@ -310,13 +326,22 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 					switch x := n.(type) {
 					case *ast.AssignStmt:
 						for _, lhs := range x.Lhs {
-							idx, isIndex := lhs.(*ast.IndexExpr)
-							if !isIndex || !isLineageMap(idx.X) {
-								continue
-							}
-							found++
-							if !writers[fn.Name.Name] {
-								t.Errorf("%s writes a locator's fence directly in %s; every write goes through setLineage or holdLineage", fset.Position(lhs.Pos()), fn.Name.Name)
+							switch {
+							case isLineageEntry(lhs):
+								found++
+								if !writers[fn.Name.Name] {
+									t.Errorf("%s writes a locator's fence directly in %s; every write goes through setLineage or holdLineage", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
+							case isLineageMap(lhs):
+								found++
+								if !mapRebinders[fn.Name.Name] {
+									t.Errorf("%s rebinds the whole fence map in %s, dropping every locator's floor with it; only setLineage and holdLineage may, and only to bind an empty map ahead of a reconciled write", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
+							case isControlRecord(lhs):
+								controlRebinds++
+								if !controlRebinders[fn.Name.Name] {
+									t.Errorf("%s reassigns the control record holding the fence map in %s, clearing every live floor with it; only newRootPolicyState may, and only to create a root or reset it to a higher generation", fset.Position(lhs.Pos()), fn.Name.Name)
+								}
 							}
 						}
 					case *ast.CallExpr:
@@ -324,6 +349,17 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 							found++
 							if !writers[fn.Name.Name] {
 								t.Errorf("%s deletes a locator's fence in %s; un-fencing is retireAbsentLineages' alone", fset.Position(x.Pos()), fn.Name.Name)
+							}
+						}
+						// clear(map) drops EVERY entry in one call - at least as strong as the delete above, which
+						// un-fences one locator - and names no locator, so it is neither an IndexExpr nor a
+						// delete and slips both. It is already idiomatic in this file (clear on absentLineagePolls),
+						// so it is the likeliest off-ratchet whole-map drop to be typed next; hold it to the same
+						// writers whitelist. No site clears the map today, so any function that adds one fails.
+						if id, isIdent := x.Fun.(*ast.Ident); isIdent && id.Name == "clear" && len(x.Args) > 0 && isLineageMap(x.Args[0]) {
+							found++
+							if !writers[fn.Name.Name] {
+								t.Errorf("%s clears the whole fence map in %s, dropping every locator's floor at once; un-fencing is retireAbsentLineages' alone", fset.Position(x.Pos()), fn.Name.Name)
 							}
 						}
 						if sel, isSel := x.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "reconcileLineage" {
@@ -338,6 +374,13 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 	if found == 0 {
 		t.Fatal("found no fence write at all; this probe has stopped watching the map it names")
 	}
+	// Counted apart from found on purpose. This shape matches on `control`, not on `Lineages`, so one
+	// total for both would let the two Lineages-keyed predicates go blind - a renamed field, a map moved
+	// behind an accessor - while the control matches alone held the total above zero and kept the probe
+	// quiet about a map it had stopped watching.
+	if controlRebinds == 0 {
+		t.Fatal("found no reassignment of the record holding the fence map; this probe has stopped watching the record it names")
+	}
 	for name := range mustGuard {
 		if !guards[name] {
 			t.Errorf("%s writes a locator's fence without routing through reconcileLineage; a live fence's identity must only be rebound or lowered by the identity it names", name)
@@ -349,6 +392,26 @@ func TestEveryLineageWriteFlowsThroughTheRatchetOrRetirement(t *testing.T) {
 func isLineageMap(e ast.Expr) bool {
 	sel, ok := e.(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == "Lineages"
+}
+
+// isLineageEntry reports an expression naming ONE locator's entry in the fence map - the indexed write
+// that sets a single fence. Bare isLineageMap is the map itself, which as an assignment target is the
+// wholesale rebind instead.
+func isLineageEntry(e ast.Expr) bool {
+	idx, ok := e.(*ast.IndexExpr)
+	return ok && isLineageMap(idx.X)
+}
+
+// isControlRecord reports an expression naming the control record that HOLDS the fence map. Assigning
+// to it replaces Lineages wholesale - with a nil map, or with another root's - without any expression
+// in the statement naming Lineages at all, which is why the two predicates above cannot see it. The
+// match is on the selector NAME rather than on what is assigned: `control` names rootPolicyState's
+// rootPolicyControl field and nothing else in this package, whereas keying on a `rootPolicyControl{...}`
+// literal on the right-hand side would let `s.control = <anything else>` past. Only the selector itself
+// counts - `s.control.Committed = true` and the rest of the per-field writes leave the map alone.
+func isControlRecord(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "control"
 }
 
 // TestReleasedIdentityFenceSurvivesAReusedInodeNumber is the bd-main-fpj regression. Retirement keys
@@ -616,5 +679,133 @@ func TestForeignWriteAtRootPolicyNeverRebindsOrClearsALiveFence(t *testing.T) {
 	}
 	if got.Floor != raised {
 		t.Fatalf("fence floor after holdLineage by a foreign identity = %d, want it held at %d", got.Floor, raised)
+	}
+}
+
+// TestCrossMoveHoldsEachLocatorsHigherFloorThroughThePollPath is the bd-main-dpv regression. dpv worried
+// that a cross-move - two sealed members of a consented store swapping names at once - could drop a
+// locator's higher floor to the LOWER one the arriving counterpart carries, publishing the pre-consent
+// span between the two floors. This drives that exact cross-move through the poll path on a real
+// filesystem and holds the invariant end to end. Both members are already sealed, so each arrives at its
+// new locator through the tracked-rename hold carrying its OWN committed baseline floor, and meets a LIVE
+// fence there: the longer transcript's floor is HELD where the shorter one's identity lands on it (a
+// foreign writer at or below the floor never lowers and never rebinds), and the shorter transcript's
+// locator RATCHETS UP to the higher floor the longer one's identity brings, keeping its own incumbent
+// identity (bd-main-9xl/dyc). The fence is live at both locators throughout, so the non-live door dpv
+// feared is never opened - and the owner's own pre-consent history copied back to the higher name
+// afterwards inherits the held floor and publishes only what was appended above it.
+func TestCrossMoveHoldsEachLocatorsHigherFloorThroughThePollPath(t *testing.T) {
+	ctx := context.Background()
+	root, state, away := t.TempDir(), t.TempDir(), t.TempDir()
+	pa := filepath.Join(root, "a.jsonl")
+	pb := filepath.Join(root, "b.jsonl")
+
+	// a is the longer transcript - the higher floor; b the shorter one - the lower floor. The gap between
+	// them is precisely the span dpv worried a downgrade would publish.
+	preA := msgLine("a-pre-consent-one") + "\n" + msgLine("a-pre-consent-two") + "\n" + msgLine("a-pre-consent-three") + "\n"
+	preB := msgLine("b-pre-consent-one") + "\n"
+	writeFileString(t, pa, preA)
+	writeFileString(t, pb, preB)
+	floorA, floorB := int64(len(preA)), int64(len(preB))
+	if floorA <= floorB {
+		t.Fatalf("staging error: floorA %d must exceed floorB %d for the downgrade dpv named to be observable", floorA, floorB)
+	}
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	devA, inoA := identityOf(t, pa)
+	devB, inoB := identityOf(t, pb)
+	policy := w.rootPolicies[root]
+	if fa := policy.control.Lineages["a.jsonl"]; fa.Floor != floorA || fa.Device != devA || fa.Inode != inoA || fa.FingerprintLen == 0 {
+		t.Fatalf("staging error: a.jsonl fence %+v, want the sealed floor %d fingerprinted and named by (%d,%d)", fa, floorA, devA, inoA)
+	}
+	if fb := policy.control.Lineages["b.jsonl"]; fb.Floor != floorB || fb.Device != devB || fb.Inode != inoB || fb.FingerprintLen == 0 {
+		t.Fatalf("staging error: b.jsonl fence %+v, want the sealed floor %d fingerprinted and named by (%d,%d)", fb, floorB, devB, inoB)
+	}
+
+	// The cross-move: the two sealed members exchange names in one swap - a.jsonl comes to hold the
+	// identity that was at b.jsonl and vice versa - staged as a three-step rename through a name outside
+	// the root so the poll observes only the settled result, the way a periodic walk observes any swap.
+	hold := filepath.Join(away, "hold.jsonl")
+	if err := os.Rename(pa, hold); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(pb, pa); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(hold, pb); err != nil {
+		t.Fatal(err)
+	}
+	if d, i := identityOf(t, pa); d != devB || i != inoB {
+		t.Fatalf("cross-move staging: a.jsonl holds (%d,%d), want the counterpart (%d,%d)", d, i, devB, inoB)
+	}
+	if d, i := identityOf(t, pb); d != devA || i != inoA {
+		t.Fatalf("cross-move staging: b.jsonl holds (%d,%d), want the counterpart (%d,%d)", d, i, devA, inoA)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("cross-move poll: %v", err)
+	}
+
+	// a.jsonl's higher floor is HELD against the counterpart's lower one: the arriving identity is foreign
+	// to the live fence, and a foreign writer at or below the floor holds it, never lowering and never
+	// rebinding the fence to itself. This is the assertion that would fail were dpv's downgrade real.
+	fa := policy.control.Lineages["a.jsonl"]
+	if fa.Floor != floorA {
+		t.Fatalf("a.jsonl fence floor after the cross-move = %d, want the higher floor %d held, not the counterpart's %d", fa.Floor, floorA, floorB)
+	}
+	if fa.Device != devA || fa.Inode != inoA {
+		t.Fatalf("a.jsonl fence identity after the cross-move = (%d,%d), want the incumbent (%d,%d) never rebound to the counterpart", fa.Device, fa.Inode, devA, inoA)
+	}
+	// b.jsonl RATCHETS UP to the higher floor the arriving counterpart carries, keeping its own incumbent
+	// identity - the same ratchet a foreign write above the floor takes anywhere. It is never lowered.
+	fb := policy.control.Lineages["b.jsonl"]
+	if fb.Floor != floorA {
+		t.Fatalf("b.jsonl fence floor after the cross-move = %d, want it ratcheted up to the arriving counterpart's higher floor %d", fb.Floor, floorA)
+	}
+	if fb.Device != devB || fb.Inode != inoB {
+		t.Fatalf("b.jsonl fence identity after the cross-move = (%d,%d), want the incumbent (%d,%d) kept through the ratchet", fb.Device, fb.Inode, devB, inoB)
+	}
+	if got := readRootControl(t, state, root); got.Lineages["a.jsonl"] != fa || got.Lineages["b.jsonl"] != fb {
+		t.Fatalf("persisted fences = %+v, want the in-memory holds committed to disk", got.Lineages)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want no pre-consent record delivered across the cross-move", got)
+	}
+	for _, r := range reads {
+		if r[0] < floorB {
+			t.Fatalf("read %v dips below the lower floor %d during the cross-move", r, floorB)
+		}
+	}
+
+	// The observable safety property: the owner's own long pre-consent history copied back to a.jsonl as
+	// a fresh inode - an editor save, a restore from backup - meets the held higher floor, corroborates
+	// against it and only the bytes appended ABOVE it are ever captured. Had a.jsonl been downgraded to
+	// the counterpart's floor, the span between the two floors would have been published here.
+	post := msgLine("a-post-consent-after-restore") + "\n"
+	replaceViaRename(t, pa, preA+post)
+	if d, i := identityOf(t, pa); d == devB && i == inoB {
+		t.Skip("filesystem kept the inode across the atomic replace; the copy-back needs a fresh identity")
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("copy-back poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "a-post-consent-after-restore" {
+		t.Fatalf("messages = %v, want only the record appended above a.jsonl's held floor %d", got, floorA)
+	}
+	for _, r := range reads {
+		if r[0] < floorA {
+			t.Fatalf("read %v dips below a.jsonl's held floor %d; the pre-consent span was published", r, floorA)
+		}
 	}
 }
