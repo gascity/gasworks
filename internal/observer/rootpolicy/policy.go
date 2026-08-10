@@ -21,11 +21,51 @@ const (
 	SchemaV2 = "gasworks.companion.root-policy/v2"
 )
 
+// Mode is a root's capture mode. It also fixes the cross-generation re-delivery idempotency
+// contract the endpoint dedups against, because both modes re-present the same transcript bytes on a
+// re-read and the two must agree on what makes a re-delivery identical.
+//
+// Re-delivery is ordinary at-least-once bookkeeping. The watcher tails each transcript behind a
+// durable per-generation scoped cursor; on a delivery failure the cursor is not advanced, and on a
+// restart that lost the durable cursor, or a re-registration that mints a new generation (and so a
+// fresh scoped cursor), the file is re-read from its floor and its records are delivered again. The
+// same bytes therefore reach the endpoint more than once, and the endpoint deduplicates them by
+// observation identity.
+//
+// CROSS-GENERATION DEDUP KEY (the contract a server implementer relies on). A re-delivered record is
+// the SAME observation as its first delivery when, and only when, these generation-stable,
+// content-derived fields match — the watcher re-presents every one of them byte-identically across a
+// generation bump or a restart:
+//   - provenance.source_locator (the transcript path relative to its consent root),
+//   - occurred_at (the provider event time parsed from the record),
+//   - the observation kind, and
+//   - that kind's typed payload metadata (for MESSAGE, role and byte_count; for USAGE, the token
+//     counts and message id; for TOOL_CALL/TOOL_RESULT, the category/status and byte counts),
+//   - together with provenance.native_session_id and provenance.provider, which the watcher threads
+//     from the transcript's own session record and so are likewise stable.
+//
+// The endpoint MUST dedup on that set. It MUST NOT dedup on any value minted per delivery downstream
+// of the watcher: the single-writer daemon assigns a FRESH sequence and observation id to every WAL
+// append, and stamps a delivery-time captured_at, so the platform's logical dedup key
+// (source_id, sequence, observation_id) is not stable across a re-append and captured_at differs on
+// every re-read. Keying on any of those would let a backfill re-delivery ingest the same transcript
+// bytes twice. This is a documentation contract only: closing it fully needs a content-derived
+// idempotency token on the wire, which is a cross-repo server change and out of scope here.
 type Mode string
 
 const (
+	// ForwardOnly seals a root's existing content at a per-file line-aligned EOF floor at registration
+	// and delivers only bytes appended after it. A re-registration mints a new generation whose fresh
+	// scoped cursor reseals at the current floor, so a Backfill->ForwardOnly flip never republishes the
+	// content beneath the new floor: the new generation's floor governs.
 	ForwardOnly Mode = "forward-only"
-	Backfill    Mode = "backfill"
+	// Backfill delivers the whole file, floor at zero, because the owner consented to full history. A
+	// re-read (restart with a lost cursor, or a new generation) re-delivers that history; it is
+	// idempotent because every re-delivery re-presents byte-identical content under the
+	// generation-stable dedup key documented on Mode. The whole-file content side channel is likewise
+	// idempotent: it re-presents the same identity (locator, device, inode) and size, which the content
+	// endpoint dedups by hash plus identity, superseding with a later, larger snapshot.
+	Backfill Mode = "backfill"
 )
 
 // Kind says what a root's path names. The empty kind is v1's implicit Transcripts: v1 documents
