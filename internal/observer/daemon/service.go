@@ -17,6 +17,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/local"
+	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 	"github.com/gascity/gasworks/internal/observer/spool"
 	"github.com/gascity/gasworks/internal/observer/upload"
 )
@@ -162,6 +163,9 @@ type ContentUploadLoopConfig struct {
 type WatchLoopConfig struct {
 	// ApprovedRoots are the absolute transcript roots the watcher may tail.
 	ApprovedRoots []string
+	// RootPolicies are explicit owner consent records for the private Companion runtime. They are
+	// mutually exclusive with ApprovedRoots, which remains the legacy watcher configuration.
+	RootPolicies []rootpolicy.Record
 	// StateDir is the owner-only durable cursor directory (outside the approved roots).
 	StateDir string
 	// References is the extraction configuration passed to every parse.
@@ -382,6 +386,7 @@ func (s *Service) buildSink(cfg *WatchLoopConfig, socketPath string) (*Candidate
 func (s *Service) buildWatcher(cfg *WatchLoopConfig, sink *CandidateSinkAdapter, obs codex.ContentObserver) (*codex.Watcher, error) {
 	w, err := codex.NewWatcher(codex.WatchConfig{
 		ApprovedRoots:   cfg.ApprovedRoots,
+		RootPolicies:    cfg.RootPolicies,
 		StateDir:        cfg.StateDir,
 		References:      cfg.References,
 		Sink:            NewPartialCandidateSinkAdapter(sink),
