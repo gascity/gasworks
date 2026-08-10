@@ -618,3 +618,131 @@ func TestForeignWriteAtRootPolicyNeverRebindsOrClearsALiveFence(t *testing.T) {
 		t.Fatalf("fence floor after holdLineage by a foreign identity = %d, want it held at %d", got.Floor, raised)
 	}
 }
+
+// TestCrossMoveHoldsEachLocatorsHigherFloorThroughThePollPath is the bd-main-dpv regression. dpv worried
+// that a cross-move - two sealed members of a consented store swapping names at once - could drop a
+// locator's higher floor to the LOWER one the arriving counterpart carries, publishing the pre-consent
+// span between the two floors. This drives that exact cross-move through the poll path on a real
+// filesystem and holds the invariant end to end. Both members are already sealed, so each arrives at its
+// new locator through the tracked-rename hold carrying its OWN committed baseline floor, and meets a LIVE
+// fence there: the longer transcript's floor is HELD where the shorter one's identity lands on it (a
+// foreign writer at or below the floor never lowers and never rebinds), and the shorter transcript's
+// locator RATCHETS UP to the higher floor the longer one's identity brings, keeping its own incumbent
+// identity (bd-main-9xl/dyc). The fence is live at both locators throughout, so the non-live door dpv
+// feared is never opened - and the owner's own pre-consent history copied back to the higher name
+// afterwards inherits the held floor and publishes only what was appended above it.
+func TestCrossMoveHoldsEachLocatorsHigherFloorThroughThePollPath(t *testing.T) {
+	ctx := context.Background()
+	root, state, away := t.TempDir(), t.TempDir(), t.TempDir()
+	pa := filepath.Join(root, "a.jsonl")
+	pb := filepath.Join(root, "b.jsonl")
+
+	// a is the longer transcript - the higher floor; b the shorter one - the lower floor. The gap between
+	// them is precisely the span dpv worried a downgrade would publish.
+	preA := msgLine("a-pre-consent-one") + "\n" + msgLine("a-pre-consent-two") + "\n" + msgLine("a-pre-consent-three") + "\n"
+	preB := msgLine("b-pre-consent-one") + "\n"
+	writeFileString(t, pa, preA)
+	writeFileString(t, pb, preB)
+	floorA, floorB := int64(len(preA)), int64(len(preB))
+	if floorA <= floorB {
+		t.Fatalf("staging error: floorA %d must exceed floorB %d for the downgrade dpv named to be observable", floorA, floorB)
+	}
+
+	var reads [][2]int64
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{{Path: root, Generation: 1, Active: true, Mode: rootpolicy.ForwardOnly}},
+		StateDir:     state, Sink: sink,
+		ReadRange: func(f *os.File, off, n int64) ([]byte, error) {
+			reads = append(reads, [2]int64{off, n})
+			return readRangeAt(f, off, n)
+		},
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	devA, inoA := identityOf(t, pa)
+	devB, inoB := identityOf(t, pb)
+	policy := w.rootPolicies[root]
+	if fa := policy.control.Lineages["a.jsonl"]; fa.Floor != floorA || fa.Device != devA || fa.Inode != inoA || fa.FingerprintLen == 0 {
+		t.Fatalf("staging error: a.jsonl fence %+v, want the sealed floor %d fingerprinted and named by (%d,%d)", fa, floorA, devA, inoA)
+	}
+	if fb := policy.control.Lineages["b.jsonl"]; fb.Floor != floorB || fb.Device != devB || fb.Inode != inoB || fb.FingerprintLen == 0 {
+		t.Fatalf("staging error: b.jsonl fence %+v, want the sealed floor %d fingerprinted and named by (%d,%d)", fb, floorB, devB, inoB)
+	}
+
+	// The cross-move: the two sealed members exchange names in one swap - a.jsonl comes to hold the
+	// identity that was at b.jsonl and vice versa - staged as a three-step rename through a name outside
+	// the root so the poll observes only the settled result, the way a periodic walk observes any swap.
+	hold := filepath.Join(away, "hold.jsonl")
+	if err := os.Rename(pa, hold); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(pb, pa); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(hold, pb); err != nil {
+		t.Fatal(err)
+	}
+	if d, i := identityOf(t, pa); d != devB || i != inoB {
+		t.Fatalf("cross-move staging: a.jsonl holds (%d,%d), want the counterpart (%d,%d)", d, i, devB, inoB)
+	}
+	if d, i := identityOf(t, pb); d != devA || i != inoA {
+		t.Fatalf("cross-move staging: b.jsonl holds (%d,%d), want the counterpart (%d,%d)", d, i, devA, inoA)
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("cross-move poll: %v", err)
+	}
+
+	// a.jsonl's higher floor is HELD against the counterpart's lower one: the arriving identity is foreign
+	// to the live fence, and a foreign writer at or below the floor holds it, never lowering and never
+	// rebinding the fence to itself. This is the assertion that would fail were dpv's downgrade real.
+	fa := policy.control.Lineages["a.jsonl"]
+	if fa.Floor != floorA {
+		t.Fatalf("a.jsonl fence floor after the cross-move = %d, want the higher floor %d held, not the counterpart's %d", fa.Floor, floorA, floorB)
+	}
+	if fa.Device != devA || fa.Inode != inoA {
+		t.Fatalf("a.jsonl fence identity after the cross-move = (%d,%d), want the incumbent (%d,%d) never rebound to the counterpart", fa.Device, fa.Inode, devA, inoA)
+	}
+	// b.jsonl RATCHETS UP to the higher floor the arriving counterpart carries, keeping its own incumbent
+	// identity - the same ratchet a foreign write above the floor takes anywhere. It is never lowered.
+	fb := policy.control.Lineages["b.jsonl"]
+	if fb.Floor != floorA {
+		t.Fatalf("b.jsonl fence floor after the cross-move = %d, want it ratcheted up to the arriving counterpart's higher floor %d", fb.Floor, floorA)
+	}
+	if fb.Device != devB || fb.Inode != inoB {
+		t.Fatalf("b.jsonl fence identity after the cross-move = (%d,%d), want the incumbent (%d,%d) kept through the ratchet", fb.Device, fb.Inode, devB, inoB)
+	}
+	if got := readRootControl(t, state, root); got.Lineages["a.jsonl"] != fa || got.Lineages["b.jsonl"] != fb {
+		t.Fatalf("persisted fences = %+v, want the in-memory holds committed to disk", got.Lineages)
+	}
+	if got := sink.messages(); len(got) != 0 {
+		t.Fatalf("messages = %v, want no pre-consent record delivered across the cross-move", got)
+	}
+	for _, r := range reads {
+		if r[0] < floorB {
+			t.Fatalf("read %v dips below the lower floor %d during the cross-move", r, floorB)
+		}
+	}
+
+	// The observable safety property: the owner's own long pre-consent history copied back to a.jsonl as
+	// a fresh inode - an editor save, a restore from backup - meets the held higher floor, corroborates
+	// against it and only the bytes appended ABOVE it are ever captured. Had a.jsonl been downgraded to
+	// the counterpart's floor, the span between the two floors would have been published here.
+	post := msgLine("a-post-consent-after-restore") + "\n"
+	replaceViaRename(t, pa, preA+post)
+	if d, i := identityOf(t, pa); d == devB && i == inoB {
+		t.Skip("filesystem kept the inode across the atomic replace; the copy-back needs a fresh identity")
+	}
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("copy-back poll: %v", err)
+	}
+	if got := sink.messages(); len(got) != 1 || got[0] != "a-post-consent-after-restore" {
+		t.Fatalf("messages = %v, want only the record appended above a.jsonl's held floor %d", got, floorA)
+	}
+	for _, r := range reads {
+		if r[0] < floorA {
+			t.Fatalf("read %v dips below a.jsonl's held floor %d; the pre-consent span was published", r, floorA)
+		}
+	}
+}
