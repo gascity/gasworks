@@ -558,6 +558,7 @@ func (w *Watcher) forgetAbsenceEvidence() {
 	}
 	for _, policy := range w.rootPolicies {
 		policy.forgetLineageAbsence()
+		policy.forgetBaselineAbsence()
 	}
 }
 
@@ -615,9 +616,14 @@ func (w *Watcher) reconcileRoots(ctx context.Context) ([]*trackedFile, error) {
 		// (A1-v2). A single empty walk is what an in-flight rotation looks like from the outside.
 		if rootCorroborated[root] {
 			policy.retireAbsentLineages(seenLocators)
+			// A dead activation baseline un-fences nothing when it is dropped, but a reused inode number
+			// inheriting it fences a genuinely new file's leading bytes, so its eviction takes the same
+			// corroborated-walk evidence retirement does and runs only here.
+			w.sweepActivationBaselines(policy, scan)
 			continue
 		}
 		policy.forgetLineageAbsence()
+		policy.forgetBaselineAbsence()
 	}
 	// Project roots draw their sessions from the shared stores rather than from a directory of their
 	// own, so they are reconciled in a separate membership-routed pass over those stores. It populates
@@ -932,6 +938,42 @@ func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
 	delete(w.tracked, key)
 	if w.cfg.ContentObserver != nil {
 		w.cfg.ContentObserver.ForgetContent(key.dev, key.ino)
+	}
+}
+
+// sweepActivationBaselines GCs the activation baselines whose files are gone (bd-main-1qh facet A). A
+// forward-only activation seals every regular identity under the root before the Match gate, so a
+// non-transcript file gets a durable floor it is never tracked through; releaseTracked, which drops a
+// tracked identity's floor once it is corroborated absent, therefore never reaches it, and the dead
+// floor lingers to fence a later file that reuses its inode NUMBER. This is that floor's release sweep,
+// held to the same corroborated-absence evidence: it runs only when the caller has corroborated the
+// walk, and occupancy counts every regular identity the walk found (scan.byIdentity includes the
+// non-matching files) plus every identity still tracked into this root, so a present or rename-raced
+// file is never read as absent. The floor and its durable cursor are dropped together, mirroring
+// releaseTracked, so a reused inode number neither inherits the dead floor nor resumes its cursor.
+func (w *Watcher) sweepActivationBaselines(policy *rootPolicyState, scan *rootScan) {
+	if policy == nil {
+		return
+	}
+	if len(policy.control.Baselines) == 0 {
+		policy.forgetBaselineAbsence()
+		return
+	}
+	occupied := make(map[string]struct{}, len(scan.byIdentity)+len(w.tracked))
+	for key := range scan.byIdentity {
+		occupied[identityString(key.dev, key.ino)] = struct{}{}
+	}
+	for key, tf := range w.tracked {
+		if tf.policy == policy {
+			occupied[identityString(key.dev, key.ino)] = struct{}{}
+		}
+	}
+	scopedDir := filepath.Join(w.cfg.StateDir, "root-cursors", policy.scope)
+	for _, id := range policy.retireAbsentActivationBaselines(occupied) {
+		// The evicted identity is corroborated gone, so nothing live loses a cursor here; dropping it on
+		// the same evidence as the floor keeps a reused inode number from resuming a stranger's sealed
+		// position instead of being captured from its own byte zero.
+		_ = os.Remove(cursorStatePath(scopedDir, id.dev, id.ino))
 	}
 }
 

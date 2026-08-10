@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 )
@@ -129,6 +131,12 @@ type rootPolicyState struct {
 	// this process gathered, and a restart re-gathers it rather than retiring a fence on a
 	// predecessor's word.
 	absentLineagePolls map[string]int
+	// absentBaselinePolls is the identity-keyed twin of absentLineagePolls: it counts, per sealed
+	// identity, the consecutive corroborated walks that have found NO file carrying that identity under
+	// the root. It gates the eviction of a dead ACTIVATION baseline — a floor a forward-activation seal
+	// gave a file that was never tracked, so the per-identity release sweep never GCs it — on the same
+	// N>=2 corroborated-absence discipline retirement uses. In-memory only, for the same reason.
+	absentBaselinePolls map[string]int
 }
 
 func rootPolicyID(root string) string {
@@ -137,6 +145,25 @@ func rootPolicyID(root string) string {
 }
 
 func identityString(dev, ino uint64) string { return fmt.Sprintf("%d:%d", dev, ino) }
+
+// parseIdentityString reverses identityString, recovering the (device,inode) a Baselines key names so a
+// dead identity's floor can be evicted by the identity it belongs to. A key that does not parse is left
+// untouched — the fail-closed direction, since an unparseable key can only cause a floor to be HELD.
+func parseIdentityString(s string) (dev, ino uint64, ok bool) {
+	d, i, found := strings.Cut(s, ":")
+	if !found {
+		return 0, 0, false
+	}
+	dev, err := strconv.ParseUint(d, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	ino, err = strconv.ParseUint(i, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return dev, ino, true
+}
 
 func newRootPolicyState(stateDir string, r rootpolicy.Record) (*rootPolicyState, error) {
 	id := rootPolicyID(r.Path)
@@ -457,6 +484,67 @@ func (s *rootPolicyState) retireAbsentLineages(seen map[string]struct{}) {
 // flight breaks it.
 func (s *rootPolicyState) forgetLineageAbsence() {
 	clear(s.absentLineagePolls)
+}
+
+// retireAbsentActivationBaselines is the identity-keyed twin of retireAbsentLineages, and closes the
+// one lifecycle gap the per-identity release sweep leaves open (bd-main-1qh facet A). A forward-only
+// activation seals EVERY regular file standing under the root, transcript-named or not, so a file the
+// Match filter never admits still gets a durable identity floor — and, never being entered into
+// w.tracked, is never reached by the release sweep that drops a tracked file's floor on corroborated
+// absence. That floor then outlives its file; once the inode NUMBER is handed to a genuinely new
+// transcript, cursorFor reads the dead floor as that file's own and fences its leading bytes.
+//
+// It rests on exactly the evidence retirement and release rest on. `occupied` names every identity a
+// corroborated walk of the whole root found still standing — matching or not, since a present but
+// non-transcript file is as real an occupant as a member — together with every identity this watcher
+// is still tailing into this root, so a rename the walk raced is never mistaken for a departure. Only a
+// baseline whose identity is absent from that set for absenceEvictionPolls consecutive corroborated
+// walks is a dead activation floor; a present-but-untracked file is NOT absent and its floor is held.
+//
+// It never deletes or lowers a lineage. Before dropping the dead floor it orphans any live fence still
+// naming the freed inode NUMBER — exactly as releaseTracked does — which only RAISES protection, so a
+// number the allocator later reuses can at most ratchet a fence up or hold it, never lower or clear it;
+// retireAbsentLineages stays the sole lineage-deletion path. It returns the evicted identities so the
+// caller can drop their durable cursors on the same evidence.
+func (s *rootPolicyState) retireAbsentActivationBaselines(occupied map[string]struct{}) []identityKey {
+	if s.absentBaselinePolls == nil {
+		s.absentBaselinePolls = map[string]int{}
+	}
+	var evicted []identityKey
+	for id := range s.control.Baselines {
+		if _, ok := occupied[id]; ok {
+			delete(s.absentBaselinePolls, id)
+			continue
+		}
+		s.absentBaselinePolls[id]++
+		if s.absentBaselinePolls[id] < absenceEvictionPolls {
+			continue
+		}
+		dev, ino, ok := parseIdentityString(id)
+		if !ok {
+			delete(s.absentBaselinePolls, id)
+			continue
+		}
+		s.orphanLineagesNaming(dev, ino)
+		s.dropBaseline(dev, ino)
+		delete(s.absentBaselinePolls, id)
+		evicted = append(evicted, identityKey{dev: dev, ino: ino})
+	}
+	// A baseline that vanished by any other path (a release, a re-registration) drops its stale streak
+	// with it, exactly as retireAbsentLineages prunes a locator's.
+	for id := range s.absentBaselinePolls {
+		if _, ok := s.control.Baselines[id]; !ok {
+			delete(s.absentBaselinePolls, id)
+		}
+	}
+	return evicted
+}
+
+// forgetBaselineAbsence discards the activation-baseline eviction evidence, for the same reason
+// forgetLineageAbsence discards the retirement evidence: an absence streak is a run of consecutive
+// corroborated walks, and a walk that could not corroborate breaks it.
+func (s *rootPolicyState) forgetBaselineAbsence() {
+	clear(s.absentBaselinePolls)
 }
 
 // The indirections keep the policy state small and give tests a narrow seam without exposing it.

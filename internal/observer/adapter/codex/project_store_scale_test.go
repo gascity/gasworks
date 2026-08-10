@@ -352,6 +352,71 @@ func TestColdTierStoreFilesDoNotRetireALiveFence(t *testing.T) {
 	}
 }
 
+// bd-main-1qh facet B. The budget and cold-tier tests above cover a locator the poll DECLINED to
+// classify. This one covers the other skip in the same family: a locator the poll DID peek but that came
+// back something other than a positive member. A live member sealed at a floor, whose file is then
+// rewritten into a session that no longer classifies as a member — the shape of a truncation, a garbled
+// head, or a stranger's cwd landing at that name — is still a file physically standing at that locator,
+// so the locator is occupied, not vacant. Reading it as absent retires the live fence, and the next
+// member put back at that name reseals from byte zero and republishes the pre-consent prefix.
+func TestUnclassifiedStoreFileDoesNotRetireALiveFence(t *testing.T) {
+	ctx := context.Background()
+	project, store, state := t.TempDir(), t.TempDir(), t.TempDir()
+
+	loc := codexMemberLocator("member")
+	sealed := codexMetaLine(project) + "\n" + msgLine("pre-consent") + "\n"
+	memberPath := writeTranscript(t, store, loc, codexMetaLine(project), msgLine("pre-consent"))
+
+	sink := &recordingSink{}
+	w := mustWatcher(t, WatchConfig{
+		RootPolicies: []rootpolicy.Record{projectRecord(project, rootpolicy.ForwardOnly)},
+		Stores:       []string{store},
+		StateDir:     state,
+		Sink:         sink,
+		Match:        func(name string) bool { return filepath.Ext(name) == ".jsonl" },
+	})
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("activation poll: %v", err)
+	}
+	floor := mustBaseline(t, readRootControl(t, state, project), memberPath).Floor
+	if floor != int64(len(sealed)) {
+		t.Fatalf("member floor = %d, want the sealed size %d", floor, len(sealed))
+	}
+
+	// The sealed member is rewritten into a stranger's session: a new inode stands at the fenced locator,
+	// and its cwd points outside every registered project, so every poll from here PEEKS it and gets a
+	// non-member back. Unlike the budget and cold-tier skips, this verdict REACHES trackStoreMember.
+	replaceViaRename(t, memberPath, codexMetaLine(t.TempDir())+"\n"+msgLine("not-ours")+"\n")
+
+	for i := 0; i <= absenceEvictionPolls; i++ {
+		if err := w.Poll(ctx); err != nil {
+			t.Fatalf("non-member poll %d: %v", i, err)
+		}
+	}
+	if _, fenced := readRootControl(t, state, project).Lineages[loc]; !fenced {
+		t.Fatalf("the fence at %s was retired while a file the poll classified as a non-member stood there; "+
+			"a locator the peek reached but could not confirm as a member is occupied, not empty", loc)
+	}
+
+	// A member is put back at the still-fenced locator with the same pre-consent prefix and one consented
+	// record appended. The held fence carries its floor to the replacement, so the consented tail is
+	// delivered and the pre-consent prefix beneath the floor is never republished.
+	replaceViaRename(t, memberPath, sealed+msgLine("after-consent")+"\n")
+	if err := w.Poll(ctx); err != nil {
+		t.Fatalf("drain poll: %v", err)
+	}
+	if got := mustBaseline(t, readRootControl(t, state, project), memberPath).Floor; got != floor {
+		t.Fatalf("the member put back at %s was fenced at %d rather than inheriting the floor %d it was sealed at", loc, got, floor)
+	}
+	msgs := sink.messages()
+	if !containsMessage(msgs, "after-consent") {
+		t.Fatalf("the restored member's consented tail was never delivered: %v", msgs)
+	}
+	if containsMessage(msgs, "pre-consent") {
+		t.Fatalf("a record beneath the floor was republished after the fence retired: %v", msgs)
+	}
+}
+
 // BenchmarkStoreScanAtTenThousandTranscripts measures one steady-state poll over a store the size the
 // budget exists for. The deterministic tests above are what gate the change; this is the latency
 // claim's evidence.
