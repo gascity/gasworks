@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"net/url"
@@ -39,6 +41,11 @@ func runDaemon(args []string) int {
 	collector := fs.String("collector", "", "Collector base URL; enables the uploader")
 	tokenFile := fs.String("token-file", "", "bearer token file (rotating), required with -collector")
 	allowLoopbackHTTP := fs.Bool("allow-loopback-http", false, "permit a plain-http loopback collector (dev only)")
+	// -ca-file adds additive TLS trust anchors for the collector (a customer/enterprise CA or an
+	// intercepting egress proxy's CA). Repeatable. Anchors are MERGED on top of the system roots
+	// (upload.buildTLSConfig) — TLS verification stays on; these only widen trust, never disable it.
+	var caFiles multiFlag
+	fs.Var(&caFiles, "ca-file", "additive collector-TLS CA bundle PEM file (repeatable); merged on top of the system roots")
 	// Content upload (Phase 1b) is opt-in and OFF by default: with it off the daemon is metadata-only,
 	// exactly as before. It reuses the -collector base + -token-file credential (no second endpoint or
 	// credential) and requires an explicitly configured watcher. OBSERVER_CONTENT_UPLOAD=1 sets the default.
@@ -101,7 +108,7 @@ func runDaemon(args []string) int {
 	}
 
 	if *collector != "" {
-		client, err := buildCollectorClient(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP)
+		client, err := buildCollectorClient(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP, caFiles)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
 			return 2
@@ -148,7 +155,7 @@ func runDaemon(args []string) int {
 // rotating token file. The credential is read fresh per attempt by the E1.9 client. The same client
 // serves both the observation-batch uploader and the whole-transcript content side channel, so
 // content upload never introduces a second endpoint or credential.
-func buildCollectorClient(endpoint, sourceID, tokenFile string, allowLoopbackHTTP bool) (*upload.Client, error) {
+func buildCollectorClient(endpoint, sourceID, tokenFile string, allowLoopbackHTTP bool, caFiles []string) (*upload.Client, error) {
 	if tokenFile == "" {
 		return nil, fmt.Errorf("-token-file is required with -collector")
 	}
@@ -156,16 +163,69 @@ func buildCollectorClient(endpoint, sourceID, tokenFile string, allowLoopbackHTT
 	if err != nil {
 		return nil, fmt.Errorf("parse -collector: %w", err)
 	}
+	customCAs, err := loadCAFiles(caFiles)
+	if err != nil {
+		return nil, err
+	}
 	client, err := upload.NewClient(upload.Config{
 		Endpoint:          u,
 		SourceID:          sourceID,
 		Credential:        upload.TokenFileSource{Path: tokenFile},
+		CustomCAs:         customCAs,
 		AllowLoopbackHTTP: allowLoopbackHTTP,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build collector client: %w", err)
 	}
 	return client, nil
+}
+
+// loadCAFiles parses each -ca-file PEM bundle into additive x509 trust anchors for the collector
+// client. It FAILS CLOSED: a path the operator passed that is missing, unreadable, or that yields
+// no certificate is an error, never a silent fallback to system-only trust — the operator's intent
+// to trust a specific CA must not be dropped (that would connect to an unintended endpoint or fail
+// opaquely). The anchors are additive: upload.buildTLSConfig merges them on top of the system roots
+// and keeps verification on. An empty list yields no anchors (system trust only), no error.
+func loadCAFiles(paths []string) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("read -ca-file %q: %w", p, err)
+		}
+		fileCerts, err := parseCAPEM(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse -ca-file %q: %w", p, err)
+		}
+		if len(fileCerts) == 0 {
+			return nil, fmt.Errorf("-ca-file %q contained no certificates", p)
+		}
+		certs = append(certs, fileCerts...)
+	}
+	return certs, nil
+}
+
+// parseCAPEM decodes every CERTIFICATE block in a PEM bundle. A non-certificate block (e.g. a stray
+// private key) is skipped so a combined bundle is tolerated; a malformed certificate block is a hard
+// error so a truncated or corrupt bundle never yields partial, silently-narrowed trust.
+func parseCAPEM(data []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	return certs, nil
 }
 
 // envTrue reports whether an environment variable is set to a truthy value (1/true/yes/on), used to
