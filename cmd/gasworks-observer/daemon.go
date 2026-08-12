@@ -62,6 +62,17 @@ func runDaemon(args []string) int {
 	// latency for CPU. 0 keeps the watcher default.
 	pollInterval := fs.Duration("poll-interval", 0, "transcript watcher poll cadence (e.g. 2s); 0 uses the watcher default")
 
+	// -bead-prefix enables PASSIVE work-reference extraction: a session that runs bd/git/gh with a
+	// bead id carrying one of these prefixes links that run to the bead with no per-session action.
+	// Prefixes are matched verbatim and must include the trailing dash (e.g. bd-). Repeatable; an
+	// empty set leaves extraction off (the daemon stays metadata-only for beads, as before).
+	var beadPrefixes multiFlag
+	fs.Var(&beadPrefixes, "bead-prefix", "bead id prefix to extract as a work reference from bd/git/gh tool calls (repeatable; include the trailing dash, e.g. bd-)")
+	// -beads-project is the team-server project id every extracted bead reference resolves to — the
+	// same project identity the wrapper's declare-work verb takes. Required whenever -bead-prefix is
+	// set: the captured bead id is opaque, so the project is supplied here, not parsed out of the id.
+	beadsProject := fs.String("beads-project", "", "team-server project id that extracted bead references resolve to (required with -bead-prefix)")
+
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -71,6 +82,14 @@ func runDaemon(args []string) int {
 	}
 	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy-file and -approved-root are mutually exclusive")
+		return 2
+	}
+	// Fail loud on a half-configured extractor: -bead-prefix without -beads-project would resolve
+	// every captured reference to no project and drop it as unresolvable (a silent INFO diagnostic),
+	// so the linkage would appear wired but produce nothing. -beads-project alone is a harmless no-op
+	// (no prefixes ⇒ no extraction), matching declare-work's independent use of the same project id.
+	if len(beadPrefixes) > 0 && *beadsProject == "" {
+		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -bead-prefix requires -beads-project (the team-server project extracted references resolve to)")
 		return 2
 	}
 	var policyRecords []rootpolicy.Record
@@ -125,14 +144,18 @@ func runDaemon(args []string) int {
 	} else if *contentUpload {
 		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
 	}
+	// Build the extraction configuration once and hand the same value to whichever watcher config is
+	// selected. Empty prefixes yield a nil bead pattern downstream (extraction off); a non-empty set
+	// carries the default-project resolver validated above.
+	references := newReferenceConfig(beadPrefixes, *beadsProject)
 	if *rootPolicyFile != "" {
-		cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval)
+		cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval, references)
 	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
 			return 2
 		}
-		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval)
+		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval, references)
 	}
 
 	svc, err := daemon.NewService(cfg)
@@ -248,10 +271,11 @@ func envTrue(name string) bool {
 // Note the filter bounds what is parsed, not what is walked: the poll still re-walks and stats the
 // whole tree to detect changes and to keep a renamed-past-filter file tracked, so steady-state poll
 // CPU scales with total files under the roots. poll-interval is the lever for that cost.
-func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration) *daemon.WatchLoopConfig {
+func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration, references codex.ReferenceConfig) *daemon.WatchLoopConfig {
 	return &daemon.WatchLoopConfig{
 		ApprovedRoots: roots,
 		StateDir:      cursorDir,
+		References:    references,
 		Policy:        watcherPolicy(),
 		Match:         transcriptNameMatch,
 		Interval:      interval,
@@ -261,13 +285,26 @@ func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration
 // newPolicyWatchLoopConfig keeps companion consent records intact until the watcher, where the
 // generation fence and root-local baseline are applied. It intentionally does not infer any
 // provider home/root; every path arrived explicitly in the owner policy.
-func newPolicyWatchLoopConfig(records []rootpolicy.Record, cursorDir string, interval time.Duration) *daemon.WatchLoopConfig {
+func newPolicyWatchLoopConfig(records []rootpolicy.Record, cursorDir string, interval time.Duration, references codex.ReferenceConfig) *daemon.WatchLoopConfig {
 	return &daemon.WatchLoopConfig{
 		RootPolicies: records,
 		StateDir:     cursorDir,
+		References:   references,
 		Policy:       watcherPolicy(),
 		Match:        transcriptNameMatch,
 		Interval:     interval,
+	}
+}
+
+// newReferenceConfig builds the passive-extraction configuration from the -bead-prefix set and the
+// -beads-project default project. The prefixes select which bead identifiers to capture from bd/git/gh
+// tool calls; the resolver supplies the team_server_project_id every captured reference resolves to.
+// DistinctRefs is left nil (no caller-owned cross-observation cap). An empty prefix set yields a config
+// whose bead pattern is nil downstream — extraction stays off, exactly as before this flag existed.
+func newReferenceConfig(beadPrefixes []string, beadsProject string) codex.ReferenceConfig {
+	return codex.ReferenceConfig{
+		BeadPrefixes: beadPrefixes,
+		Resolver:     evidence.ProjectResolver{DefaultProjectID: beadsProject},
 	}
 }
 
