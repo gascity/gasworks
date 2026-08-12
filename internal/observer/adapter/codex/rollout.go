@@ -3,7 +3,10 @@ package codex
 import (
 	"bytes"
 	"encoding/json"
+	"path"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -57,6 +60,38 @@ type parseState struct {
 
 	claudeModel          string
 	claudeSessionEmitted bool
+
+	// toolSurfaceByID maps a tool-invocation id (Claude tool_use.id, Codex function_call.call_id)
+	// to the effective CLI tool of the command it ran, so the matching later result record
+	// (Claude tool_result.tool_use_id, Codex function_call_output.call_id) can be classified for
+	// TOOL_RESULT extraction — the result surface gate needs an exact bd/git/gh tool name and the
+	// real dialects never carry one on the result record. Populated lazily; a miss (result whose
+	// call landed in an earlier buffer) leaves the result unclassified, an accepted degradation.
+	toolSurfaceByID map[string]string
+}
+
+// recordToolSurface stashes the effective CLI tool of a tool invocation under its call id, keyed
+// so the later result record extracts against the same bd/git/gh surface. The first argv token of
+// the command is the real CLI (git, gh, bd); the provider tool name (Bash, shell) is only the
+// fallback when the command is empty.
+func (st *parseState) recordToolSurface(id, name, command string) {
+	if id == "" {
+		return
+	}
+	tool := firstToken(command)
+	if tool == "" {
+		tool = name
+	}
+	if st.toolSurfaceByID == nil {
+		st.toolSurfaceByID = make(map[string]string)
+	}
+	st.toolSurfaceByID[id] = tool
+}
+
+// toolSurfaceFor returns the CLI tool recorded for a result record's call id, empty when the call
+// was never seen in this buffer.
+func (st *parseState) toolSurfaceFor(id string) string {
+	return st.toolSurfaceByID[id]
 }
 
 // newParseState builds the per-buffer parse context, peeking the buffer once for the session model
@@ -100,7 +135,7 @@ func peekRolloutModel(data []byte) string {
 // parseRolloutLine projects one raw Codex rollout record. session_meta becomes the transcript's
 // single SESSION_LIFECYCLE (with the peeked model); a token_count event becomes a per-turn USAGE;
 // every other rollout record is skipped without a diagnostic.
-func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int) []*Candidate {
+func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg ReferenceConfig) []*Candidate {
 	ts := probe.probeTime()
 	switch probe.Type {
 	case rolloutSessionMeta:
@@ -116,17 +151,7 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int) []*Candida
 		st.rolloutSessionEmitted = true
 		return []*Candidate{sessionLifecycleCandidate(meta.ID, rolloutProvider, st.rolloutModel, ts, lineNo)}
 	case rolloutResponseItem:
-		// Latch the assistant turn's provider response id (resp_…) when the rollout records one, so the
-		// following token_count USAGE can carry it as the exact-lane spend-join key. Most rollout
-		// versions leave the id null (user/developer items never carry one), so this is usually a no-op.
-		var pl struct {
-			Role string `json:"role"`
-			ID   string `json:"id"`
-		}
-		if json.Unmarshal(probe.Payload, &pl) == nil && pl.Role == "assistant" && pl.ID != "" {
-			st.rolloutTurnMessageID = pl.ID
-		}
-		return nil
+		return st.parseRolloutResponseItem(probe.Payload, cfg, ts, lineNo)
 	case rolloutEventMsg:
 		var pl struct {
 			Type string `json:"type"`
@@ -146,6 +171,147 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int) []*Candida
 	default:
 		return nil
 	}
+}
+
+// The response_item payload shapes this adapter projects. A rollout records the agent's shell
+// activity as response_item function/tool calls; their command argv is the TOOL_CALL surface the
+// reference extractors read, and the paired *_output records are the TOOL_RESULT surface.
+const (
+	rolloutItemMessage        = "message"
+	rolloutItemFunctionCall   = "function_call"
+	rolloutItemLocalShellCall = "local_shell_call"
+	rolloutItemFunctionOutput = "function_call_output"
+	rolloutItemShellOutput    = "local_shell_call_output"
+)
+
+// parseRolloutResponseItem projects one response_item. An assistant message latches the turn's
+// response id for the exact-lane usage join (unchanged); a function/shell call becomes a TOOL_CALL
+// surface run through the reference extractors; a call output becomes a TOOL_RESULT surface,
+// classified against the CLI tool recorded for its call id. Every other item is skipped silently.
+func (st *parseState) parseRolloutResponseItem(payload json.RawMessage, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
+	var head struct {
+		Type   string `json:"type"`
+		Role   string `json:"role"`
+		ID     string `json:"id"`
+		CallID string `json:"call_id"`
+	}
+	if json.Unmarshal(payload, &head) != nil {
+		return nil
+	}
+	switch head.Type {
+	case rolloutItemMessage:
+		// Latch the assistant turn's provider response id (resp_…) when the rollout records one, so
+		// the following token_count USAGE can carry it as the exact-lane spend-join key. Most rollout
+		// versions leave the id null (user/developer items never carry one), so this is usually a no-op.
+		if head.Role == "assistant" && head.ID != "" {
+			st.rolloutTurnMessageID = head.ID
+		}
+		return nil
+	case rolloutItemFunctionCall, rolloutItemLocalShellCall:
+		name, command := rolloutCallCommand(head.Type, payload)
+		if command == "" {
+			return nil
+		}
+		st.recordToolSurface(head.CallID, name, command)
+		return extractedCandidates(wire.ExtractionProvenanceSurfaceTOOLCALL, SurfaceText{Tool: name, Text: command}, cfg, ts, lineNo)
+	case rolloutItemFunctionOutput, rolloutItemShellOutput:
+		tool := st.toolSurfaceFor(head.CallID)
+		if tool == "" {
+			return nil
+		}
+		var out struct {
+			Output json.RawMessage `json:"output"`
+		}
+		if json.Unmarshal(payload, &out) != nil {
+			return nil
+		}
+		text := rolloutOutputText(out.Output)
+		if text == "" {
+			return nil
+		}
+		return extractedCandidates(wire.ExtractionProvenanceSurfaceTOOLRESULT, SurfaceText{Tool: tool, Text: text}, cfg, ts, lineNo)
+	default:
+		return nil
+	}
+}
+
+// rolloutCallCommand recovers the provider tool name and the shell command text from a rollout
+// function/shell call. Codex has emitted several call schemas across versions — a function_call
+// whose JSON-string arguments carry command (string or ["bash","-lc",script] argv) or cmd, and a
+// local_shell_call whose action.command is a raw argv — so the recovery tolerates all of them and
+// returns an empty command for a call it cannot read (e.g. apply_patch), which the caller skips.
+func rolloutCallCommand(itemType string, payload json.RawMessage) (name, command string) {
+	switch itemType {
+	case rolloutItemLocalShellCall:
+		var pl struct {
+			Action struct {
+				Command []string `json:"command"`
+			} `json:"action"`
+		}
+		if json.Unmarshal(payload, &pl) != nil {
+			return "", ""
+		}
+		return "shell", commandFromArgv(pl.Action.Command)
+	default: // function_call
+		var pl struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}
+		if json.Unmarshal(payload, &pl) != nil {
+			return "", ""
+		}
+		return pl.Name, shellArgsCommand(pl.Arguments)
+	}
+}
+
+// shellArgsCommand reads the command out of a function_call's arguments (itself a JSON-encoded
+// string). command is honored as either a plain string or a ["bash","-lc",script] argv; cmd is the
+// exec_command spelling. An unreadable or command-less arguments blob yields "".
+func shellArgsCommand(arguments string) string {
+	if arguments == "" {
+		return ""
+	}
+	var a struct {
+		Command json.RawMessage `json:"command"`
+		Cmd     string          `json:"cmd"`
+	}
+	if json.Unmarshal([]byte(arguments), &a) != nil {
+		return ""
+	}
+	if len(a.Command) > 0 {
+		var s string
+		if json.Unmarshal(a.Command, &s) == nil {
+			return s
+		}
+		var argv []string
+		if json.Unmarshal(a.Command, &argv) == nil {
+			return commandFromArgv(argv)
+		}
+	}
+	return a.Cmd
+}
+
+// rolloutOutputText reads a function_call_output's output, which providers encode as either a plain
+// string or a structured {"output":"..."} / [{"type":"output_text","text":"..."}] block.
+func rolloutOutputText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var obj struct {
+		Output string `json:"output"`
+		Text   string `json:"text"`
+	}
+	if json.Unmarshal(raw, &obj) == nil && (obj.Output != "" || obj.Text != "") {
+		if obj.Output != "" {
+			return obj.Output
+		}
+		return obj.Text
+	}
+	return concatTextBlocks(raw)
 }
 
 // rolloutTokenUsage is one token_count event's per-turn usage delta. Codex reports input_tokens as
@@ -211,6 +377,75 @@ func sessionLifecycleCandidate(nativeID, provider, model string, ts time.Time, l
 			Model:           model,
 		},
 	}
+}
+
+// commandFromArgv renders a shell-call argv to the command text the reference extractors read. A
+// `["bash","-lc",script]` wrapper (the common exec form) unwraps to just the script so the surface
+// gate sees the real bd/git/gh invocation at token 0; any other argv (e.g. a direct
+// `["git","log"]` exec) is space-joined, which likewise puts the CLI tool first.
+func commandFromArgv(argv []string) string {
+	if len(argv) == 0 {
+		return ""
+	}
+	if len(argv) >= 3 && isShellName(argv[0]) && isDashCFlag(argv[1]) {
+		return argv[2]
+	}
+	return strings.Join(argv, " ")
+}
+
+// isShellName reports whether an argv[0] is a POSIX shell, tolerating an absolute path
+// (/bin/bash), so a `["/bin/bash","-lc",script]` wrapper is unwrapped like a bare `bash`.
+func isShellName(s string) bool {
+	switch path.Base(s) {
+	case "sh", "bash", "zsh", "dash", "ash":
+		return true
+	default:
+		return false
+	}
+}
+
+// isDashCFlag reports whether an argv token is a shell command flag (-c and its login/interactive
+// combinations), i.e. the next token is the command script.
+func isDashCFlag(s string) bool {
+	switch s {
+	case "-c", "-lc", "-ic", "-lic", "-il", "-cl":
+		return true
+	default:
+		return false
+	}
+}
+
+// firstToken returns the leading whitespace-delimited token of a command, the effective CLI tool
+// (git, gh, bd) used to classify the paired result surface. Empty for an empty command.
+func firstToken(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexFunc(s, unicode.IsSpace); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// concatTextBlocks joins the .text of a content-block array (Anthropic/Codex message content, tool
+// result content), newline-separated; "" when raw is not such an array.
+func concatTextBlocks(raw json.RawMessage) string {
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, bl := range blocks {
+		if bl.Text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(bl.Text)
+	}
+	return b.String()
 }
 
 // splitJSONLines returns the complete newline-terminated lines of data (blank lines dropped), for

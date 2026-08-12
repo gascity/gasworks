@@ -233,19 +233,72 @@ func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg Ref
 	if re == nil {
 		return nil
 	}
+	// Bead IDs are captured as WHOLE argv/whitespace tokens, not as substrings: a token is a bead
+	// only if the entire token (after stripping surrounding punctuation) matches the pattern. This
+	// keeps a repo/path slug that merely starts with a prefix — lego-pilot.git, lego-pilot/foo —
+	// from minting a phantom lego-pilot, since the token continues past the id (spec finding 4).
+	fields := strings.Fields(text)
 	var out []ExtractedReference
-	for _, m := range re.FindAllString(text, -1) {
+	for i, tok := range fields {
+		if isBranchOperand(fields, i) {
+			// A branch-create operand is a human-chosen name, commonly <bead>-<slug>
+			// (git checkout -b lego-x-add-docs). Capturing it whole mints a phantom bead and
+			// buries the real id, so the branch-name position is excluded entirely.
+			continue
+		}
+		id := trimBeadToken(tok)
+		if id == "" || !re.MatchString(id) {
+			continue
+		}
 		out = append(out, ExtractedReference{
 			Kind: RefKindBead,
-			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: m, Resolver: cfg.Resolver},
+			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: id, Resolver: cfg.Resolver},
 		})
 	}
 	return out
 }
 
-// beadPattern compiles the declared prefix set into an anchored bead-ID matcher, or nil when no
-// prefixes are declared. A bead ID is a declared prefix followed by one or more alphanumerics
-// and any number of dash-joined alphanumeric segments (e.g. ga-1tzraj, ga-1tzraj-repair-merge).
+// branchOperandFlags are the git flags whose following token is a caller-chosen name/value, never a
+// bead id: -b/-B create-branch (checkout/switch), -c/-C create-branch (switch) and git's global
+// -c <config>/-C <path> (whose values are equally not beads, so skipping is always safe).
+var branchOperandFlags = map[string]bool{
+	"-b": true, "-B": true, "-c": true, "-C": true, "--branch": true, "--orphan": true,
+}
+
+// isBranchOperand reports whether fields[i] is a git branch-name operand: the token right after a
+// branch-create flag, or the first operand of `git branch <name>`. Such tokens are excluded from
+// bead capture.
+func isBranchOperand(fields []string, i int) bool {
+	if i == 0 {
+		return false
+	}
+	if branchOperandFlags[fields[i-1]] {
+		return true
+	}
+	// `git branch <name>` (no flag): <name> is the first token after the `branch` subcommand.
+	if fields[i-1] == "branch" && i >= 2 {
+		for _, f := range fields[:i-1] {
+			if f == "git" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// trimBeadToken strips shell/prose punctuation surrounding a token so a quoted or sentence-embedded
+// id ((lego-1), "lego-1", lego-1.) is still recognized, while leaving interior characters intact so
+// a path/extension token (lego-pilot.git) still fails the whole-token match.
+func trimBeadToken(tok string) string {
+	return strings.TrimFunc(tok, func(r rune) bool {
+		return !(r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
+	})
+}
+
+// beadPattern compiles the declared prefix set into a whole-token bead-ID matcher, or nil when no
+// prefixes are declared. A bead ID is a declared prefix followed by one or more alphanumerics and
+// any number of dash-joined alphanumeric segments (e.g. ga-1tzraj, ga-1tzraj-repair-merge). It is
+// anchored ^…$ because the caller matches it against a single already-tokenized field.
 func beadPattern(prefixes []string) *regexp.Regexp {
 	if len(prefixes) == 0 {
 		return nil
@@ -260,7 +313,7 @@ func beadPattern(prefixes []string) *regexp.Regexp {
 	if len(quoted) == 0 {
 		return nil
 	}
-	return regexp.MustCompile(`\b(?:` + strings.Join(quoted, "|") + `)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\b`)
+	return regexp.MustCompile(`^(?:` + strings.Join(quoted, "|") + `)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$`)
 }
 
 // isGitGhSurface reports whether a tool surface is a recognized git/gh surface, gating COMMIT
@@ -280,8 +333,16 @@ func isBeadSurface(surface wire.ExtractionProvenanceSurface, tool, text string) 
 	return recognizedSurface(surface, tool, text, "bd", "git", "gh")
 }
 
+// shellSegmentSep splits a command line into its pipeline/list segments on the shell control
+// operators (&&, ||, |, ;, &, newline, and command-substitution/subshell brackets) so the tool at
+// the head of ANY segment is recognized — cd /repo && bd close … runs bd even though the line
+// starts with cd (spec finding 4). It is used only for the trusted TOOL_CALL command text.
+var shellSegmentSep = regexp.MustCompile(`\|\||&&|[|;&\n(){}` + "`" + `]`)
+
 // recognizedSurface classifies a surface against an allowed tool-name set: an exact tool-name
-// match on any surface, or a "<name> " command prefix on a TOOL_CALL surface only.
+// match on any surface, or a "<name> " prefix at the head of any command segment on a TOOL_CALL
+// surface only. The per-segment head check is deliberately confined to TOOL_CALL (the trusted
+// command line); a TOOL_RESULT's output bytes never enable extraction by content.
 func recognizedSurface(surface wire.ExtractionProvenanceSurface, tool, text string, names ...string) bool {
 	name := strings.ToLower(strings.TrimSpace(tool))
 	for _, n := range names {
@@ -290,10 +351,12 @@ func recognizedSurface(surface wire.ExtractionProvenanceSurface, tool, text stri
 		}
 	}
 	if surface == wire.ExtractionProvenanceSurfaceTOOLCALL {
-		trimmed := strings.TrimSpace(text)
-		for _, n := range names {
-			if strings.HasPrefix(trimmed, n+" ") {
-				return true
+		for _, seg := range shellSegmentSep.Split(text, -1) {
+			seg = strings.TrimSpace(seg)
+			for _, n := range names {
+				if strings.HasPrefix(seg, n+" ") {
+					return true
+				}
 			}
 		}
 	}

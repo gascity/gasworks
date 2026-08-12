@@ -62,7 +62,7 @@ func peekClaudeModel(data []byte) string {
 // the buffer yields the transcript's SESSION_LIFECYCLE (the sink de-dups the recurrence across
 // polls); an assistant envelope's message.usage yields a USAGE. The session candidate is ordered
 // before the usage so a single assistant record that triggers both still threads correctly.
-func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int) []*Candidate {
+func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int, cfg ReferenceConfig) []*Candidate {
 	ts := probe.probeTime()
 	var out []*Candidate
 	if probe.SessionIDCamel != "" && !st.claudeSessionEmitted {
@@ -71,14 +71,97 @@ func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int) []*Candidat
 	}
 	if len(probe.Message) > 0 {
 		var m struct {
-			ID    string       `json:"id"`
-			Usage *claudeUsage `json:"usage"`
+			ID      string          `json:"id"`
+			Usage   *claudeUsage    `json:"usage"`
+			Content json.RawMessage `json:"content"`
 		}
-		if json.Unmarshal(probe.Message, &m) == nil && m.Usage != nil && m.Usage.hasTokens() {
-			out = append(out, m.Usage.candidate(ts, lineNo, m.ID))
+		if json.Unmarshal(probe.Message, &m) == nil {
+			if m.Usage != nil && m.Usage.hasTokens() {
+				out = append(out, m.Usage.candidate(ts, lineNo, m.ID))
+			}
+			out = append(out, st.claudeToolCandidates(m.Content, cfg, ts, lineNo)...)
 		}
 	}
 	return out
+}
+
+// claudeContentBlock is one entry of a Claude message.content array. tool_use carries the tool name
+// and its structured input (the shell command lives under input.command); tool_result carries the
+// paired tool_use_id and the tool's output (a string or a content-block array). Both project onto
+// the reference-extraction surfaces so a bd/git/gh invocation inside a real Claude session links.
+type claudeContentBlock struct {
+	Type      string          `json:"type"`
+	ID        string          `json:"id"`          // tool_use
+	Name      string          `json:"name"`        // tool_use
+	Input     json.RawMessage `json:"input"`       // tool_use
+	ToolUseID string          `json:"tool_use_id"` // tool_result
+	Content   json.RawMessage `json:"content"`     // tool_result (string | content-block array)
+}
+
+// claudeToolCandidates projects a Claude message's tool_use / tool_result content blocks onto the
+// reference-extraction surfaces. message.content is a string for plain turns (no tool blocks) and an
+// array only when the turn carries tools, so a failed array decode is the common no-tool case and
+// yields nothing.
+func (st *parseState) claudeToolCandidates(content json.RawMessage, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
+	if len(content) == 0 {
+		return nil
+	}
+	var blocks []claudeContentBlock
+	if json.Unmarshal(content, &blocks) != nil {
+		return nil
+	}
+	var out []*Candidate
+	for _, b := range blocks {
+		switch b.Type {
+		case "tool_use":
+			command := claudeToolCommand(b.Input)
+			st.recordToolSurface(b.ID, b.Name, command)
+			if command == "" {
+				continue
+			}
+			out = append(out, extractedCandidates(wire.ExtractionProvenanceSurfaceTOOLCALL, SurfaceText{Tool: b.Name, Text: command}, cfg, ts, lineNo)...)
+		case "tool_result":
+			tool := st.toolSurfaceFor(b.ToolUseID)
+			if tool == "" {
+				continue
+			}
+			text := claudeResultText(b.Content)
+			if text == "" {
+				continue
+			}
+			out = append(out, extractedCandidates(wire.ExtractionProvenanceSurfaceTOOLRESULT, SurfaceText{Tool: tool, Text: text}, cfg, ts, lineNo)...)
+		}
+	}
+	return out
+}
+
+// claudeToolCommand reads the shell command out of a tool_use input. Only the shell tools (Bash)
+// carry input.command; a structured-input tool (Read, Edit, an MCP tool) has none and yields "",
+// so it never reaches the surface gate.
+func claudeToolCommand(input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var in struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal(input, &in) == nil {
+		return in.Command
+	}
+	return ""
+}
+
+// claudeResultText reads a tool_result's content, which Claude encodes as either a plain string or a
+// [{"type":"text","text":"..."}] block array.
+func claudeResultText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return concatTextBlocks(raw)
 }
 
 // claudeUsage is a Claude message.usage block. Claude splits input into fresh input plus two cache

@@ -1,0 +1,6 @@
+{"timestamp": "2026-08-12T10:00:00.000Z", "type": "session_meta", "payload": {"id": "019cfdea-e7bc-73a1-9871-aae32d212349", "cwd": "/data/projects/lego", "originator": "codex-tui", "cli_version": "0.115.0", "source": "cli"}}
+{"timestamp": "2026-08-12T10:00:00.100Z", "type": "turn_context", "payload": {"cwd": "/data/projects/lego", "model": "gpt-5.4", "effort": "high"}}
+{"timestamp": "2026-08-12T10:00:01.000Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "id": "resp_1", "content": [{"type": "output_text", "text": "Marking the bead in progress."}]}}
+{"timestamp": "2026-08-12T10:00:02.000Z", "type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": "{\"command\":[\"bash\",\"-lc\",\"bd update ga-1tzraj-repair-merge --status in_progress\"],\"workdir\":\"/data/projects/lego\"}", "call_id": "call_1"}}
+{"timestamp": "2026-08-12T10:00:03.000Z", "type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_1", "output": "Updated ga-1tzraj-repair-merge to in_progress"}}
+{"timestamp": "2026-08-12T10:00:03.100Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 14003, "cached_input_tokens": 5504, "output_tokens": 451, "total_tokens": 14454}}}}
