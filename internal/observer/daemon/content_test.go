@@ -14,7 +14,17 @@ import (
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/contentguard"
 	"github.com/gascity/gasworks/internal/observer/upload"
+)
+
+// Valid transcript paths for the always-on content-lane allowlist (contentguard): a codex
+// rollout and a claude session uuid. The uploader keys transcripts by (device,inode), not by
+// path, so the mechanics tests below reuse these shapes freely — only the content guard reads
+// the basename, and a non-transcript-shaped name would now be refused before upload.
+const (
+	testCodexPath  = "/root/rollout-2026-06.jsonl"
+	testClaudePath = "/root/01234567-89ab-cdef-0123-456789abcdef.jsonl"
 )
 
 // --- test doubles -------------------------------------------------------------
@@ -250,7 +260,7 @@ func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
 	h.reader.set(dev, ino, content, 100)
 	h.sessions.set(dev, ino, "sess-1", "claude")
 
-	h.observe(dev, ino, "/abs/s.jsonl", int64(len(content)), 100)
+	h.observe(dev, ino, testClaudePath, int64(len(content)), 100)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 
@@ -261,7 +271,7 @@ func TestContentUploadPostsWholeFileWithHeaders(t *testing.T) {
 	if string(req.Body) != content {
 		t.Fatalf("body = %q, want whole file %q", req.Body, content)
 	}
-	if req.NativeSessionID != "sess-1" || req.Provider != "claude" || req.SourcePath != "/abs/s.jsonl" {
+	if req.NativeSessionID != "sess-1" || req.Provider != "claude" || req.SourcePath != testClaudePath {
 		t.Fatalf("headers wrong: %+v", req)
 	}
 }
@@ -273,7 +283,7 @@ func TestContentUploadRearmsUnchangedTranscriptWhenGCSessionIDArrives(t *testing
 	h.reader.set(dev, ino, "unchanged transcript", 100)
 
 	// The sidecar is absent on the first stable observation, so this remains a plain upload.
-	h.observeWithGCSessionID(dev, ino, "/abs/s.jsonl", int64(len("unchanged transcript")), 100, "")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, int64(len("unchanged transcript")), 100, "")
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 1 || h.sender.at(0).GCSessionID != "" {
@@ -281,7 +291,7 @@ func TestContentUploadRearmsUnchangedTranscriptWhenGCSessionIDArrives(t *testing
 	}
 
 	// A late authoritative sidecar must re-arm the exact same bytes once.
-	h.observeWithGCSessionID(dev, ino, "/abs/s.jsonl", int64(len("unchanged transcript")), 100, "gc_exact_1")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, int64(len("unchanged transcript")), 100, "gc_exact_1")
 	h.u.tick(context.Background())
 	if h.sender.count() != 2 {
 		t.Fatalf("uploads after sidecar arrival = %d, want 2", h.sender.count())
@@ -314,7 +324,7 @@ func TestContentUploadRearmsUnchangedTranscriptWhenGCSessionIDArrives(t *testing
 	u2.ObserveContent(context.Background(), codex.ContentObservation{
 		Root:        "/root",
 		Locator:     "s.jsonl",
-		Path:        "/abs/s.jsonl",
+		Path:        testCodexPath,
 		Device:      dev,
 		Inode:       ino,
 		Size:        int64(len("unchanged transcript")),
@@ -354,7 +364,7 @@ func TestContentUploadLegacyPlainMarkerStaysDeduplicatedUntilBindingArrives(t *t
 		t.Fatalf("new restarted uploader: %v", err)
 	}
 	u2.ObserveContent(context.Background(), codex.ContentObservation{
-		Root: "/root", Locator: "s.jsonl", Path: "/abs/s.jsonl", Device: dev, Inode: ino,
+		Root: "/root", Locator: "s.jsonl", Path: testCodexPath, Device: dev, Inode: ino,
 		Size: int64(len(body)), ModNanos: 100,
 	})
 	h.clock.advance(31 * time.Second)
@@ -372,7 +382,7 @@ func TestContentUploadDebounceWaitsForStability(t *testing.T) {
 	h.reader.set(dev, ino, final, 5)
 
 	// First observation (still small); a tick before the window passes uploads nothing.
-	h.observe(dev, ino, "/p", 5, 1)
+	h.observe(dev, ino, testCodexPath, 5, 1)
 	h.clock.advance(15 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 0 {
@@ -380,7 +390,7 @@ func TestContentUploadDebounceWaitsForStability(t *testing.T) {
 	}
 
 	// File grows (size+mtime change) — resets the stability clock.
-	h.observe(dev, ino, "/p", 10, 5)
+	h.observe(dev, ino, testCodexPath, 10, 5)
 	h.clock.advance(15 * time.Second) // only 15s since the growth
 	h.u.tick(context.Background())
 	if h.sender.count() != 0 {
@@ -404,7 +414,7 @@ func TestContentUploadDedupUnchangedNotReuploadedGrownReuploaded(t *testing.T) {
 	h.sessions.set(dev, ino, "s", "codex")
 	h.reader.set(dev, ino, "aaa", 1)
 
-	h.observe(dev, ino, "/p", 3, 1)
+	h.observe(dev, ino, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 1 {
@@ -420,7 +430,7 @@ func TestContentUploadDedupUnchangedNotReuploadedGrownReuploaded(t *testing.T) {
 
 	// Grown: a later, larger, stable snapshot supersedes and is re-uploaded once.
 	h.reader.set(dev, ino, "aaabbb", 2)
-	h.observe(dev, ino, "/p", 6, 2)
+	h.observe(dev, ino, testCodexPath, 6, 2)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 2 {
@@ -441,7 +451,7 @@ func TestContentUpload501StopsUploads(t *testing.T) {
 	h.reader.set(1, 1, "aaa", 1)
 	h.reader.set(2, 2, "bbb", 1)
 
-	h.observe(1, 1, "/p1", 3, 1)
+	h.observe(1, 1, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if sender.count() != 1 {
@@ -449,7 +459,7 @@ func TestContentUpload501StopsUploads(t *testing.T) {
 	}
 
 	// A second, different, stable-and-changed transcript is NOT attempted: content upload latched off.
-	h.observe(2, 2, "/p2", 3, 1)
+	h.observe(2, 2, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if sender.count() != 1 {
@@ -469,7 +479,7 @@ func TestContentUpload429HonorsRetryAfter(t *testing.T) {
 	h.sessions.set(dev, ino, "s", "codex")
 	h.reader.set(dev, ino, "aaa", 1)
 
-	h.observe(dev, ino, "/p", 3, 1)
+	h.observe(dev, ino, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background()) // 429; holdUntil = now + 10s
 	if sender.count() != 1 {
@@ -497,7 +507,7 @@ func TestContentUploadOversizeSkipped(t *testing.T) {
 	h.sessions.set(dev, ino, "s", "codex")
 	h.reader.set(dev, ino, "way too large", 1) // 13 bytes > 4
 
-	h.observe(dev, ino, "/p", 13, 1)
+	h.observe(dev, ino, testCodexPath, 13, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 0 {
@@ -521,7 +531,7 @@ func TestContentUpload409LogsAndAdvances(t *testing.T) {
 	h.sessions.set(dev, ino, "s", "codex")
 	h.reader.set(dev, ino, "aaa", 1)
 
-	h.observe(dev, ino, "/p", 3, 1)
+	h.observe(dev, ino, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if sender.count() != 1 {
@@ -542,7 +552,7 @@ func TestContentUploadMarkerSurvivesRestart(t *testing.T) {
 	h.sessions.set(dev, ino, "s", "codex")
 	h.reader.set(dev, ino, "stable-body", 1)
 
-	h.observe(dev, ino, "/p", 11, 1)
+	h.observe(dev, ino, testCodexPath, 11, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 1 {
@@ -566,7 +576,7 @@ func TestContentUploadMarkerSurvivesRestart(t *testing.T) {
 	// Same content, but the mtime moved (forces the hash comparison rather than the cheap size/mtime
 	// gate). The persisted marker's hash makes this an idempotent no-op — nothing is re-shipped.
 	u2.ObserveContent(context.Background(), codex.ContentObservation{
-		Root: "/root", Locator: "s.jsonl", Path: "/p", Device: dev, Inode: ino, Size: 11, ModNanos: 2,
+		Root: "/root", Locator: "s.jsonl", Path: testCodexPath, Device: dev, Inode: ino, Size: 11, ModNanos: 2,
 	})
 	h.clock.advance(31 * time.Second)
 	u2.tick(context.Background())
@@ -615,7 +625,7 @@ func TestContentUploadEndToEndThroughRealWatcher(t *testing.T) {
 	}
 
 	body := "line-1\nline-2\nline-3\n"
-	path := filepath.Join(root, "session.jsonl")
+	path := filepath.Join(root, "rollout-e2e.jsonl")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write transcript: %v", err)
 	}
@@ -652,7 +662,7 @@ func TestContentUploadSkipsUnknownSessionThenRetries(t *testing.T) {
 	h.reader.set(dev, ino, "body", 1)
 	// Session not known yet.
 
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 0 {
@@ -678,7 +688,7 @@ func TestContentUploadUnknownSessionNotRead(t *testing.T) {
 	const dev, ino = 31, 32
 	h.reader.set(dev, ino, "body", 1)
 	// Session deliberately unknown.
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	h.clock.advance(1 * time.Second)
@@ -698,7 +708,7 @@ func TestContentUploadCodexRestartUsesMarkerSession(t *testing.T) {
 	const dev, ino = 21, 22
 	h.sessions.set(dev, ino, "codex-sess", "codex")
 	h.reader.set(dev, ino, "body-v1", 1)
-	h.observe(dev, ino, "/p", 7, 1)
+	h.observe(dev, ino, testCodexPath, 7, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 1 {
@@ -721,7 +731,7 @@ func TestContentUploadCodexRestartUsesMarkerSession(t *testing.T) {
 	}
 	h.reader.set(dev, ino, "body-v1-and-then-some", 2) // grew → new hash, not a no-op
 	u2.ObserveContent(context.Background(), codex.ContentObservation{
-		Root: "/root", Locator: "s.jsonl", Path: "/p", Device: dev, Inode: ino, Size: 21, ModNanos: 2,
+		Root: "/root", Locator: "s.jsonl", Path: testCodexPath, Device: dev, Inode: ino, Size: 21, ModNanos: 2,
 	})
 	h.clock.advance(31 * time.Second)
 	u2.tick(context.Background())
@@ -743,7 +753,7 @@ func TestContentUploadPermanentStatusAdvancesNoLoop(t *testing.T) {
 	const dev, ino = 41, 42
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "s", "codex")
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	h.clock.advance(31 * time.Second)
@@ -766,7 +776,7 @@ func TestContentUploadInvalidSessionSkipped(t *testing.T) {
 	const dev, ino = 51, 52
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "bad/session id", "codex") // '/' and space violate the contract
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 0 {
@@ -784,7 +794,7 @@ func TestContentUploadForgetContentEvictsStateAndMarker(t *testing.T) {
 	const dev, ino = 61, 62
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "s", "codex")
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	markerPath := contentMarkerPath(h.stateDir, dev, ino)
@@ -814,7 +824,7 @@ func TestContentUploadReadErrorLoggedOnce(t *testing.T) {
 	const dev, ino = 101, 102
 	h.sessions.set(dev, ino, "s", "codex")
 	// No reader content set → read returns os.ErrNotExist.
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	h.clock.advance(1 * time.Second)
@@ -859,7 +869,7 @@ func TestContentUploadInodeReuseUsesNewSession(t *testing.T) {
 	const dev, ino = 71, 72
 	h.reader.set(dev, ino, "aaa", 1)
 	h.sessions.set(dev, ino, "sessA", "codex")
-	h.observe(dev, ino, "/pA", 3, 1)
+	h.observe(dev, ino, testCodexPath, 3, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 1 || h.sender.at(0).NativeSessionID != "sessA" {
@@ -870,7 +880,7 @@ func TestContentUploadInodeReuseUsesNewSession(t *testing.T) {
 	h.u.ForgetContent(dev, ino)
 	h.reader.set(dev, ino, "bbbbb", 5)
 	h.sessions.set(dev, ino, "sessB", "codex")
-	h.observe(dev, ino, "/pB", 5, 5)
+	h.observe(dev, ino, testCodexPath, 5, 5)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.sender.count() != 2 {
@@ -894,7 +904,7 @@ func TestContentUploadMidTickShedStopsRemaining(t *testing.T) {
 	for i, id := range []uint64{81, 82} {
 		h.reader.set(1, id, "body", int64(i+1))
 		h.sessions.set(1, id, "s", "codex")
-		h.observe(1, id, "/p", 4, int64(i+1))
+		h.observe(1, id, testCodexPath, 4, int64(i+1))
 	}
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
@@ -913,7 +923,7 @@ func TestContentUploadCapsRetryAfter(t *testing.T) {
 	const dev, ino = 91, 92
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "s", "codex")
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	want := h.clock.now().Add(maxContentHold)
@@ -936,7 +946,7 @@ func TestContentUploadPermanent422NeverPersistedViaNoOp(t *testing.T) {
 	const dev, ino = 111, 112
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "s", "codex")
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background()) // POST → 422: in-memory dedup only, no marker persisted
 	markerPath := contentMarkerPath(h.stateDir, dev, ino)
@@ -946,7 +956,7 @@ func TestContentUploadPermanent422NeverPersistedViaNoOp(t *testing.T) {
 
 	// mtime-only bump, identical content: the no-op path must NOT promote the rejected hash to disk.
 	h.reader.set(dev, ino, "body", 2)
-	h.observe(dev, ino, "/p", 4, 2)
+	h.observe(dev, ino, testCodexPath, 4, 2)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
@@ -968,7 +978,7 @@ func TestContentUploadGivesUpAfterRepeatedPostFailures(t *testing.T) {
 	const dev, ino = 121, 122
 	h.reader.set(dev, ino, "body", 1)
 	h.sessions.set(dev, ino, "s", "codex")
-	h.observe(dev, ino, "/p", 4, 1)
+	h.observe(dev, ino, testCodexPath, 4, 1)
 
 	for i := 0; i < 10; i++ {
 		h.clock.advance(31 * time.Second) // past the transient hold each time
@@ -990,10 +1000,89 @@ func TestContentUploadGivesUpAfterRepeatedPostFailures(t *testing.T) {
 	// A content change is a new snapshot: retries re-arm.
 	before := h.reader.readCount()
 	h.reader.set(dev, ino, "body-grown-more", 2)
-	h.observe(dev, ino, "/p", 15, 2)
+	h.observe(dev, ino, testCodexPath, 15, 2)
 	h.clock.advance(31 * time.Second)
 	h.u.tick(context.Background())
 	if h.reader.readCount() <= before {
 		t.Fatalf("content change did not re-arm retry: reads stayed at %d", before)
+	}
+}
+
+// TestContentUploadGuardsRefuseSecretsBeforeAnyRequest is the bd-63vj1 acceptance: the always-on
+// content guards (contentguard) refuse a secrets-named file, an env file, a PEM-bodied transcript,
+// and a non-allowlisted .jsonl AT THE DAEMON — NO upload request is constructed for any of them —
+// while a real allowlisted transcript authored alongside them still uploads. The drops are counted
+// (per reason) and logged, never silent.
+func TestContentUploadGuardsRefuseSecretsBeforeAnyRequest(t *testing.T) {
+	h := newContentHarness(t, contentUploaderConfig{})
+
+	// Each refused fixture is a distinct (device,inode) with a VALID session threaded, so the ONLY
+	// thing that can stop it is the content guard (not the unknown-session or invalid-header skips).
+	pemBody := "-----BEGIN PRIVATE KEY-----\nMIIBVAIBADANBgkq\n-----END PRIVATE KEY-----\n"
+	fixtures := []struct {
+		dev, ino uint64
+		path     string
+		body     string
+		reason   contentguard.Reason
+	}{
+		{1, 1, "/root/proj/credentials.json", `{"token":"sekret"}`, contentguard.ReasonDenylistedName}, // exact denylist
+		{2, 2, "/root/proj/x.env", "SECRET=1\n", contentguard.ReasonDenylistedName},                    // deny-glob *.env
+		{3, 3, "/root/proj/agent-abc123.jsonl", pemBody, contentguard.ReasonPEMContent},                // allowlisted name, PEM body
+		{4, 4, "/root/proj/notes.jsonl", `{"type":"user"}`, contentguard.ReasonNotAllowlisted},         // off-shape name
+	}
+	for _, f := range fixtures {
+		h.reader.set(f.dev, f.ino, f.body, 1)
+		h.sessions.set(f.dev, f.ino, "sess", "claude")
+		h.observe(f.dev, f.ino, f.path, int64(len(f.body)), 1)
+	}
+	// A real transcript that MUST still upload, proving the guard is a filter, not a kill-switch.
+	realBody := `{"type":"user","text":"hi"}` + "\n"
+	h.reader.set(9, 9, realBody, 1)
+	h.sessions.set(9, 9, "sess-ok", "claude")
+	h.observe(9, 9, testClaudePath, int64(len(realBody)), 1)
+
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+
+	// Exactly one upload — the allowlisted transcript. No request was constructed for any refusal.
+	if h.sender.count() != 1 {
+		t.Fatalf("uploads = %d, want exactly 1 (only the allowlisted transcript); a guarded file produced a request", h.sender.count())
+	}
+	if got := h.sender.at(0).SourcePath; got != testClaudePath {
+		t.Fatalf("uploaded transcript = %q, want the allowlisted %q", got, testClaudePath)
+	}
+
+	// Every refusal is counted by reason (deny x2, not-allowlisted x1, PEM x1).
+	h.u.mu.Lock()
+	deny := h.u.guardRefusals[contentguard.ReasonDenylistedName]
+	notAllow := h.u.guardRefusals[contentguard.ReasonNotAllowlisted]
+	pem := h.u.guardRefusals[contentguard.ReasonPEMContent]
+	h.u.mu.Unlock()
+	if deny != 2 || notAllow != 1 || pem != 1 {
+		t.Fatalf("guard refusal counts = deny:%d not-allowlisted:%d pem:%d, want 2/1/1", deny, notAllow, pem)
+	}
+
+	// The refusals were logged, not silent — one line per refused fixture.
+	var logged int
+	for _, l := range h.logLines() {
+		if strings.Contains(l, "refusing") && strings.Contains(l, "guard") {
+			logged++
+		}
+	}
+	if logged != 4 {
+		t.Fatalf("guard refusals logged %d times, want 4 (one per refused fixture); logs=%v", logged, h.logLines())
+	}
+
+	// A repeat tick does not re-count, re-log, or hot-loop the refusals (eval advanced).
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 1 {
+		t.Fatalf("a refused fixture produced a request on the second tick: uploads = %d", h.sender.count())
+	}
+	h.u.mu.Lock()
+	total := h.u.guardRefusals[contentguard.ReasonDenylistedName] + h.u.guardRefusals[contentguard.ReasonNotAllowlisted] + h.u.guardRefusals[contentguard.ReasonPEMContent]
+	h.u.mu.Unlock()
+	if total != 4 {
+		t.Fatalf("guard refusals re-counted on a second tick: total = %d, want 4", total)
 	}
 }

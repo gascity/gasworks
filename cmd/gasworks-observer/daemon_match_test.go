@@ -5,10 +5,13 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
+	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // TestTranscriptNameMatch pins the transcript filename filter to the real session transcripts of
@@ -48,7 +51,7 @@ func TestNewPolicyWatchLoopConfigPreservesExplicitPerRootConsent(t *testing.T) {
 		{Path: "/explicit/claude", Generation: 4, Active: true, Mode: rootpolicy.ForwardOnly},
 		{Path: "/explicit/codex", Generation: 9, Active: false},
 	}
-	cfg := newPolicyWatchLoopConfig(records, "/tmp/cursors", 2*time.Second)
+	cfg := newPolicyWatchLoopConfig(records, "/tmp/cursors", 2*time.Second, codex.ReferenceConfig{})
 	if len(cfg.ApprovedRoots) != 0 || len(cfg.RootPolicies) != len(records) {
 		t.Fatalf("watch config roots = legacy %v policy %v, want only policy records", cfg.ApprovedRoots, cfg.RootPolicies)
 	}
@@ -101,8 +104,8 @@ func TestPolicyWiringAcceptsV2AndIgnoresProjectRoots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPolicy(v2 transcripts only): %v", err)
 	}
-	v1Cfg := newPolicyWatchLoopConfig(capturableRoots(v1Policy.Roots), cursorDir, 0)
-	v2Cfg := newPolicyWatchLoopConfig(capturableRoots(v2Policy.Roots), cursorDir, 0)
+	v1Cfg := newPolicyWatchLoopConfig(capturableRoots(v1Policy.Roots), cursorDir, 0, codex.ReferenceConfig{})
+	v2Cfg := newPolicyWatchLoopConfig(capturableRoots(v2Policy.Roots), cursorDir, 0, codex.ReferenceConfig{})
 	if len(v2Cfg.RootPolicies) != 1 || v2Cfg.RootPolicies[0] != v1Cfg.RootPolicies[0] {
 		t.Fatalf("v2 transcripts-only policy = %+v, want the v1 wiring %+v", v2Cfg.RootPolicies, v1Cfg.RootPolicies)
 	}
@@ -118,7 +121,7 @@ func TestPolicyWiringAcceptsV2AndIgnoresProjectRoots(t *testing.T) {
 	if len(mixed.Roots) != 2 || len(mixed.Stores) != 1 || mixed.Stores[0] != store {
 		t.Fatalf("loaded policy = %+v, want both roots plus the recorded store %q", mixed, store)
 	}
-	cfg := newPolicyWatchLoopConfig(capturableRoots(mixed.Roots), cursorDir, 0)
+	cfg := newPolicyWatchLoopConfig(capturableRoots(mixed.Roots), cursorDir, 0, codex.ReferenceConfig{})
 	if len(cfg.RootPolicies) != 1 || cfg.RootPolicies[0].Path != transcriptRoot {
 		t.Fatalf("watched roots = %+v, want only the transcript root %q", cfg.RootPolicies, transcriptRoot)
 	}
@@ -137,7 +140,7 @@ func writePolicyFile(t *testing.T, body string) string {
 // watcher the transcript filter, not leave Match nil (which parses every file under the roots), and
 // must pass the poll cadence through.
 func TestNewWatchLoopConfigInstallsTranscriptFilter(t *testing.T) {
-	cfg := newWatchLoopConfig([]string{"/home/u/.claude/projects"}, "/tmp/cursors", 2*time.Second)
+	cfg := newWatchLoopConfig([]string{"/home/u/.claude/projects"}, "/tmp/cursors", 2*time.Second, codex.ReferenceConfig{})
 	if cfg.Match == nil {
 		t.Fatal("newWatchLoopConfig left Match nil; the watcher would parse all ~60k files under the roots")
 	}
@@ -149,5 +152,64 @@ func TestNewWatchLoopConfigInstallsTranscriptFilter(t *testing.T) {
 	}
 	if cfg.Interval != 2*time.Second {
 		t.Errorf("poll interval = %v, want 2s (must be wired through)", cfg.Interval)
+	}
+}
+
+// TestNewReferenceConfigWiresPassiveExtraction is the load-bearing guard for the passive linkage:
+// the -bead-prefix/-beads-project flags must map onto the ReferenceConfig the codex watcher consumes,
+// both watcher constructors must carry it into References (nil there = the dead extractor this wiring
+// fixes), and the wired config must actually fire — a bd tool call carrying a prefixed bead id yields
+// exactly one work reference resolved to the configured project, while an empty prefix set stays off.
+func TestNewReferenceConfigWiresPassiveExtraction(t *testing.T) {
+	const (
+		prefix  = "bd-"
+		project = "lego_pilot"
+		beadID  = "bd-abc123"
+	)
+	refs := newReferenceConfig([]string{prefix}, project)
+
+	if len(refs.BeadPrefixes) != 1 || refs.BeadPrefixes[0] != prefix {
+		t.Fatalf("BeadPrefixes = %v, want [%q]", refs.BeadPrefixes, prefix)
+	}
+	if refs.Resolver.DefaultProjectID != project {
+		t.Fatalf("Resolver.DefaultProjectID = %q, want %q", refs.Resolver.DefaultProjectID, project)
+	}
+
+	// Both watcher constructors must thread the same config into References; before this wiring both
+	// omitted it, leaving BeadPrefixes nil so extractBeads always returned nil.
+	if got := newWatchLoopConfig([]string{"/root"}, "/cursors", 0, refs).References; !reflect.DeepEqual(got, refs) {
+		t.Errorf("newWatchLoopConfig References = %+v, want %+v", got, refs)
+	}
+	if got := newPolicyWatchLoopConfig(nil, "/cursors", 0, refs).References; !reflect.DeepEqual(got, refs) {
+		t.Errorf("newPolicyWatchLoopConfig References = %+v, want %+v", got, refs)
+	}
+
+	// The extractor fires with the prefix set: a bd TOOL_CALL carrying the bead id yields exactly one
+	// work reference that resolves to the configured project — the passive run→bead link in one step.
+	surface := codex.SurfaceText{Tool: "bd", Text: "bd update " + beadID + " --status in_progress"}
+	got, _ := codex.ExtractReferences(wire.ExtractionProvenanceSurfaceTOOLCALL, surface, refs)
+	var work []codex.ExtractedReference
+	for _, r := range got {
+		if r.Kind == codex.RefKindBead {
+			work = append(work, r)
+		}
+	}
+	if len(work) != 1 {
+		t.Fatalf("extracted %d bead references, want exactly 1: %+v", len(work), got)
+	}
+	if work[0].Work.BeadID != beadID {
+		t.Errorf("extracted bead id = %q, want %q", work[0].Work.BeadID, beadID)
+	}
+	if work[0].Work.Resolver.DefaultProjectID != project {
+		t.Errorf("extracted reference resolves to project %q, want %q", work[0].Work.Resolver.DefaultProjectID, project)
+	}
+
+	// With no prefixes the extractor stays off — the daemon is metadata-only for beads, as before.
+	off := newReferenceConfig(nil, "")
+	none, _ := codex.ExtractReferences(wire.ExtractionProvenanceSurfaceTOOLCALL, surface, off)
+	for _, r := range none {
+		if r.Kind == codex.RefKindBead {
+			t.Fatalf("empty prefix set still extracted a bead reference: %+v", r)
+		}
 	}
 }

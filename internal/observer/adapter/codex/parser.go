@@ -281,9 +281,9 @@ func (st *parseState) parseLine(line []byte, lineNo int, cfg ReferenceConfig) []
 	case isNormalizedType(probe.Type):
 		return parseNormalizedLine(line, lineNo, cfg)
 	case len(probe.Payload) > 0:
-		return st.parseRolloutLine(probe, lineNo)
+		return st.parseRolloutLine(probe, lineNo, cfg)
 	case probe.SessionIDCamel != "" || len(probe.Message) > 0:
-		return st.parseClaudeLine(probe, lineNo)
+		return st.parseClaudeLine(probe, lineNo, cfg)
 	default:
 		return []*Candidate{diagnosticCandidate(probe.probeTime(), lineNo, "unsupported transcript record type")}
 	}

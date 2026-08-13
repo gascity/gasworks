@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/contentguard"
 	"github.com/gascity/gasworks/internal/observer/upload"
 )
 
@@ -136,6 +137,10 @@ type contentUploader struct {
 
 	mu    sync.Mutex
 	files map[transcriptIdentity]*contentState
+	// guardRefusals counts transcripts dropped by an always-on content guard (denylist / allowlist /
+	// PEM sniff), keyed by reason, so a refused credential/config/key file is visible and testable —
+	// counted + logged, never silent. Guarded by u.mu.
+	guardRefusals map[contentguard.Reason]int
 	// disabled is latched when the server reports the tenant is not provisioned (501): content upload
 	// stops for the process lifetime (a restart re-probes). It never affects the metadata pipeline.
 	disabled bool
@@ -193,6 +198,9 @@ type contentState struct {
 	readErrLogged   bool
 	permanentLogged bool
 	giveUpLogged    bool
+	// guardLogged latches the once-per-transcript log + count of an always-on content-guard refusal,
+	// so a persistently-refused file does not re-log or re-count on every tick.
+	guardLogged bool
 }
 
 // newContentUploader validates cfg and returns a ready uploader.
@@ -236,6 +244,8 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 		now:      now,
 		log:      cfg.log,
 		files:    map[transcriptIdentity]*contentState{},
+
+		guardRefusals: map[contentguard.Reason]int{},
 	}, nil
 }
 
@@ -314,6 +324,16 @@ func (u *contentUploader) tick(ctx context.Context) {
 			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
 			continue
 		}
+		// Always-on content-lane filename guards: the secrets/config denylist and the strict
+		// per-provider transcript-shape allowlist (contentguard). A credential, config, or off-shape
+		// file authored under an approved root is refused HERE — before any whole-file read or upload
+		// request is constructed. Advance eval so a refused file is not re-read every tick; the refusal
+		// is logged + counted once, never silent.
+		if reason, refused := contentguard.ScreenName(provider, st.path); refused {
+			u.recordGuardRefusalLocked(st, st.locator, reason)
+			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
+			continue
+		}
 		jobs = append(jobs, job{id: id, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID})
 	}
 	u.mu.Unlock()
@@ -380,6 +400,19 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		if logIt {
 			u.logf("content upload: read %s: %v", locator, err)
 		}
+		return
+	}
+
+	// Always-on PEM content sniff (applied LAST in the guard chain): a PEM/PKCS key block that
+	// reached here under a transcript-shaped name is refused before it is hashed or POSTed, so no
+	// upload request is ever constructed for it. Advance eval so it is not re-read; log + count once.
+	if reason, refused := contentguard.ScreenContent(content); refused {
+		u.mu.Lock()
+		if st := u.files[id]; st != nil {
+			u.recordGuardRefusalLocked(st, locator, reason)
+			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+		}
+		u.mu.Unlock()
 		return
 	}
 
@@ -703,6 +736,21 @@ func sweepOrphanContentTemps(stateDir string) {
 			_ = os.Remove(filepath.Join(stateDir, e.Name()))
 		}
 	}
+}
+
+// recordGuardRefusalLocked logs (once per transcript) and counts a content-guard refusal so a
+// dropped credential/config/key file is visible and never silent — the daemon analogue of the
+// recall forwarder's surfaced drop count. Called under u.mu.
+func (u *contentUploader) recordGuardRefusalLocked(st *contentState, locator string, reason contentguard.Reason) {
+	if st == nil || st.guardLogged {
+		return
+	}
+	st.guardLogged = true
+	if u.guardRefusals == nil {
+		u.guardRefusals = map[contentguard.Reason]int{}
+	}
+	u.guardRefusals[reason]++
+	u.logf("content upload: refusing %s: %s guard", locator, reason)
 }
 
 func (u *contentUploader) logf(format string, args ...any) {

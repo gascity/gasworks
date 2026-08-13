@@ -56,10 +56,14 @@ Endpoint configuration:
   --source-id ID            durable spool source id (required for install)
   --collector URL           Collector base URL (enables the uploader; requires --token-file)
   --token-file PATH         bearer token SOURCE file to place owner-only into the config dir
-  --custom-ca PATH          additive customer/egress-proxy CA bundle to place owner-only
+  --custom-ca PATH          additive customer/egress-proxy CA bundle (placed owner-only AND trusted
+                            by the daemon via -ca-file)
   --workspace NAME          registry workspace scope
   --ceiling-bytes N         spool byte ceiling
   --approved-root DIR       an approved transcript root (repeatable; enables the watcher)
+  --root-policy-file PATH   owner-supplied companion root policy (mutually exclusive with --approved-root)
+  --content-upload          upload whole raw transcripts to the collector content endpoint (opt-in;
+                            requires --collector and a root/--root-policy-file)
   --allow-loopback-http     permit a plain-http loopback collector (dev only)
 
 Paths (all owner-only; default under $HOME, no elevated privileges):
@@ -81,6 +85,7 @@ identity_regexp="$DEFAULT_IDENTITY_REGEXP"
 oidc_issuer="$DEFAULT_OIDC_ISSUER"
 cosign_bin="${COSIGN:-cosign}"
 source_id="" collector="" token_file="" custom_ca="" workspace="" ceiling=""
+root_policy_file="" content_upload=0
 allow_loopback=0
 approved_roots=()
 prefix="" config_dir="" state_dir=""
@@ -107,6 +112,8 @@ while [ $# -gt 0 ]; do
     --workspace)          workspace="$2"; shift ;;
     --ceiling-bytes)      ceiling="$2"; shift ;;
     --approved-root)      approved_roots+=("$2"); shift ;;
+    --root-policy-file)   root_policy_file="$2"; shift ;;
+    --content-upload)     content_upload=1 ;;
     --allow-loopback-http) allow_loopback=1 ;;
     --prefix)             prefix="$2"; shift ;;
     --config-dir)         config_dir="$2"; shift ;;
@@ -189,6 +196,12 @@ validate_config_inputs() {
   if [ -n "$token_file" ] && [ ! -f "$token_file" ]; then die "token file not found: $token_file"; fi
   if [ -n "$custom_ca" ] && [ ! -f "$custom_ca" ]; then die "custom CA not found: $custom_ca"; fi
   if [ -n "$collector" ] && [ -z "$token_file" ]; then die "--collector requires --token-file"; fi
+  if [ -n "$root_policy_file" ] && [ ! -f "$root_policy_file" ]; then die "root policy file not found: $root_policy_file"; fi
+  if [ -n "$root_policy_file" ] && [ "${#approved_roots[@]}" -gt 0 ]; then die "--root-policy-file and --approved-root are mutually exclusive"; fi
+  if [ "$content_upload" = 1 ] && [ -z "$collector" ]; then die "--content-upload requires --collector"; fi
+  if [ "$content_upload" = 1 ] && [ -z "$root_policy_file" ] && [ "${#approved_roots[@]}" -eq 0 ]; then
+    die "--content-upload requires --approved-root or --root-policy-file"
+  fi
 }
 
 sha256_of() {
@@ -235,6 +248,11 @@ write_config() {
     install -m 0600 "$custom_ca" "$config_dir/custom-ca.pem"
     log "placed custom CA (0600)"
   fi
+  if [ -n "$root_policy_file" ]; then
+    [ -f "$root_policy_file" ] || die "root policy file not found: $root_policy_file"
+    install -m 0600 "$root_policy_file" "$config_dir/root-policy.json"
+    log "placed root policy (0600)"
+  fi
 
   # Assemble the daemon argv. Only flags the committed binary understands are emitted.
   local args="daemon -dir $state_dir -source-id $source_id"
@@ -243,14 +261,23 @@ write_config() {
   if [ -n "$collector" ]; then
     [ -n "$token_file" ] || die "--collector requires --token-file"
     args="$args -collector $collector -token-file $config_dir/token"
+    # Trust the placed customer/egress-proxy CA (additive; the daemon merges it on top of the system
+    # roots). This is the fix for --custom-ca being placed under the config dir but never passed.
+    [ -n "$custom_ca" ] && args="$args -ca-file $config_dir/custom-ca.pem"
     [ "$allow_loopback" = 1 ] && args="$args -allow-loopback-http"
   fi
-  if [ "${#approved_roots[@]}" -gt 0 ]; then
+  if [ -n "$root_policy_file" ]; then
+    install -d -m 0700 "$state_dir/cursors"
+    args="$args -root-policy-file $config_dir/root-policy.json -cursor-dir $state_dir/cursors"
+  elif [ "${#approved_roots[@]}" -gt 0 ]; then
     install -d -m 0700 "$state_dir/cursors"
     local r
     for r in "${approved_roots[@]}"; do args="$args -approved-root $r"; done
     args="$args -cursor-dir $state_dir/cursors"
   fi
+  # Opt-in whole-transcript content upload (metadata-only unless explicitly enabled). The daemon
+  # additionally requires -collector and a root/root-policy, validated in validate_config_inputs.
+  [ "$content_upload" = 1 ] && args="$args -content-upload"
 
   # Written unquoted: systemd reads the whole line as the value, and ExecStart's $OBSERVER_ARGS
   # (unbraced) word-splits it into the daemon argv.
