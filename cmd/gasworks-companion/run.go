@@ -41,7 +41,7 @@ func nativeSessionIDFromPath(path string) (string, bool) {
 //
 // The child command follows a "--" terminator so it can carry its own flags:
 //
-//	gasworks-observer run [flags] -- CMD [args...]
+//	gasworks-companion run [flags] -- CMD [args...]
 func runRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	dir := fs.String("dir", "", "observer state directory (to locate the daemon socket)")
@@ -56,7 +56,7 @@ func runRun(args []string) int {
 	}
 	target := fs.Args()
 	if len(target) == 0 {
-		fmt.Fprintln(os.Stderr, "gasworks-observer run: no child command (use: run [flags] -- CMD [args...])")
+		fmt.Fprintln(os.Stderr, "gasworks-companion run: no child command (use: run [flags] -- CMD [args...])")
 		return 2
 	}
 
@@ -85,12 +85,12 @@ func runRun(args []string) int {
 	if !*allowUnobserved {
 		stateDir, err := observerDir(*dir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer run:", err)
+			fmt.Fprintln(os.Stderr, "gasworks-companion run:", err)
 			return 1
 		}
 		socketPath, err := observerSocketPath(*socket, stateDir)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer run:", err)
+			fmt.Fprintln(os.Stderr, "gasworks-companion run:", err)
 			return 2
 		}
 		dc = daemon.NewWrapperDaemonClient(local.NewClient(socketPath))
@@ -106,7 +106,7 @@ func runRun(args []string) int {
 	// red. The terminal-append error is still surfaced to stderr as an operator signal.
 	if res.Launched {
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer run: terminal sequence not fully durable:", err)
+			fmt.Fprintln(os.Stderr, "gasworks-companion run: terminal sequence not fully durable:", err)
 		}
 		if res.Signaled {
 			return 128 + res.Signal
@@ -117,7 +117,7 @@ func runRun(args []string) int {
 	// The child never launched: this is a genuine pre-launch failure (capacity refusal, non-durable
 	// RUN_STARTED, launch failure, or a usage error) with no child exit code to report.
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer run:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion run:", err)
 		return exitCodeForRunError(err)
 	}
 	return res.ExitCode

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# gasworks-observer endpoint installer (O4.2).
+# gasworks-companion endpoint installer (O4.2).
 #
 # GOVERNING INVARIANT: the Observer endpoint has ZERO Gas City dependency. This installer and
 # the service it lays down have NO gc, City, sudo, or default-tmux dependency. It installs a
@@ -19,8 +19,9 @@
 set -euo pipefail
 
 readonly PROG="install.sh"
-readonly BIN_NAME="gasworks-observer"
-readonly SERVICE_NAME="gasworks-observer.service"
+readonly BIN_NAME="gasworks-companion"
+readonly SERVICE_NAME="gasworks-companion.service"
+readonly LEGACY_SERVICE_NAME="gasworks-observer.service"
 
 # Consumer verify pins BOTH the signing identity (this repo's release workflow) AND the OIDC
 # issuer (GitHub Actions), and fails closed. Mirrors the CONSUMER VERIFY block in .goreleaser.yaml.
@@ -32,7 +33,7 @@ die()  { printf '%s: ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 usage() {
   cat >&2 <<'EOF'
-gasworks-observer endpoint installer
+gasworks-companion endpoint installer
 
 Usage:
   install.sh --archive PATH --checksums PATH --checksums-sig PATH --checksums-cert PATH \
@@ -42,7 +43,7 @@ Usage:
   install.sh --uninstall [--purge-spool]         remove binary/config/service (WAL preserved by default)
 
 Verification (fail-closed, all required for install/upgrade):
-  --archive PATH            the gasworks-observer_*_linux_<arch>.tar.gz archive
+  --archive PATH            the gasworks-companion_*_linux_<arch>.tar.gz archive
   --checksums PATH          checksums.txt covering the archive
   --checksums-sig PATH      cosign signature of checksums.txt (checksums.txt.sig)
   --checksums-cert PATH     cosign certificate for checksums.txt (checksums.txt.pem)
@@ -68,8 +69,8 @@ Endpoint configuration:
 
 Paths (all owner-only; default under $HOME, no elevated privileges):
   --prefix DIR              install prefix for the binary   (default: ~/.local)
-  --config-dir DIR          owner-only config dir           (default: ~/.config/gasworks-observer)
-  --state-dir DIR           owner-only WAL/spool state dir  (default: ~/.local/state/gasworks-observer)
+  --config-dir DIR          owner-only config dir           (default: ~/.config/gasworks-companion)
+  --state-dir DIR           owner-only WAL/spool state dir  (default: ~/.local/state/gasworks-companion)
 
 Service:
   --skip-service            do not install/enable the systemd user unit
@@ -89,6 +90,7 @@ root_policy_file="" content_upload=0
 allow_loopback=0
 approved_roots=()
 prefix="" config_dir="" state_dir=""
+config_dir_explicit=0 state_dir_explicit=0
 skip_service=0 enable_linger=0 purge_spool=0
 
 # ---- arg parsing (non-interactive) ------------------------------------------
@@ -116,8 +118,8 @@ while [ $# -gt 0 ]; do
     --content-upload)     content_upload=1 ;;
     --allow-loopback-http) allow_loopback=1 ;;
     --prefix)             prefix="$2"; shift ;;
-    --config-dir)         config_dir="$2"; shift ;;
-    --state-dir)          state_dir="$2"; shift ;;
+    --config-dir)         config_dir="$2"; config_dir_explicit=1; shift ;;
+    --state-dir)          state_dir="$2"; state_dir_explicit=1; shift ;;
     --skip-service)       skip_service=1 ;;
     --enable-linger)      enable_linger=1 ;;
     --purge-spool)        purge_spool=1 ;;
@@ -129,8 +131,28 @@ done
 
 home="${HOME:?HOME must be set}"
 : "${prefix:=$home/.local}"
-: "${config_dir:=${XDG_CONFIG_HOME:-$home/.config}/gasworks-observer}"
-: "${state_dir:=${XDG_STATE_HOME:-$home/.local/state}/gasworks-observer}"
+config_base="${XDG_CONFIG_HOME:-$home/.config}"
+state_base="${XDG_STATE_HOME:-$home/.local/state}"
+companion_config_dir="$config_base/gasworks-companion"
+companion_state_dir="$state_base/gasworks-companion"
+: "${config_dir:=$companion_config_dir}"
+: "${state_dir:=$companion_state_dir}"
+legacy_config_dir="$config_base/gasworks-observer"
+legacy_state_dir="$state_base/gasworks-observer"
+# A default-path operation adopts one complete legacy layout only when neither Companion path
+# exists. Explicit paths and an existing Companion layout are never mixed with legacy paths.
+if [ "$config_dir_explicit" = 0 ] && [ "$state_dir_explicit" = 0 ] && \
+  [ ! -e "$companion_config_dir" ] && [ ! -e "$companion_state_dir" ] && \
+  { [ -d "$legacy_config_dir" ] || [ -d "$legacy_state_dir" ]; }; then
+  if [ -d "$legacy_config_dir" ]; then
+    config_dir="$legacy_config_dir"
+    log "adopting legacy config directory $config_dir"
+  fi
+  if [ -d "$legacy_state_dir" ]; then
+    state_dir="$legacy_state_dir"
+    log "adopting legacy state directory $state_dir"
+  fi
+fi
 bindir="$prefix/bin"
 unit_dir="${XDG_CONFIG_HOME:-$home/.config}/systemd/user"
 
@@ -217,7 +239,7 @@ sha256_of() {
 # ---- placement --------------------------------------------------------------
 place_binary() {
   local staging staged tmpbin
-  staging="$(mktemp -d "${TMPDIR:-/tmp}/gasworks-observer-stage.XXXXXX")"
+  staging="$(mktemp -d "${TMPDIR:-/tmp}/gasworks-companion-stage.XXXXXX")"
   # shellcheck disable=SC2064  # expand $staging now for the cleanup trap
   trap "rm -rf '$staging'" RETURN
 
@@ -283,7 +305,7 @@ write_config() {
   # (unbraced) word-splits it into the daemon argv.
   umask 0077
   cat >"$config_dir/observer.env" <<EOF
-# gasworks-observer service configuration (owner-only, 0600). Written by $PROG.
+# gasworks-companion service configuration (owner-only, 0600). Written by $PROG.
 GASWORKS_OBSERVER_DIR=$state_dir
 OBSERVER_ARGS=$args
 EOF
@@ -302,7 +324,7 @@ user_systemctl_ok() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
 }
 
-install_service() {
+place_service() {
   local src
   src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy/$SERVICE_NAME"
   [ -f "$src" ] || die "service unit not found: $src"
@@ -326,9 +348,12 @@ ReadWritePaths=$state_dir
 EOF
   chmod 0644 "$override_dir/override.conf"
 
+}
+
+start_service() {
   if user_systemctl_ok; then
     systemctl --user daemon-reload
-    systemctl --user enable --now "$SERVICE_NAME"
+    systemctl --user enable --now "$SERVICE_NAME" || return 1
     log "enabled + started $SERVICE_NAME (systemctl --user)"
   else
     log "no reachable 'systemctl --user' manager; unit placed but not started."
@@ -344,6 +369,55 @@ EOF
   else
     log "to keep the service running across logout, run: loginctl enable-linger \"\$USER\""
   fi
+}
+
+legacy_service_pending=0
+legacy_service_was_enabled=0
+
+prepare_legacy_migration() {
+  local legacy_unit="$unit_dir/$LEGACY_SERVICE_NAME"
+  local legacy_override="$unit_dir/$LEGACY_SERVICE_NAME.d"
+  [ -e "$legacy_unit" ] || [ -d "$legacy_override" ] || return 0
+
+  legacy_service_pending=1
+  if user_systemctl_ok; then
+    if systemctl --user is-enabled --quiet "$LEGACY_SERVICE_NAME"; then
+      systemctl --user disable --now "$LEGACY_SERVICE_NAME"
+      legacy_service_was_enabled=1
+      log "stopped enabled legacy user unit $LEGACY_SERVICE_NAME"
+    elif systemctl --user is-active --quiet "$LEGACY_SERVICE_NAME"; then
+      systemctl --user stop "$LEGACY_SERVICE_NAME"
+      log "stopped disabled-but-active legacy user unit $LEGACY_SERVICE_NAME"
+    fi
+  fi
+}
+
+finish_legacy_migration() {
+  [ "$legacy_service_pending" = 1 ] || return 0
+  local legacy_unit="$unit_dir/$LEGACY_SERVICE_NAME"
+  local legacy_override="$unit_dir/$LEGACY_SERVICE_NAME.d"
+  rm -f "$legacy_unit"
+  rm -rf "$legacy_override"
+  rm -f "$bindir/gasworks-observer"
+  if user_systemctl_ok; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  log "retired legacy user unit $LEGACY_SERVICE_NAME"
+}
+
+restore_legacy_service() {
+  [ "$legacy_service_pending" = 1 ] || return 0
+  if user_systemctl_ok; then
+    if ! systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1; then
+      log "failed to stop $SERVICE_NAME during legacy service rollback"
+      return 1
+    fi
+    if ! systemctl --user enable --now "$LEGACY_SERVICE_NAME" >/dev/null 2>&1; then
+      log "failed to restore $LEGACY_SERVICE_NAME during legacy service rollback"
+      return 1
+    fi
+  fi
+  log "restored legacy user unit $LEGACY_SERVICE_NAME after Companion start failure"
 }
 
 remove_service() {
@@ -367,7 +441,19 @@ do_install() {
   place_binary
   write_config
   ensure_state
-  [ "$skip_service" = 1 ] || install_service
+  if [ "$skip_service" = 0 ]; then
+    prepare_legacy_migration
+    place_service
+    if [ "$legacy_service_pending" = 1 ] && [ "$legacy_service_was_enabled" = 0 ]; then
+      finish_legacy_migration
+    elif ! start_service; then
+      if ! restore_legacy_service; then
+        die "could not start $SERVICE_NAME; legacy service rollback failed"
+      fi
+      die "could not start $SERVICE_NAME; legacy service restored"
+    fi
+    finish_legacy_migration
+  fi
   log "install complete."
   log "  binary:  $bindir/$BIN_NAME"
   log "  config:  $config_dir"
@@ -385,10 +471,28 @@ do_upgrade() {
     [ -f "$config_dir/observer.env" ] || die "no existing config at $config_dir/observer.env; pass --source-id to (re)configure"
     log "preserved existing config $config_dir/observer.env"
   fi
-  if [ "$skip_service" = 0 ] && user_systemctl_ok; then
-    systemctl --user daemon-reload
-    systemctl --user try-restart "$SERVICE_NAME" >/dev/null 2>&1 || true
-    log "restarted $SERVICE_NAME (WAL recovered on start)"
+  if [ "$skip_service" = 0 ]; then
+    local companion_was_active=0
+    if user_systemctl_ok && systemctl --user is-active --quiet "$SERVICE_NAME"; then
+      companion_was_active=1
+    fi
+    prepare_legacy_migration
+    place_service
+    if [ "$legacy_service_was_enabled" = 1 ]; then
+      if ! start_service; then
+        if ! restore_legacy_service; then
+          die "could not start $SERVICE_NAME; legacy service rollback failed"
+        fi
+        die "could not start $SERVICE_NAME; legacy service restored"
+      fi
+      finish_legacy_migration
+    elif [ "$legacy_service_pending" = 1 ]; then
+      finish_legacy_migration
+    elif [ "$companion_was_active" = 1 ] && user_systemctl_ok; then
+      systemctl --user daemon-reload
+      systemctl --user try-restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+      log "restarted active $SERVICE_NAME (WAL recovered on start)"
+    fi
   fi
   log "upgrade complete (WAL preserved)."
 }

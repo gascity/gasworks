@@ -69,9 +69,9 @@ builds:
   # CLI/forwarder default archive, and is deliberately kept OUT of the Homebrew tap so its
   # verified-install path (gasworks-pack/observer/install.sh) is never bypassed by a brew
   # fast-path — the endpoint runs unattended holding an ingest credential.
-  - id: gasworks-observer
-    main: ./cmd/gasworks-observer
-    binary: gasworks-observer
+  - id: gasworks-companion
+    main: ./cmd/gasworks-companion
+    binary: gasworks-companion
     env:
       - CGO_ENABLED=0
     goos: [linux, darwin]
@@ -93,16 +93,16 @@ archives:
       - goos: windows
         formats: [zip]
 
-  # Independent Observer archive (O4.1). Independently NAMED (gasworks-observer_…) so it never
+  # Independent Companion archive (O4.1). Independently NAMED (gasworks-companion_…) so it never
   # collides with or contaminates the CLI/forwarder `default` archive. An explicit `files:` list
   # REPLACES the archive defaults, so this archive carries ONLY the endpoint binary plus its
   # license — no CLI/forwarder bytes. It automatically inherits the checksum, cosign signature,
   # SBOM, and SLSA-provenance coverage below (all keyed on `artifacts: archive` / artifacts.json),
   # so no change to those blocks — or to the release workflow — is required.
   - id: observer
-    ids: [gasworks-observer]
+    ids: [gasworks-companion]
     name_template: >-
-      gasworks-observer_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+      gasworks-companion_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     formats: [tar.gz]
     files:
       - src: gasworks-pack/observer/LICENSE

@@ -47,6 +47,42 @@ func TestGoreleaserCheckPasses(t *testing.T) {
 	}
 }
 
+// TestCompanionReleaseArtifactsUseCompanionNames prevents a release from publishing the
+// retired observer command or archive name. The observer implementation remains internal;
+// this checks only the user-facing distribution boundary.
+func TestCompanionReleaseArtifactsUseCompanionNames(t *testing.T) {
+	root := repoRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, ".goreleaser.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	for _, want := range []string{
+		"id: gasworks-companion",
+		"main: ./cmd/gasworks-companion",
+		"binary: gasworks-companion",
+		"ids: [gasworks-companion]",
+		"gasworks-companion_{{ .Version }}_{{ .Os }}_{{ .Arch }}",
+	} {
+		if !strings.Contains(config, want) {
+			t.Errorf("GoReleaser config missing %q", want)
+		}
+	}
+	for _, retired := range []string{
+		"id: gasworks-observer",
+		"main: ./cmd/gasworks-observer",
+		"binary: gasworks-observer",
+		"gasworks-observer_{{ .Version }}_{{ .Os }}_{{ .Arch }}",
+	} {
+		if strings.Contains(config, retired) {
+			t.Errorf("GoReleaser config still ships retired identity %q", retired)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "cmd", "gasworks-companion")); err != nil {
+		t.Fatalf("Companion command directory missing: %v", err)
+	}
+}
+
 func readTarGzNames(t *testing.T, path string) []string {
 	t.Helper()
 	f, err := os.Open(path)
@@ -107,12 +143,12 @@ func TestSnapshotObserverArchiveInventory(t *testing.T) {
 	}
 
 	// Both supported operating systems and architectures must carry exactly
-	// {LICENSE, gasworks-observer}.
+	// {LICENSE, gasworks-companion}.
 	for _, goos := range []string{"linux", "darwin"} {
 		for _, arch := range []string{"amd64", "arm64"} {
-			obs := globOne(t, filepath.Join(dist, "gasworks-observer_*_"+goos+"_"+arch+".tar.gz"))
+			obs := globOne(t, filepath.Join(dist, "gasworks-companion_*_"+goos+"_"+arch+".tar.gz"))
 			got := readTarGzNames(t, obs)
-			want := []string{"LICENSE", observerBinName}
+			want := []string{"LICENSE", companionBinName}
 			if !equalStrings(got, want) {
 				t.Errorf("observer %s/%s archive inventory = %v, want %v", goos, arch, got, want)
 			}
@@ -127,7 +163,7 @@ func TestSnapshotObserverArchiveInventory(t *testing.T) {
 		t.Errorf("default (CLI/forwarder) archive inventory = %v, want %v (regression!)", got, want)
 	}
 	for _, n := range got {
-		if n == observerBinName {
+		if n == companionBinName {
 			t.Errorf("observer binary leaked into the CLI/forwarder archive")
 		}
 	}

@@ -170,12 +170,21 @@ func launchObserved(cfg Config, childEnv []string, register func(wire.ProcessIde
 		// Dir left empty: the child inherits the wrapper's working directory.
 	}
 
+	attachForwarding, stopForwarding := startSignalForwarding()
 	if err := cmd.Start(); err != nil {
+		stopForwarding()
 		for _, f := range []*os.File{idR, idW, ackR, ackW, statusR, statusW} {
 			f.Close()
 		}
 		return nil, &launchError{stage: "spawn", err: err}
 	}
+	forwardingTransferred := false
+	defer func() {
+		if !forwardingTransferred {
+			stopForwarding()
+		}
+	}()
+	attachForwarding(cmd.Process)
 	// The parent no longer needs the child-side pipe ends.
 	idW.Close()
 	ackR.Close()
@@ -215,8 +224,8 @@ func launchObserved(cfg Config, childEnv []string, register func(wire.ProcessIde
 		return nil, lerr
 	}
 
-	stop := forwardSignals(cmd.Process)
-	return &childProc{cmd: cmd, identity: id, stopFwd: stop}, nil
+	forwardingTransferred = true
+	return &childProc{cmd: cmd, identity: id, stopFwd: stopForwarding}, nil
 }
 
 // readLaunchStatus positively classifies the shim's launch outcome from the status pipe:
@@ -274,19 +283,30 @@ func launchUnobserved(cfg Config, childEnv []string) (*childProc, error) {
 		Stdout: cfg.stdout(),
 		Stderr: cfg.stderr(),
 	}
+	attachForwarding, stopForwarding := startSignalForwarding()
 	if err := cmd.Start(); err != nil {
+		stopForwarding()
 		return nil, fmt.Errorf("observer runwrap: start %q: %w", cfg.Target[0], err)
 	}
-	stop := forwardSignals(cmd.Process)
-	return &childProc{cmd: cmd, stopFwd: stop}, nil
+	attachForwarding(cmd.Process)
+	return &childProc{cmd: cmd, stopFwd: stopForwarding}, nil
 }
 
-// forwardSignals relays forwardedSignals to proc until the returned stop function is called.
-func forwardSignals(proc *os.Process) func() {
+// startSignalForwarding registers the wrapper signal handler before a child is started. Signals
+// received before attach is called remain buffered until the child process exists, closing the
+// launch-time default-action window without dropping the signal.
+func startSignalForwarding() (attach func(*os.Process), stop func()) {
 	ch := make(chan os.Signal, 16)
 	signal.Notify(ch, forwardedSignals...)
 	done := make(chan struct{})
+	procReady := make(chan *os.Process, 1)
 	go func() {
+		var proc *os.Process
+		select {
+		case proc = <-procReady:
+		case <-done:
+			return
+		}
 		for {
 			select {
 			case s := <-ch:
@@ -298,10 +318,17 @@ func forwardSignals(proc *os.Process) func() {
 			}
 		}
 	}()
-	return func() {
+	attach = func(proc *os.Process) {
+		select {
+		case procReady <- proc:
+		case <-done:
+		}
+	}
+	stop = func() {
 		signal.Stop(ch)
 		close(done)
 	}
+	return attach, stop
 }
 
 // RunShim is the same-PID identity shim entry point. The production `observe run` adapter

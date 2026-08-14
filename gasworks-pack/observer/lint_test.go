@@ -27,16 +27,16 @@ func TestShellcheckPackScripts(t *testing.T) {
 // unit installs into the user target, hardens against privilege gain, runs the observer binary,
 // and never escalates (no User=/Group= root, no system multi-user target).
 func TestServiceUnitIsUserScoped(t *testing.T) {
-	data, err := os.ReadFile(scriptPath(t, filepath.Join("deploy", "gasworks-observer.service")))
+	data, err := os.ReadFile(scriptPath(t, filepath.Join("deploy", "gasworks-companion.service")))
 	if err != nil {
 		t.Fatal(err)
 	}
 	unit := string(data)
 	mustContain := []string{
 		"WantedBy=default.target", // user session target, not multi-user.target
-		"ExecStart=%h/.local/bin/gasworks-observer",
+		"ExecStart=%h/.local/bin/gasworks-companion",
 		"NoNewPrivileges=true",
-		"EnvironmentFile=%h/.config/gasworks-observer/observer.env",
+		"EnvironmentFile=%h/.config/gasworks-companion/observer.env",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(unit, s) {
@@ -65,14 +65,14 @@ func TestServiceUnitSystemdVerify(t *testing.T) {
 	}
 	home := t.TempDir()
 	// Place the ExecStart binary and EnvironmentFile at the %h-relative default locations.
-	bin := filepath.Join(home, ".local", "bin", observerBinName)
+	bin := filepath.Join(home, ".local", "bin", companionBinName)
 	if err := os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	conf := filepath.Join(home, ".config", "gasworks-observer")
+	conf := filepath.Join(home, ".config", "gasworks-companion")
 	if err := os.MkdirAll(conf, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +80,7 @@ func TestServiceUnitSystemdVerify(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command("systemd-analyze", "verify", "--user", scriptPath(t, filepath.Join("deploy", "gasworks-observer.service")))
+	cmd := exec.Command("systemd-analyze", "verify", "--user", scriptPath(t, filepath.Join("deploy", "gasworks-companion.service")))
 	cmd.Env = append(os.Environ(), "HOME="+home)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("systemd-analyze verify failed: %v\n%s", err, out)
@@ -123,5 +123,36 @@ func TestDoctorFlagsBadPermsAndDetectsWAL(t *testing.T) {
 	}
 	if !strings.Contains(out, "[FAIL]") {
 		t.Errorf("expected a [FAIL] line; got:\n%s", out)
+	}
+}
+
+func TestDoctorAdoptsLegacyDefaultPaths(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	bin := filepath.Join(home, ".local", "bin", companionBinName)
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	legacyState := filepath.Join(home, ".local", "state", "gasworks-observer")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(legacyState, "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyState, "wal", "000001.seg"), []byte("DURABLE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runScript(t, installEnv(home), scriptPath(t, "doctor.sh"), "--expect-wal")
+	if err != nil {
+		t.Fatalf("doctor did not adopt legacy defaults: %v\n%s", err, out)
 	}
 }

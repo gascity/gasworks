@@ -20,11 +20,11 @@ import (
 // Codex startup is never stalled. The 2s hook budget is enforced inside codex.Run.
 func runHook(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "gasworks-observer hook: expected a provider (codex)")
+		fmt.Fprintln(os.Stderr, "gasworks-companion hook: expected a provider (codex)")
 		return 2
 	}
 	if args[0] != "codex" {
-		fmt.Fprintf(os.Stderr, "gasworks-observer hook: unsupported provider %q (want: codex)\n", args[0])
+		fmt.Fprintf(os.Stderr, "gasworks-companion hook: unsupported provider %q (want: codex)\n", args[0])
 		return 2
 	}
 
@@ -40,12 +40,12 @@ func runHook(args []string) int {
 
 	stateDir, err := observerDir(*dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer hook:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion hook:", err)
 		return 1
 	}
 	socketPath, err := observerSocketPath(*socket, stateDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer hook:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion hook:", err)
 		return 2
 	}
 
@@ -63,7 +63,7 @@ func runHook(args []string) int {
 	if err := codex.Run(context.Background(), seam, cfg, os.Stdin, os.Stdout); err != nil {
 		// A returned error is reserved for a stdout write failure; every capture/decode problem is
 		// already handled inside codex.Run by emitting the content-free response.
-		fmt.Fprintln(os.Stderr, "gasworks-observer hook:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion hook:", err)
 		return 1
 	}
 	return 0

@@ -56,6 +56,24 @@ func TestObserverSocketPathRejectsUnmanagedDirectory(t *testing.T) {
 	}
 }
 
+func TestObserverDirAdoptsLegacyStateWhenCompanionStateIsAbsent(t *testing.T) {
+	stateBase := t.TempDir()
+	legacy := filepath.Join(stateBase, "gasworks-observer")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GASWORKS_OBSERVER_DIR", "")
+	t.Setenv("XDG_STATE_HOME", stateBase)
+
+	got, err := observerDir("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != legacy {
+		t.Fatalf("default observer dir = %q, want adopted legacy dir %q", got, legacy)
+	}
+}
+
 // startBareDaemon starts an assembled endpoint with only the socket server (no uploader/watcher) so
 // the run/hook subcommands have a real daemon to reserve/append/release through.
 func startBareDaemon(t *testing.T, dir string) *daemon.Service {

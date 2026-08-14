@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# gasworks-observer install doctor (O4.2).
+# gasworks-companion install doctor (O4.2).
 #
 # Validates a standalone endpoint install WITHOUT any gc/City/sudo dependency:
 #   - owner-only paths (binary 0700, config/state dirs 0700, secret files 0600, no group/other bits)
@@ -12,10 +12,11 @@
 set -euo pipefail
 
 readonly PROG="doctor.sh"
-readonly BIN_NAME="gasworks-observer"
-readonly SERVICE_NAME="gasworks-observer.service"
+readonly BIN_NAME="gasworks-companion"
+readonly SERVICE_NAME="gasworks-companion.service"
 
 prefix="" config_dir="" state_dir="" expect_wal=0
+config_dir_explicit=0 state_dir_explicit=0
 fail=0
 
 log()  { printf '%s: %s\n' "$PROG" "$*"; }
@@ -25,14 +26,14 @@ bad()  { printf '  [FAIL] %s\n' "$*"; fail=1; }
 
 usage() {
   cat >&2 <<'EOF'
-gasworks-observer install doctor
+gasworks-companion install doctor
 
 Usage:
   doctor.sh [--prefix DIR] [--config-dir DIR] [--state-dir DIR] [--expect-wal]
 
   --prefix DIR       install prefix        (default: ~/.local)
-  --config-dir DIR   owner-only config dir (default: ~/.config/gasworks-observer)
-  --state-dir DIR    owner-only state dir  (default: ~/.local/state/gasworks-observer)
+  --config-dir DIR   owner-only config dir (default: ~/.config/gasworks-companion)
+  --state-dir DIR    owner-only state dir  (default: ~/.local/state/gasworks-companion)
   --expect-wal       treat an empty WAL as a hard failure (nonempty-WAL-survives check)
 EOF
 }
@@ -40,8 +41,8 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix)      prefix="$2"; shift ;;
-    --config-dir)  config_dir="$2"; shift ;;
-    --state-dir)   state_dir="$2"; shift ;;
+    --config-dir)  config_dir="$2"; config_dir_explicit=1; shift ;;
+    --state-dir)   state_dir="$2"; state_dir_explicit=1; shift ;;
     --expect-wal)  expect_wal=1 ;;
     -h|--help)     usage; exit 0 ;;
     *)             usage; printf '%s: unknown argument: %s\n' "$PROG" "$1" >&2; exit 2 ;;
@@ -51,8 +52,20 @@ done
 
 home="${HOME:?HOME must be set}"
 : "${prefix:=$home/.local}"
-: "${config_dir:=${XDG_CONFIG_HOME:-$home/.config}/gasworks-observer}"
-: "${state_dir:=${XDG_STATE_HOME:-$home/.local/state}/gasworks-observer}"
+config_base="${XDG_CONFIG_HOME:-$home/.config}"
+state_base="${XDG_STATE_HOME:-$home/.local/state}"
+companion_config_dir="$config_base/gasworks-companion"
+companion_state_dir="$state_base/gasworks-companion"
+legacy_config_dir="$config_base/gasworks-observer"
+legacy_state_dir="$state_base/gasworks-observer"
+: "${config_dir:=$companion_config_dir}"
+: "${state_dir:=$companion_state_dir}"
+if [ "$config_dir_explicit" = 0 ] && [ "$state_dir_explicit" = 0 ] && \
+  [ ! -e "$companion_config_dir" ] && [ ! -e "$companion_state_dir" ] && \
+  { [ -d "$legacy_config_dir" ] || [ -d "$legacy_state_dir" ]; }; then
+  [ -d "$legacy_config_dir" ] && config_dir="$legacy_config_dir"
+  [ -d "$legacy_state_dir" ] && state_dir="$legacy_state_dir"
+fi
 bindir="$prefix/bin"
 
 mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }

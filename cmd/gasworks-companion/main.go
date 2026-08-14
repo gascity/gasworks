@@ -1,11 +1,11 @@
 //go:build linux || darwin
 
-// Command gasworks-observer is the standalone Gas City Observer endpoint binary. It ties the
+// Command gasworks-companion is the standalone Gas City Companion endpoint binary. It ties the
 // committed observer subsystems into a working daemon and its interactive surfaces:
 //
-//	gasworks-observer daemon   — run the endpoint (WAL spool + socket server + uploader + watcher)
-//	gasworks-observer run CMD  — run a child command as an observed explicit run
-//	gasworks-observer hook codex — the Codex SessionStart hook handler (stdin -> durable capture)
+//	gasworks-companion daemon   — run the endpoint (WAL spool + socket server + uploader + watcher)
+//	gasworks-companion run CMD  — run a child command as an observed explicit run
+//	gasworks-companion hook codex — the Codex SessionStart hook handler (stdin -> durable capture)
 //
 // GOVERNING RULE: this binary has ZERO Gas City dependency. It imports ONLY internal/observer/*
 // (which is Gas-City-free), the standard library, and golang.org/x/sys/unix. It must never import
@@ -65,25 +65,25 @@ func dispatch(args []string) int {
 		usage()
 		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "gasworks-observer: unknown command %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "gasworks-companion: unknown command %q\n", args[0])
 		usage()
 		return 2
 	}
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `gasworks-observer — Gas City Observer endpoint
+	fmt.Fprint(os.Stderr, `gasworks-companion — Gas City Companion endpoint
 
 Usage:
-  gasworks-observer daemon   [flags]      run the endpoint daemon
-  gasworks-observer run      [flags] -- CMD [args...]  run a child as an observed run
-  gasworks-observer declare-work [flags]  declare work on the current explicit run
-  gasworks-observer hook codex [flags]    Codex SessionStart hook handler (reads stdin)
+	  gasworks-companion daemon   [flags]      run the endpoint daemon
+	  gasworks-companion run      [flags] -- CMD [args...]  run a child as an observed run
+	  gasworks-companion declare-work [flags]  declare work on the current explicit run
+	  gasworks-companion hook codex [flags]    Codex SessionStart hook handler (reads stdin)
 `)
 }
 
 // observerDir resolves the observer state directory: the -dir flag, else GASWORKS_OBSERVER_DIR,
-// else ${XDG_STATE_HOME:-$HOME/.local/state}/gasworks-observer.
+// else ${XDG_STATE_HOME:-$HOME/.local/state}/gasworks-companion.
 func observerDir(flagDir string) (string, error) {
 	if flagDir != "" {
 		return flagDir, nil
@@ -99,7 +99,14 @@ func observerDir(flagDir string) (string, error) {
 		}
 		base = filepath.Join(home, ".local", "state")
 	}
-	return filepath.Join(base, "gasworks-observer"), nil
+	companionDir := filepath.Join(base, "gasworks-companion")
+	if _, err := os.Stat(companionDir); os.IsNotExist(err) {
+		legacyDir := filepath.Join(base, "gasworks-observer")
+		if info, err := os.Stat(legacyDir); err == nil && info.IsDir() {
+			return legacyDir, nil
+		}
+	}
+	return companionDir, nil
 }
 
 // socketPathFor returns the daemon socket path under the observer state directory.

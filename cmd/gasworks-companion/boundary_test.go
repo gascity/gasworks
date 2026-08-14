@@ -23,7 +23,7 @@ import (
 // directory. `-deps` over them yields the union of their transitive build closures — which,
 // for a non-test `go list`, is exactly what links into the binary.
 var boundaryTargets = []string{
-	"github.com/gascity/gasworks/cmd/gasworks-observer",
+	"github.com/gascity/gasworks/cmd/gasworks-companion",
 	"github.com/gascity/gasworks/internal/observer/...",
 }
 
@@ -34,7 +34,7 @@ const observerModule = "github.com/gascity/gasworks"
 // artifact (contracts/observer/v1 — the embedded corpus + generated-from schema) are in;
 // every other github.com/gascity/gasworks/internal/* or cmd/* path is out.
 var allowedModulePrefixes = []string{
-	observerModule + "/cmd/gasworks-observer",
+	observerModule + "/cmd/gasworks-companion",
 	observerModule + "/internal/observer/",
 	observerModule + "/internal/observer", // the package itself (no trailing slash)
 	observerModule + "/contracts/observer/",
@@ -177,7 +177,7 @@ func allowedModulePackage(dep string) bool {
 func TestAllowedModulePackageRejectsSiblingPrefixes(t *testing.T) {
 	m := observerModule
 	allowed := []string{
-		m + "/cmd/gasworks-observer",
+		m + "/cmd/gasworks-companion",
 		m + "/internal/observer",
 		m + "/internal/observer/local",
 		m + "/internal/observer/adapter/codex",

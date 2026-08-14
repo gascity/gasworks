@@ -393,7 +393,7 @@ func Run(ctx context.Context, d DaemonClient, cfg Config) (Result, error) {
 // own inferred run rather than referencing an unknown boundary.
 func runUnobserved(cfg Config) (Result, error) {
 	fmt.Fprintln(cfg.warnWriter(),
-		"WARNING: --allow-unobserved bypasses Gas City Observer. This run is UNOBSERVED: "+
+		"WARNING: --allow-unobserved bypasses Gas City Companion. This run is UNOBSERVED: "+
 			"no run boundary, no process ancestry, and no GASWORKS_RUN_ID are recorded.")
 
 	childEnv := sanitizeUnobservedEnv(cfg.baseEnv())
