@@ -22,7 +22,10 @@ import (
 	"testing"
 )
 
-const observerBinName = "gasworks-observer"
+const (
+	companionBinName      = "gasworks-companion"
+	legacyObserverBinName = "gasworks-observer"
+)
 
 // scriptPath resolves a pack script relative to the test package dir (the go test cwd).
 func scriptPath(t *testing.T, rel string) string {
@@ -57,14 +60,18 @@ type fixture struct {
 	checksumsCert string
 }
 
-// buildFixture creates a tar.gz containing a stub gasworks-observer binary + LICENSE, then a
+// buildFixture creates a tar.gz containing a stub gasworks-companion binary + LICENSE, then a
 // checksums.txt naming it (with placeholder cosign sig/cert the fake cosign ignores).
 func buildFixture(t *testing.T, dir string) fixture {
+	return buildFixtureForBinary(t, dir, companionBinName)
+}
+
+func buildFixtureForBinary(t *testing.T, dir, binName string) fixture {
 	t.Helper()
-	archive := filepath.Join(dir, "gasworks-observer_v9.9.9_linux_amd64.tar.gz")
+	archive := filepath.Join(dir, binName+"_v9.9.9_linux_amd64.tar.gz")
 	writeTarGz(t, archive, map[string][]byte{
-		observerBinName: []byte("#!/bin/sh\necho observer-stub\n"),
-		"LICENSE":       []byte("MIT\n"),
+		binName:   []byte("#!/bin/sh\necho companion-stub\n"),
+		"LICENSE": []byte("MIT\n"),
 	})
 	sum := sha256File(t, archive)
 	checksums := filepath.Join(dir, "checksums.txt")
@@ -77,6 +84,71 @@ func buildFixture(t *testing.T, dir string) fixture {
 	mustWrite(t, sig, "signature-placeholder")
 	mustWrite(t, cert, "certificate-placeholder")
 	return fixture{archive: archive, checksums: checksums, checksumsSig: sig, checksumsCert: cert}
+}
+
+func installEnvWithSystemctl(home, systemctlDir, logPath string) []string {
+	env := installEnv(home)
+	env[1] = "PATH=" + systemctlDir + ":" + os.Getenv("PATH")
+	return append(env, "SYSTEMCTL_LOG="+logPath)
+}
+
+func fakeSystemctl(t *testing.T, dir string) (string, string) {
+	return fakeSystemctlWithBehavior(t, dir, systemctlBehavior{legacyEnabled: true})
+}
+
+type systemctlBehavior struct {
+	legacyEnabled      bool
+	legacyActive       bool
+	failCompanionStart bool
+	failCompanionStop  bool
+	failLegacyStart    bool
+}
+
+func fakeSystemctlWithBehavior(t *testing.T, dir string, behavior systemctlBehavior) (string, string) {
+	t.Helper()
+	logPath := filepath.Join(dir, "systemctl.log")
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(binDir, "systemctl")
+	legacyEnabledExit := 1
+	if behavior.legacyEnabled {
+		legacyEnabledExit = 0
+	}
+	legacyActiveExit := 1
+	if behavior.legacyActive {
+		legacyActiveExit = 0
+	}
+	companionStartExit := 0
+	if behavior.failCompanionStart {
+		companionStartExit = 1
+	}
+	companionStopExit := 0
+	if behavior.failCompanionStop {
+		companionStopExit = 1
+	}
+	legacyStartExit := 0
+	if behavior.failLegacyStart {
+		legacyStartExit = 1
+	}
+	body := fmt.Sprintf(`#!/usr/bin/env bash
+set -eu
+printf '%%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  "--user is-enabled --quiet gasworks-observer.service") exit %d ;;
+  "--user is-active --quiet gasworks-observer.service") exit %d ;;
+  "--user is-active --quiet gasworks-companion.service") exit 1 ;;
+  "--user enable --now gasworks-companion.service") exit %d ;;
+  "--user disable --now gasworks-companion.service") exit %d ;;
+  "--user enable --now gasworks-observer.service") exit %d ;;
+esac
+exit 0
+`, legacyEnabledExit, legacyActiveExit, companionStartExit, companionStopExit, legacyStartExit)
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake systemctl: %v", err)
+	}
+	return binDir, logPath
 }
 
 func writeTarGz(t *testing.T, path string, entries map[string][]byte) {
@@ -145,9 +217,9 @@ type installPaths struct{ home, bin, config, state string }
 func pathsFor(home string) installPaths {
 	return installPaths{
 		home:   home,
-		bin:    filepath.Join(home, ".local", "bin", observerBinName),
-		config: filepath.Join(home, ".config", "gasworks-observer"),
-		state:  filepath.Join(home, ".local", "state", "gasworks-observer"),
+		bin:    filepath.Join(home, ".local", "bin", companionBinName),
+		config: filepath.Join(home, ".config", "gasworks-companion"),
+		state:  filepath.Join(home, ".local", "state", "gasworks-companion"),
 	}
 }
 
@@ -313,6 +385,344 @@ func TestUpgradePreservesNonemptyWAL(t *testing.T) {
 	}
 }
 
+// TestInstallAdoptsLegacyDefaultsAndMigratesEnabledUnit guards the rename upgrade path:
+// new Companion defaults must keep an existing Observer config/WAL, and an enabled Observer
+// unit must be stopped before the new Companion unit is enabled.
+func TestInstallAdoptsLegacyDefaultsAndMigratesEnabledUnit(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	legacyState := filepath.Join(home, ".local", "state", "gasworks-observer")
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(legacyState, "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".config", "systemd", "user", "gasworks-observer.service.d"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon -source-id legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	segment := filepath.Join(legacyState, "wal", "000001.seg")
+	if err := os.WriteFile(segment, []byte("DURABLE-LEGACY-WAL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacyUnit := filepath.Join(home, ".config", "systemd", "user", "gasworks-observer.service")
+	if err := os.WriteFile(legacyUnit, []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := buildFixtureForBinary(t, dir, companionBinName)
+	systemctlDir, systemctlLog := fakeSystemctl(t, dir)
+	out, err := runScript(t, installEnvWithSystemctl(home, systemctlDir, systemctlLog), scriptPath(t, "install.sh"),
+		"--archive", fx.archive, "--checksums", fx.checksums,
+		"--checksums-sig", fx.checksumsSig, "--checksums-cert", fx.checksumsCert,
+		"--source-id", "src-1", "--cosign", fakeCosign(t, dir, 0))
+	if err != nil {
+		t.Fatalf("Companion install failed: %v\n%s", err, out)
+	}
+
+	if got, err := os.ReadFile(segment); err != nil || string(got) != "DURABLE-LEGACY-WAL" {
+		t.Fatalf("legacy WAL was not preserved: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", companionBinName)); err != nil {
+		t.Errorf("Companion binary missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", legacyObserverBinName)); !os.IsNotExist(err) {
+		t.Errorf("retired Observer executable must not be installed, stat err = %v", err)
+	}
+	if _, err := os.Stat(legacyUnit); !os.IsNotExist(err) {
+		t.Errorf("legacy service unit still present: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "systemd", "user", "gasworks-companion.service")); err != nil {
+		t.Errorf("Companion service unit missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "gasworks-companion")); !os.IsNotExist(err) {
+		t.Errorf("new config directory should not displace adopted legacy config, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "state", "gasworks-companion")); !os.IsNotExist(err) {
+		t.Errorf("new state directory should not displace adopted legacy state, stat err = %v", err)
+	}
+	log, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := string(log)
+	stop := "--user disable --now gasworks-observer.service"
+	start := "--user enable --now gasworks-companion.service"
+	if !strings.Contains(commands, stop) || !strings.Contains(commands, start) {
+		t.Fatalf("expected legacy stop and Companion start, got:\n%s", commands)
+	}
+	if strings.Index(commands, stop) > strings.Index(commands, start) {
+		t.Errorf("legacy service was not stopped before Companion start:\n%s", commands)
+	}
+}
+
+func TestUpgradeRetiresDisabledActiveLegacyServiceWithoutStartingCompanion(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local", "state", "gasworks-observer", "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon -source-id legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, "gasworks-observer.service"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyBin := filepath.Join(home, ".local", "bin", legacyObserverBinName)
+	if err := os.MkdirAll(filepath.Dir(legacyBin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyBin, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := buildFixture(t, dir)
+	systemctlDir, systemctlLog := fakeSystemctlWithBehavior(t, dir, systemctlBehavior{legacyActive: true})
+	out, err := runScript(t, installEnvWithSystemctl(home, systemctlDir, systemctlLog), scriptPath(t, "install.sh"), "--upgrade",
+		"--archive", fx.archive, "--checksums", fx.checksums,
+		"--checksums-sig", fx.checksumsSig, "--checksums-cert", fx.checksumsCert,
+		"--cosign", fakeCosign(t, dir, 0))
+	if err != nil {
+		t.Fatalf("disabled-service upgrade failed: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(unitDir, "gasworks-observer.service")); !os.IsNotExist(err) {
+		t.Errorf("disabled legacy unit was not retired, stat err = %v", err)
+	}
+	if _, err := os.Stat(legacyBin); !os.IsNotExist(err) {
+		t.Errorf("disabled legacy binary was not retired, stat err = %v", err)
+	}
+	log, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(log), "--user enable --now gasworks-companion.service") {
+		t.Fatalf("upgrade revived disabled service:\n%s", log)
+	}
+	if !strings.Contains(string(log), "--user stop gasworks-observer.service") {
+		t.Fatalf("disabled-but-active legacy service was not stopped:\n%s", log)
+	}
+}
+
+func TestFailedCompanionStartRestoresEnabledLegacyService(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local", "state", "gasworks-observer", "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon -source-id legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyUnit := filepath.Join(unitDir, "gasworks-observer.service")
+	if err := os.WriteFile(legacyUnit, []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := buildFixture(t, dir)
+	systemctlDir, systemctlLog := fakeSystemctlWithBehavior(t, dir, systemctlBehavior{legacyEnabled: true, failCompanionStart: true})
+	out, err := runScript(t, installEnvWithSystemctl(home, systemctlDir, systemctlLog), scriptPath(t, "install.sh"),
+		"--archive", fx.archive, "--checksums", fx.checksums,
+		"--checksums-sig", fx.checksumsSig, "--checksums-cert", fx.checksumsCert,
+		"--source-id", "src-1", "--cosign", fakeCosign(t, dir, 0))
+	if err == nil {
+		t.Fatalf("expected failed Companion start, got success:\n%s", out)
+	}
+	if _, err := os.Stat(legacyUnit); err != nil {
+		t.Fatalf("failed handoff removed legacy unit: %v", err)
+	}
+	log, readErr := os.ReadFile(systemctlLog)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	commands := string(log)
+	for _, want := range []string{
+		"--user disable --now gasworks-observer.service",
+		"--user enable --now gasworks-companion.service",
+		"--user disable --now gasworks-companion.service",
+		"--user enable --now gasworks-observer.service",
+	} {
+		if !strings.Contains(commands, want) {
+			t.Errorf("missing %q from failed handoff:\n%s", want, commands)
+		}
+	}
+}
+
+func TestFailedLegacyRestorePropagatesRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local", "state", "gasworks-observer", "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon -source-id legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, "gasworks-observer.service"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := buildFixture(t, dir)
+	systemctlDir, _ := fakeSystemctlWithBehavior(t, dir, systemctlBehavior{legacyEnabled: true, failCompanionStart: true, failLegacyStart: true})
+	out, err := runScript(t, installEnvWithSystemctl(home, systemctlDir, filepath.Join(dir, "systemctl.log")), scriptPath(t, "install.sh"),
+		"--archive", fx.archive, "--checksums", fx.checksums,
+		"--checksums-sig", fx.checksumsSig, "--checksums-cert", fx.checksumsCert,
+		"--source-id", "src-1", "--cosign", fakeCosign(t, dir, 0))
+	if err == nil {
+		t.Fatalf("expected failed rollback, got success:\n%s", out)
+	}
+	if strings.Contains(out, "restored legacy user unit") {
+		t.Fatalf("installer claimed a failed rollback was restored:\n%s", out)
+	}
+	if !strings.Contains(out, "legacy service rollback failed") {
+		t.Fatalf("installer did not report rollback failure:\n%s", out)
+	}
+}
+
+func TestFailedCompanionStopPropagatesRollbackFailure(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local", "state", "gasworks-observer", "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon -source-id legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Join(home, ".config", "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, "gasworks-observer.service"), []byte("[Service]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fx := buildFixture(t, dir)
+	systemctlDir, _ := fakeSystemctlWithBehavior(t, dir, systemctlBehavior{legacyEnabled: true, failCompanionStart: true, failCompanionStop: true})
+	out, err := runScript(t, installEnvWithSystemctl(home, systemctlDir, filepath.Join(dir, "systemctl.log")), scriptPath(t, "install.sh"),
+		"--archive", fx.archive, "--checksums", fx.checksums,
+		"--checksums-sig", fx.checksumsSig, "--checksums-cert", fx.checksumsCert,
+		"--source-id", "src-1", "--cosign", fakeCosign(t, dir, 0))
+	if err == nil {
+		t.Fatalf("expected failed rollback, got success:\n%s", out)
+	}
+	if strings.Contains(out, "restored legacy user unit") {
+		t.Fatalf("installer claimed a failed rollback was restored:\n%s", out)
+	}
+	if !strings.Contains(out, "legacy service rollback failed") {
+		t.Fatalf("installer did not report rollback failure:\n%s", out)
+	}
+}
+
+func TestUninstallAdoptsLegacyLayoutAndPurgesWAL(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	legacyState := filepath.Join(home, ".local", "state", "gasworks-observer")
+	if err := os.MkdirAll(filepath.Join(legacyState, "wal"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacyConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyConfig, "observer.env"), []byte("OBSERVER_ARGS=daemon\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyState, "wal", "000001.seg"), []byte("DURABLE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	companionBin := filepath.Join(home, ".local", "bin", companionBinName)
+	if err := os.MkdirAll(filepath.Dir(companionBin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(companionBin, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runScript(t, installEnv(home), scriptPath(t, "install.sh"), "--uninstall", "--purge-spool", "--skip-service")
+	if err != nil {
+		t.Fatalf("legacy-layout uninstall failed: %v\n%s", err, out)
+	}
+	for _, path := range []string{legacyConfig, legacyState, companionBin} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("legacy-layout uninstall left %s behind: %v", path, err)
+		}
+	}
+}
+
+func TestUninstallDoesNotTouchLegacyLayoutWhenCompanionLayoutExists(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	companionConfig := filepath.Join(home, ".config", "gasworks-companion")
+	companionState := filepath.Join(home, ".local", "state", "gasworks-companion")
+	legacyConfig := filepath.Join(home, ".config", "gasworks-observer")
+	legacyState := filepath.Join(home, ".local", "state", "gasworks-observer")
+	for _, path := range []string{companionConfig, filepath.Join(companionState, "wal"), legacyConfig, filepath.Join(legacyState, "wal")} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(companionState, "wal", "000001.seg"), []byte("COMPANION"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyState, "wal", "000001.seg"), []byte("LEGACY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	companionBin := filepath.Join(home, ".local", "bin", companionBinName)
+	if err := os.MkdirAll(filepath.Dir(companionBin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(companionBin, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := runScript(t, installEnv(home), scriptPath(t, "install.sh"), "--uninstall", "--purge-spool", "--skip-service")
+	if err != nil {
+		t.Fatalf("Companion-layout uninstall failed: %v\n%s", err, out)
+	}
+	for _, path := range []string{companionConfig, companionState} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("Companion-layout uninstall left %s behind: %v", path, err)
+		}
+	}
+	for _, path := range []string{legacyConfig, legacyState} {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("Companion-layout uninstall touched unrelated legacy path %s: %v", path, err)
+		}
+	}
+}
+
 func TestUninstallPreservesNonemptyWALByDefault(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
@@ -357,7 +767,7 @@ func TestUninstallPurgeSpoolRemovesWAL(t *testing.T) {
 // installer, doctor, and service must NOT depend on sudo, tmux, or the gc/City runtime. It
 // scans non-comment lines only (comments may legitimately explain the "no sudo" design).
 func TestNoElevationDependencyInPackScripts(t *testing.T) {
-	files := []string{"install.sh", "doctor.sh", filepath.Join("deploy", "gasworks-observer.service")}
+	files := []string{"install.sh", "doctor.sh", filepath.Join("deploy", "gasworks-companion.service")}
 	banned := []string{"sudo", "tmux"}
 	for _, f := range files {
 		data, err := os.ReadFile(scriptPath(t, f))

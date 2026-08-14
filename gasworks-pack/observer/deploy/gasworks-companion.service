@@ -1,4 +1,4 @@
-# gasworks-observer — standalone Gas City Observer endpoint (systemd USER service).
+# gasworks-companion — standalone Gas City Companion endpoint (systemd USER service).
 #
 # GOVERNING INVARIANT: ZERO Gas City dependency. This is a per-user service — installed under
 # ~/.config/systemd/user and run with `systemctl --user`, NEVER system-wide, NEVER with sudo.
@@ -6,7 +6,7 @@
 #
 # Enable (no sudo):
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now gasworks-observer.service
+#   systemctl --user enable --now gasworks-companion.service
 #
 # LINGERING: a user service only runs while the user has a login session unless linger is on.
 # To keep the endpoint collecting across logout/reboot (no sudo required for your own user):
@@ -16,7 +16,7 @@
 # On restart the daemon recovers its WAL from the state dir, so a restart never loses spool.
 
 [Unit]
-Description=Gas City Observer endpoint (standalone user service)
+Description=Gas City Companion endpoint (standalone user service)
 Documentation=https://github.com/gascity/gasworks
 After=network-online.target
 Wants=network-online.target
@@ -25,11 +25,11 @@ Wants=network-online.target
 Type=simple
 
 # Owner-only config (0600) written by install.sh: GASWORKS_OBSERVER_DIR + OBSERVER_ARGS.
-EnvironmentFile=%h/.config/gasworks-observer/observer.env
+EnvironmentFile=%h/.config/gasworks-companion/observer.env
 
 # $OBSERVER_ARGS is intentionally unbraced so systemd word-splits it into the daemon argv
 # (e.g. "daemon -dir … -source-id … -collector …").
-ExecStart=%h/.local/bin/gasworks-observer $OBSERVER_ARGS
+ExecStart=%h/.local/bin/gasworks-companion $OBSERVER_ARGS
 
 # Graceful drain: SIGTERM lets the daemon flush and close the spool; the WAL is recovered on
 # the next start, so stop/restart never loses acknowledged evidence.
@@ -43,7 +43,7 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/state/gasworks-observer
+ReadWritePaths=%h/.local/state/gasworks-companion
 PrivateTmp=true
 PrivateDevices=true
 ProtectControlGroups=true

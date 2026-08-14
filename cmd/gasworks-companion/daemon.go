@@ -77,11 +77,11 @@ func runDaemon(args []string) int {
 		return 2
 	}
 	if *sourceID == "" {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -source-id is required")
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -source-id is required")
 		return 2
 	}
 	if *rootPolicyFile != "" && len(approvedRoots) > 0 {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -root-policy-file and -approved-root are mutually exclusive")
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -root-policy-file and -approved-root are mutually exclusive")
 		return 2
 	}
 	// Fail loud on a half-configured extractor: -bead-prefix without -beads-project would resolve
@@ -89,7 +89,7 @@ func runDaemon(args []string) int {
 	// so the linkage would appear wired but produce nothing. -beads-project alone is a harmless no-op
 	// (no prefixes ⇒ no extraction), matching declare-work's independent use of the same project id.
 	if len(beadPrefixes) > 0 && *beadsProject == "" {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -bead-prefix requires -beads-project (the team-server project extracted references resolve to)")
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -bead-prefix requires -beads-project (the team-server project extracted references resolve to)")
 		return 2
 	}
 	var policy rootpolicy.Policy
@@ -98,23 +98,23 @@ func runDaemon(args []string) int {
 		var err error
 		policy, err = rootpolicy.LoadPolicy(*rootPolicyFile)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 			return 2
 		}
 		policyRecords = capturableRoots(policy.Roots)
 		if *cursorDir == "" {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -root-policy-file")
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -cursor-dir is required with -root-policy-file")
 			return 2
 		}
 	}
 	stateDir, err := observerDir(*dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 		return 1
 	}
 	socketPath, err := observerSocketPath(*socket, stateDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 		return 2
 	}
 
@@ -125,26 +125,26 @@ func runDaemon(args []string) int {
 		Capacity:          defaultCapacity(*ceiling),
 		RegistrySource:    *sourceID,
 		RegistryWorkspace: *workspace,
-		Log:               func(s string) { fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", s) },
+		Log:               func(s string) { fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", s) },
 	}
 
 	if *collector != "" {
 		client, err := buildCollectorClient(*collector, *sourceID, *tokenFile, *allowLoopbackHTTP, caFiles)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 			return 2
 		}
 		cfg.Upload = &daemon.UploadLoopConfig{Sender: client}
 		if *contentUpload {
 			if len(approvedRoots) == 0 && len(policyRecords) == 0 {
-				fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
+				fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
 			} else {
 				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
 				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
 			}
 		}
 	} else if *contentUpload {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -content-upload requires -collector; running metadata-only")
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -collector; running metadata-only")
 	}
 	// Build the extraction configuration once and hand the same value to whichever watcher config is
 	// selected. Empty prefixes yield a nil bead pattern downstream (extraction off); a non-empty set
@@ -155,13 +155,13 @@ func runDaemon(args []string) int {
 		// rootless watcher fails construction, so the daemon runs metadata-only until the
 		// membership engine lands. Any other policy keeps its v1 wiring exactly.
 		if len(policyRecords) == 0 && len(policy.Roots) > 0 {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: root policy carries only project roots; transcript capture is idle")
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: root policy carries only project roots; transcript capture is idle")
 		} else {
 			cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval, references)
 		}
 	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
-			fmt.Fprintln(os.Stderr, "gasworks-observer daemon: -cursor-dir is required with -approved-root")
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -cursor-dir is required with -approved-root")
 			return 2
 		}
 		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval, references)
@@ -169,15 +169,15 @@ func runDaemon(args []string) int {
 
 	svc, err := daemon.NewService(cfg)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 		return 1
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	fmt.Fprintf(os.Stderr, "gasworks-observer daemon: serving at %s\n", svc.SocketPath())
+	fmt.Fprintf(os.Stderr, "gasworks-companion daemon: serving at %s\n", svc.SocketPath())
 	if err := svc.Run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer daemon:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 		return 1
 	}
 	return 0

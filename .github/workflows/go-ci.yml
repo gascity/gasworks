@@ -22,9 +22,9 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           # Pinned patch (not the floating "1.26"). The Gas City eventexport dependency
-          # establishes a 1.26.4 baseline; this module uses 1.26.5 to fix GO-2026-5856
+          # establishes a 1.26.4 baseline; this module uses 1.26.6 to fix GO-2026-5856
           # and the stdlib CVEs that lingered at earlier toolchain versions.
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: gofmt (fail on unformatted)
         run: |
@@ -61,13 +61,13 @@ jobs:
         run: go test -mod=vendor ./... -race -count=1
 
       # Vulnerability gate. Installs govulncheck pinned to a released version and fails on
-      # any reachable CVE. Proven clean against go1.26.5 (0 reachable vulns). This gate fails
+      # any reachable CVE. Proven clean against go1.26.6 (0 reachable vulns). This gate fails
       # only on a NEW reachable CVE in the stdlib or a dependency.
       - name: govulncheck
         env:
           # govulncheck@v1.4.0's own go.mod floor is 1.25, so a default install would build
-          # it WITH 1.25 — and a 1.25-built govulncheck cannot analyze this go 1.26.5 module.
-          # GOTOOLCHAIN=local forces it to build + scan with the setup-go 1.26.5 above.
+          # it WITH 1.25 — and a 1.25-built govulncheck cannot analyze this go 1.26.6 module.
+          # GOTOOLCHAIN=local forces it to build + scan with the setup-go 1.26.6 above.
           GOTOOLCHAIN: local
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.4.0
@@ -82,7 +82,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: Exercise native macOS Observer boundaries
         run: >-
@@ -91,11 +91,11 @@ jobs:
           ./internal/observer/adapter/codex
           ./internal/observer/runwrap
           ./internal/observer/daemon
-          ./cmd/gasworks-observer
+          ./cmd/gasworks-companion
           -count=1
 
       - name: Build macOS Observer companion
-        run: go build -mod=vendor -trimpath ./cmd/gasworks-observer
+        run: go build -mod=vendor -trimpath ./cmd/gasworks-companion
 
   windows-locking:
     runs-on: windows-latest
@@ -104,7 +104,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: Exercise credential-store locking on Windows
         run: go test -mod=vendor ./internal/store ./cmd/gasworks -run '^(TestConcurrentUpdatePreservesFields|TestCredentialProvider(SerializesRefreshRotationAcrossProcesses|RecoversRefreshLockAfterProcessTermination))$' -count=1
@@ -121,7 +121,7 @@ jobs:
 
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.26.5"
+          go-version: "1.26.6"
 
       - name: GoReleaser snapshot (cross-compile dry-run)
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0

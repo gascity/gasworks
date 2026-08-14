@@ -160,6 +160,31 @@ func TestSignalForwarding(t *testing.T) {
 	}
 }
 
+// TestSignalForwardingQueuesSignalBeforeChildAttachment closes the launch window where a child
+// can become ready before the wrapper has attached its signal-forwarding target. The wrapper must
+// retain the signal instead of taking its default termination action, then relay it once attached.
+func TestSignalForwardingQueuesSignalBeforeChildAttachment(t *testing.T) {
+	sh := shPath(t)
+	cmd := exec.Command(sh, "-c", `trap 'exit 42' USR1; echo ready; while true; do sleep 0.05; done`)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	attach, stop := startSignalForwarding()
+	defer stop()
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	waitForLine(t, bufio.NewReader(stdout), "ready", 10*time.Second)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGUSR1); err != nil {
+		t.Fatalf("signal wrapper: %v", err)
+	}
+	attach(cmd.Process)
+	if err := cmd.Wait(); exitCode(err) != 42 {
+		t.Fatalf("child exit code = %d (err=%v), want 42", exitCode(err), err)
+	}
+}
+
 // TestCwdPreserved proves the child runs in the wrapper's working directory (a real wrapper
 // process launched with Dir set to a temp dir; its child prints that same directory).
 func TestCwdPreserved(t *testing.T) {

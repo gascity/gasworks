@@ -15,7 +15,7 @@ import (
 )
 
 // runDeclareWork appends one DECLARED work reference to the explicit run inherited from
-// gasworks-observer run. It intentionally has no run-id flag: callers may extend only their
+// gasworks-companion run. It intentionally has no run-id flag: callers may extend only their
 // current wrapper-authored boundary, never name an arbitrary run.
 func runDeclareWork(args []string) int {
 	fs := flag.NewFlagSet("declare-work", flag.ContinueOnError)
@@ -27,23 +27,23 @@ func runDeclareWork(args []string) int {
 		return 2
 	}
 	if strings.TrimSpace(*beadsProject) == "" || strings.TrimSpace(*workItem) == "" {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work: -beads-project and -work-item are required")
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work: -beads-project and -work-item are required")
 		return 2
 	}
 	runID := strings.TrimSpace(os.Getenv(runwrap.RunIDEnvVar))
 	if runID == "" {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work: no current explicit run")
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work: no current explicit run")
 		return 1
 	}
 
 	stateDir, err := observerDir(*dir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work:", err)
 		return 1
 	}
 	socketPath, err := observerSocketPath(*socket, stateDir)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work:", err)
 		return 2
 	}
 	obs, err := runwrap.NewDeclaredWorkReference(
@@ -53,14 +53,14 @@ func runDeclareWork(args []string) int {
 		time.Now().UTC(),
 	)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work:", err)
 		return 2
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), local.DefaultClientTimeout)
 	defer cancel()
 	if _, err := local.NewClient(socketPath).AppendObservation(ctx, obs); err != nil {
-		fmt.Fprintln(os.Stderr, "gasworks-observer declare-work:", err)
+		fmt.Fprintln(os.Stderr, "gasworks-companion declare-work:", err)
 		return 1
 	}
 	return 0
