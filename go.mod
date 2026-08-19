@@ -3,7 +3,7 @@ module github.com/gascity/gasworks
 go 1.26.6
 
 require (
-	github.com/gastownhall/gascity v1.4.1-0.20260805194759-b19a3da8b5bb
+	github.com/gastownhall/gascity v1.4.1-0.20260819084019-ba85a40e285e
 	github.com/oapi-codegen/runtime v1.4.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/zeebo/blake3 v0.2.4
