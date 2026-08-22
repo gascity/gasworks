@@ -10,9 +10,9 @@ import (
 
 const (
 	defaultSTSBase      = "https://works.gascity.com"
-	defaultOIDCIssuer   = "https://auth.gascity.com/realms/gascity"
+	defaultOIDCIssuer   = "https://auth.gascity.com/realms/gasworks-customers"
 	defaultClientID     = "gasworks-cli"
-	defaultLoopbackPort = 9822
+	defaultLoopbackPort = 0
 )
 
 // Config is the resolved endpoint + client configuration. Treat it as immutable after
@@ -25,8 +25,10 @@ type Config struct {
 }
 
 // FromEnv builds a Config from defaults plus GASWORKS_* env overrides. Trailing slashes on
-// the base URLs are trimmed so the accessors never emit a double slash. A non-numeric
-// GASWORKS_LOOPBACK_PORT falls back to the default.
+// the base URLs are trimmed so the accessors never emit a double slash. By default the
+// browser callback uses an OS-assigned ephemeral port; GASWORKS_LOOPBACK_PORT is an
+// explicit fixed-port override for tests and development. A non-numeric override falls
+// back to the ephemeral default.
 func FromEnv() Config {
 	port := defaultLoopbackPort
 	if v := os.Getenv("GASWORKS_LOOPBACK_PORT"); v != "" {
