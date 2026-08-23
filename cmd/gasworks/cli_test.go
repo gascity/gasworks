@@ -590,6 +590,18 @@ func TestLoginOrgSelection(t *testing.T) {
 	}
 }
 
+func TestLoginStaffRejectsDeviceFlow(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "OLD", "id_token": "OLD"})
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--staff", "--device"}) })
+	if code == 0 || !strings.Contains(errOut, "--staff requires the browser flow") {
+		t.Fatalf("login = exit %d stderr %q, want staff/device rejection", code, errOut)
+	}
+	if got := len(srv.reqs("/protocol/openid-connect/auth/device")); got != 0 {
+		t.Fatalf("staff/device made %d device authorization requests, want none", got)
+	}
+}
+
 func TestLoginWithoutRefreshTokenPreservesPriorLogin(t *testing.T) {
 	srv := newStub(t)
 	srv.refreshTok = map[string]any{"id_token": validIDTokenIss(srv.srv.URL + "/realms/g")}

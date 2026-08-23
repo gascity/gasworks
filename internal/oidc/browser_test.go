@@ -41,6 +41,7 @@ type browserHarness struct {
 	emptyIDToken     bool   // if set, the token response carries an empty id_token
 	redirectURI      string // captured from the authorization request
 	tokenRedirectURI string // captured from the token exchange
+	authorizeParams  url.Values
 }
 
 func newBrowserHarness(t *testing.T) *browserHarness {
@@ -94,6 +95,7 @@ func (h *browserHarness) install() {
 		h.nonce = q.Get("nonce")
 		h.state = q.Get("state")
 		h.redirectURI = redirectURI
+		h.authorizeParams = q
 		h.mu.Unlock()
 
 		params := url.Values{}
@@ -170,6 +172,34 @@ func TestBrowserLoginDefaultUsesEphemeralExactCallback(t *testing.T) {
 	}
 	if tokenRedirectURI != redirectURI {
 		t.Fatalf("token redirect_uri = %q, want authorization redirect_uri %q", tokenRedirectURI, redirectURI)
+	}
+}
+
+func TestBrowserLoginStaffUsesOnlyTheApprovedBrokerHint(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	if _, err := BrowserLoginStaff(h.cfg, func(string) {}); err != nil {
+		t.Fatalf("BrowserLoginStaff: %v", err)
+	}
+	h.mu.Lock()
+	hint := h.authorizeParams.Get("kc_idp_hint")
+	h.mu.Unlock()
+	if hint != staffBrokerHint {
+		t.Fatalf("kc_idp_hint = %q, want %q", hint, staffBrokerHint)
+	}
+}
+
+func TestBrowserLoginCustomerDoesNotEmitStaffBrokerHint(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	if _, err := BrowserLogin(h.cfg, func(string) {}); err != nil {
+		t.Fatalf("BrowserLogin: %v", err)
+	}
+	h.mu.Lock()
+	_, present := h.authorizeParams["kc_idp_hint"]
+	h.mu.Unlock()
+	if present {
+		t.Fatal("customer browser login sent a staff broker hint")
 	}
 }
 

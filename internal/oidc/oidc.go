@@ -31,6 +31,10 @@ import (
 // and refresh — dropping `openid` makes Keycloak omit the id_token.
 const OIDCScope = "openid profile email offline_access"
 
+// staffBrokerHint is deliberately reachable only through BrowserLoginStaff. Customer login
+// calls BrowserLogin and therefore never emit this Keycloak routing parameter.
+const staffBrokerHint = "gascity-sso"
+
 const (
 	grantDeviceCode = "urn:ietf:params:oauth:grant-type:device_code"
 	grantAuthCode   = "authorization_code"
@@ -207,6 +211,17 @@ func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 // port for tests and development. It binds 127.0.0.1 ONLY, serves exactly one /callback,
 // fails closed on any error/CSRF/nonce mismatch, and exchanges the code for tokens.
 func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
+	return browserLogin(cfg, logf, "")
+}
+
+// BrowserLoginStaff runs the browser flow through the approved staff broker. The device grant
+// has no browser authorization request to route, so callers must reject that combination rather
+// than silently changing device-flow behavior.
+func BrowserLoginStaff(cfg config.Config, logf func(string)) (Tokens, error) {
+	return browserLogin(cfg, logf, staffBrokerHint)
+}
+
+func browserLogin(cfg config.Config, logf func(string), idpHint string) (Tokens, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
@@ -236,7 +251,7 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 	}
 	selectedPort := ln.Addr().(*net.TCPAddr).Port
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", selectedPort)
-	authURL := cfg.AuthorizeURL() + "?" + url.Values{
+	authParams := url.Values{
 		"client_id":             {cfg.ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {redirectURI},
@@ -245,7 +260,11 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 		"nonce":                 {nonce},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
-	}.Encode()
+	}
+	if idpHint != "" {
+		authParams.Set("kc_idp_hint", idpHint)
+	}
+	authURL := cfg.AuthorizeURL() + "?" + authParams.Encode()
 
 	type result struct {
 		code     string
