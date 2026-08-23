@@ -55,7 +55,7 @@ func TestProofStructure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hdr, pl, _ := parts(t, mustProof(t, k, "POST", "https://works.gascity.com/sts/v0/token"))
+	hdr, pl, _ := parts(t, mustProof(t, k, "POST", "https://works.gascity.com/sts/v0/token", ""))
 
 	if hdr["typ"] != "dpop+jwt" {
 		t.Errorf("typ = %v, want dpop+jwt", hdr["typ"])
@@ -103,12 +103,25 @@ func TestProofStructure(t *testing.T) {
 	}
 }
 
+func TestProofBindsPresentedCredentialWithATH(t *testing.T) {
+	k, err := NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const credential = "presented-credential"
+	_, payload, _ := parts(t, mustProof(t, k, "POST", "https://works.gascity.com/sts/v0/token", credential))
+	want := sha256.Sum256([]byte(credential))
+	if got, _ := payload["ath"].(string); got != base64.RawURLEncoding.EncodeToString(want[:]) {
+		t.Fatalf("ath = %q, want hash of the exact presented credential", got)
+	}
+}
+
 func TestIatSerializesAsInteger(t *testing.T) {
 	k, err := NewKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	proof := mustProof(t, k, "POST", "https://x/y")
+	proof := mustProof(t, k, "POST", "https://x/y", "")
 	pb, err := base64.RawURLEncoding.DecodeString(strings.Split(proof, ".")[1])
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +142,7 @@ func TestSignatureIs64BytesAndVerifiesAcrossManyKeys(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		proof := mustProof(t, k, "POST", htu)
+		proof := mustProof(t, k, "POST", htu, "")
 		seg := strings.Split(proof, ".")
 		sig, err := base64.RawURLEncoding.DecodeString(seg[2])
 		if err != nil {
@@ -161,8 +174,8 @@ func TestFreshJTIPerProof(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, a, _ := parts(t, mustProof(t, k, "POST", "https://x/y"))
-	_, b, _ := parts(t, mustProof(t, k, "POST", "https://x/y"))
+	_, a, _ := parts(t, mustProof(t, k, "POST", "https://x/y", ""))
+	_, b, _ := parts(t, mustProof(t, k, "POST", "https://x/y", ""))
 	if a["jti"] == b["jti"] {
 		t.Errorf("jti reused across proofs: %v", a["jti"])
 	}
@@ -240,9 +253,9 @@ func TestPublicJWKHasNoPrivateScalar(t *testing.T) {
 	}
 }
 
-func mustProof(t *testing.T, k *Key, htm, htu string) string {
+func mustProof(t *testing.T, k *Key, htm, htu, credential string) string {
 	t.Helper()
-	p, err := k.Proof(htm, htu)
+	p, err := k.Proof(htm, htu, credential)
 	if err != nil {
 		t.Fatalf("Proof: %v", err)
 	}

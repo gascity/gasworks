@@ -92,6 +92,24 @@ Success:
 Failures are typed JSON with `kind: "Error"` and a stable code such as
 `interaction_required`; they exit nonzero and never echo credentials or upstream response bodies.
 
+For a managed service principal, keep the same v1 JSON protocol and configure the invocation
+with the complete flag set below. The key file is reread for each invocation; this mode does not
+read or modify the human login store.
+
+```sh
+gasworks credential-provider \
+  --service-principal-credential-file /absolute/path/to/api-key \
+  --service-principal-audience manifold \
+  --service-principal-org org_123 \
+  --service-principal-scope manifold:proxy \
+  --service-principal-scope manifold:pool:acme \
+  < request.json
+```
+
+The request audience must match exactly, `org` may be omitted or must match exactly, and its
+nonempty scopes must be a subset of the configured scopes. Any incomplete service-principal flag
+set is rejected.
+
 ## How it works
 
 Three short-lived layers, each cached and auto-renewed:

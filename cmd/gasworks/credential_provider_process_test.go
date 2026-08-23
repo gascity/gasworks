@@ -131,9 +131,17 @@ func runGasworksCLIProcess(binary, request string) (string, string, int, error) 
 }
 
 func runGasworksCLIProcessStarted(binary, request string, started chan<- struct{}) (string, string, int, error) {
+	return runGasworksCLIProcessStartedWithArgs(binary, request, started)
+}
+
+func runGasworksCLIProcessWithArgs(binary, request string, args ...string) (string, string, int, error) {
+	return runGasworksCLIProcessStartedWithArgs(binary, request, nil, args...)
+}
+
+func runGasworksCLIProcessStartedWithArgs(binary, request string, started chan<- struct{}, args ...string) (string, string, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, binary, "credential-provider")
+	command := exec.CommandContext(ctx, binary, append([]string{"credential-provider"}, args...)...)
 	command.Stdin = strings.NewReader(request)
 	command.Env = os.Environ()
 	var stdoutBuffer, stderrBuffer bytes.Buffer
@@ -158,6 +166,61 @@ func runGasworksCLIProcessStarted(binary, request string, started chan<- struct{
 		exitCode = exitError.ExitCode()
 	}
 	return stdoutBuffer.String(), stderrBuffer.String(), exitCode, nil
+}
+
+func TestServicePrincipalCredentialProviderRealProcessesAreIndependent(t *testing.T) {
+	stub := newServicePrincipalStub(t)
+	credentialFile := filepath.Join(t.TempDir(), "service-principal-key")
+	const serviceKey = "service-key-not-in-output"
+	if err := os.WriteFile(credentialFile, []byte(serviceKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	credentialsPath := filepath.Join(configDir, "credentials.json")
+	const humanCredentials = "not-a-human-credential-store"
+	if err := os.WriteFile(credentialsPath, []byte(humanCredentials), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GASWORKS_STS_URL", stub.server.URL)
+	t.Setenv("GASWORKS_CONFIG_DIR", configDir)
+	binary := buildGasworksCLI(t)
+	args := servicePrincipalArgs(credentialFile)
+	request := `{"version":"gascity.dev/credential-provider/v1","audience":"manifold","required_scopes":["manifold:proxy"],"org":"org_a","interactive":false}`
+
+	results := make(chan credentialProviderProcessResult, 2)
+	for range 2 {
+		go func() {
+			out, errOut, code, err := runGasworksCLIProcessWithArgs(binary, request, args...)
+			results <- credentialProviderProcessResult{stdout: out, stderr: errOut, code: code, err: err}
+		}()
+	}
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("run service-principal process: %v", result.err)
+		}
+		response := decodeProcessResponse(t, result.stdout)
+		if result.code != 0 || result.stderr != "" || response.Kind != "Credential" || response.AccessToken != "SERVICE.EIA" ||
+			response.AuthorizationScheme != "Bearer" || strings.Contains(result.stdout+result.stderr, serviceKey) {
+			t.Fatalf("service-principal process = exit %d stderr %q response %+v", result.code, result.stderr, response)
+		}
+	}
+	requests := stub.snapshot()
+	if len(requests) != 4 {
+		t.Fatalf("STS requests = %d, want four", len(requests))
+	}
+	machineProofs := make([]string, 0, 2)
+	for _, request := range requests {
+		if request.path == "/sts/v0/machine" {
+			machineProofs = append(machineProofs, proofJWK(t, request.headers.Get("DPoP")))
+		}
+	}
+	if len(machineProofs) != 2 || machineProofs[0] == machineProofs[1] {
+		t.Fatalf("machine proof keys = %v, want one distinct fresh key per process", machineProofs)
+	}
+	if got, err := os.ReadFile(credentialsPath); err != nil || string(got) != humanCredentials {
+		t.Fatalf("human credentials changed or read path failed: bytes %q err %v", got, err)
+	}
 }
 
 func decodeProcessResponse(t *testing.T, output string) credentialProviderTestResponse {

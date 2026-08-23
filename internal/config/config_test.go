@@ -52,6 +52,7 @@ func TestURLAccessors(t *testing.T) {
 	cfg := Config{STSBase: "https://sts.example", OIDCIssuer: "https://kc.example/realms/g"}
 	cases := map[string]string{
 		cfg.LoginURL():      "https://sts.example/sts/v0/login",
+		cfg.MachineURL():    "https://sts.example/sts/v0/machine",
 		cfg.TokenURL():      "https://sts.example/sts/v0/token",
 		cfg.ContextURL():    "https://sts.example/sts/v0/context",
 		cfg.DeviceAuthURL(): "https://kc.example/realms/g/protocol/openid-connect/auth/device",

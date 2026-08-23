@@ -54,6 +54,9 @@ func env(key, def string) string {
 // LoginURL is the DPoP-bound session-establishment endpoint.
 func (c Config) LoginURL() string { return c.STSBase + "/sts/v0/login" }
 
+// MachineURL is the DPoP-bound service-principal session-establishment endpoint.
+func (c Config) MachineURL() string { return c.STSBase + "/sts/v0/machine" }
+
 // TokenURL is the RFC 8693 token-exchange endpoint (mints the EIA).
 func (c Config) TokenURL() string { return c.STSBase + "/sts/v0/token" }
 
