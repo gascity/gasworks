@@ -1,6 +1,7 @@
 package sts
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -76,6 +77,11 @@ func newStub(t *testing.T) (config.Config, *stubServer) {
 			writeJSON(w, http.StatusCreated, map[string]any{
 				"session_token": "SESS", "session_id": "ses_1",
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
+			})
+		case strings.HasSuffix(path, "/sts/v0/machine"):
+			writeJSON(w, http.StatusCreated, map[string]any{
+				"session_token": "SESS", "session_id": "ses_1", "org_id": "org_a",
+				"token_type": "DPoP", "expires_in": 28800,
 			})
 		case strings.HasSuffix(path, "/sts/v0/token"):
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -186,6 +192,27 @@ func TestLoginAndExchangeReuseOneKey(t *testing.T) {
 	}
 }
 
+func TestMachineUsesClientCredentialsAndATH(t *testing.T) {
+	cfg, srv := newStub(t)
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	if _, err := Machine(cfg, "service-key", key); err != nil {
+		t.Fatalf("Machine: %v", err)
+	}
+	requests := srv.reqs("/sts/v0/machine")
+	if len(requests) != 1 {
+		t.Fatalf("machine requests = %d, want 1", len(requests))
+	}
+	if got := requests[0].form; got.Get("grant_type") != grantClientCredentials || got.Get("client_secret") != "service-key" || len(got) != 2 {
+		t.Fatalf("machine form = %v", got)
+	}
+	if got := athOf(t, requests[0].headers.Get("DPoP")); got != ath("service-key") {
+		t.Fatalf("machine ath = %q, want exact client credential hash", got)
+	}
+}
+
 func TestContextSendsBearerAndProvision(t *testing.T) {
 	cfg, srv := newStub(t)
 	ctx, err := Context(cfg, "ID.TOK.EN", true)
@@ -266,4 +293,28 @@ func jwkOf(t *testing.T, proof string) string {
 	}
 	out, _ := json.Marshal(hdr.JWK)
 	return string(out)
+}
+
+func athOf(t *testing.T, proof string) string {
+	t.Helper()
+	parts := strings.Split(proof, ".")
+	if len(parts) != 3 {
+		t.Fatalf("malformed DPoP proof: %q", proof)
+	}
+	raw, err := base64urlDecode(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims struct {
+		ATH string `json:"ath"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return claims.ATH
+}
+
+func ath(credential string) string {
+	sum := sha256.Sum256([]byte(credential))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }

@@ -18,6 +18,9 @@ import (
 // grantTokenExchange is the RFC 8693 token-exchange grant.
 const grantTokenExchange = "urn:ietf:params:oauth:grant-type:token-exchange"
 
+// grantClientCredentials establishes an STS session for a configured service principal.
+const grantClientCredentials = "client_credentials"
+
 // defaultSessionExpiresIn is the fallback session lifetime (8h) when the server omits
 // expires_in.
 const defaultSessionExpiresIn = 28800
@@ -50,6 +53,8 @@ type ContextResolution struct {
 type Session struct {
 	SessionToken string `json:"session_token"`
 	SessionID    string `json:"session_id"`
+	OrgID        string `json:"org_id"`
+	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"`
 }
 
@@ -57,6 +62,7 @@ type Session struct {
 // its granted scope/lifetime.
 type EIA struct {
 	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
 	Scope       string `json:"scope"`
 	ExpiresIn   int    `json:"expires_in"`
 }
@@ -84,7 +90,7 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 // login URL and signed by key; pass the SAME key to Exchange so the server's jkt-pin holds.
 // On a non-2xx it returns the raw *httpc.HTTPError.
 func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, error) {
-	proof, err := key.Proof("POST", cfg.LoginURL())
+	proof, err := key.Proof("POST", cfg.LoginURL(), idToken)
 	if err != nil {
 		return Session{}, err
 	}
@@ -105,13 +111,34 @@ func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, erro
 	return sess, nil
 }
 
+// Machine establishes a DPoP-bound service-principal session at /sts/v0/machine. The same
+// key must be passed to Exchange so the STS session's jkt pin holds.
+func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, error) {
+	proof, err := key.Proof("POST", cfg.MachineURL(), clientSecret)
+	if err != nil {
+		return Session{}, err
+	}
+	_, body, err := httpc.PostForm(cfg.MachineURL(), url.Values{
+		"grant_type":    {grantClientCredentials},
+		"client_secret": {clientSecret},
+	}, map[string]string{"DPoP": proof})
+	if err != nil {
+		return Session{}, err
+	}
+	var sess Session
+	if err := remarshal(body, &sess); err != nil {
+		return Session{}, fmt.Errorf("machine: %w", err)
+	}
+	return sess, nil
+}
+
 // Exchange performs the RFC 8693 token-exchange at /sts/v0/token, returning the EIA
 // (access_token). subject_token_type is intentionally OMITTED: the STS accepts only empty or
 // the gascity session URN, so the RFC-canonical access_token default would 400. The DPoP
 // proof is bound to the token URL and MUST be signed by the same key as Login. On a non-2xx
 // it returns the raw *httpc.HTTPError.
 func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key) (EIA, error) {
-	proof, err := key.Proof("POST", cfg.TokenURL())
+	proof, err := key.Proof("POST", cfg.TokenURL(), sessionToken)
 	if err != nil {
 		return EIA{}, err
 	}

@@ -136,11 +136,12 @@ func jti() (string, error) {
 	return string(out), nil
 }
 
-// Proof builds a fresh DPoP proof JWT for one request. htu must be the exact STS URL.
+// Proof builds a fresh DPoP proof JWT for one request. htu must be the exact STS URL and
+// credential is the exact value presented by that request's credential-bearing form field.
 // iat is an int64 so encoding/json emits a JSON integer; header/payload key order is
 // irrelevant on the wire — the server verifies over the received bytes and never re-derives
 // the jkt from the header (that uses canonicalJWK).
-func (k *Key) Proof(htm, htu string) (string, error) {
+func (k *Key) Proof(htm, htu, credential string) (string, error) {
 	jwk := k.PublicJWK()
 
 	header := map[string]any{
@@ -158,6 +159,8 @@ func (k *Key) Proof(htm, htu string) (string, error) {
 		"iat": time.Now().Unix(), // int64 -> JSON integer
 		"jti": id,
 	}
+	credentialHash := sha256.Sum256([]byte(credential))
+	payload["ath"] = b64url.EncodeToString(credentialHash[:])
 
 	hJSON, err := json.Marshal(header)
 	if err != nil {

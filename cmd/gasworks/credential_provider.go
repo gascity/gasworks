@@ -46,20 +46,29 @@ type credentialProviderResponse struct {
 }
 
 func cmdCredentialProvider(cfg config.Config, argv []string) int {
-	request, err := decodeCredentialProviderRequest(argv)
+	servicePrincipal, machineMode, err := parseServicePrincipalFlags(argv)
+	if err != nil {
+		return emitCredentialProviderError(credentialErrorInvalid)
+	}
+	request, err := decodeCredentialProviderRequest()
 	if err != nil {
 		return emitCredentialProviderError(credentialErrorInvalid)
 	}
 
-	result, err := mintEIA(
-		cfg,
-		"",
-		request.Audience,
-		request.Org,
-		strings.Join(request.RequiredScopes, " "),
-		request.ForceRefresh,
-		true,
-	)
+	var result mintResult
+	if machineMode {
+		result, err = mintServicePrincipalEIA(cfg, servicePrincipal, request)
+	} else {
+		result, err = mintEIA(
+			cfg,
+			"",
+			request.Audience,
+			request.Org,
+			strings.Join(request.RequiredScopes, " "),
+			request.ForceRefresh,
+			true,
+		)
+	}
 	if err != nil {
 		code := credentialErrorUnavailable
 		var commandErr *cmdError
@@ -84,11 +93,10 @@ func cmdCredentialProvider(cfg config.Config, argv []string) int {
 	return 0
 }
 
-func decodeCredentialProviderRequest(argv []string) (credentialProviderRequest, error) {
-	if len(argv) != 0 {
+func decodeCredentialProviderRequest(argv ...[]string) (credentialProviderRequest, error) {
+	if len(argv) > 0 && len(argv[0]) != 0 {
 		return credentialProviderRequest{}, errors.New("credential-provider accepts no arguments")
 	}
-
 	raw, err := io.ReadAll(io.LimitReader(stdin, credentialRequestMaxBytes+1))
 	if err != nil || len(raw) > credentialRequestMaxBytes {
 		return credentialProviderRequest{}, errors.New("invalid credential request")
