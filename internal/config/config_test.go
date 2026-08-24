@@ -10,14 +10,14 @@ func TestFromEnvDefaults(t *testing.T) {
 	if cfg.STSBase != "https://works.gascity.com" {
 		t.Errorf("STSBase = %q", cfg.STSBase)
 	}
-	if cfg.OIDCIssuer != "https://auth.gascity.com/realms/gascity" {
+	if cfg.OIDCIssuer != "https://auth.gascity.com/realms/gasworks-customers" {
 		t.Errorf("OIDCIssuer = %q", cfg.OIDCIssuer)
 	}
 	if cfg.ClientID != "gasworks-cli" {
 		t.Errorf("ClientID = %q", cfg.ClientID)
 	}
-	if cfg.LoopbackPort != 9822 {
-		t.Errorf("LoopbackPort = %d, want 9822", cfg.LoopbackPort)
+	if cfg.LoopbackPort != 0 {
+		t.Errorf("LoopbackPort = %d, want 0 for an ephemeral port", cfg.LoopbackPort)
 	}
 }
 
@@ -43,8 +43,8 @@ func TestFromEnvOverridesAndTrimsSlash(t *testing.T) {
 
 func TestFromEnvBadPortFallsBack(t *testing.T) {
 	t.Setenv("GASWORKS_LOOPBACK_PORT", "not-a-number")
-	if cfg := FromEnv(); cfg.LoopbackPort != 9822 {
-		t.Errorf("LoopbackPort = %d, want default 9822 on bad input", cfg.LoopbackPort)
+	if cfg := FromEnv(); cfg.LoopbackPort != 0 {
+		t.Errorf("LoopbackPort = %d, want ephemeral default 0 on bad input", cfg.LoopbackPort)
 	}
 }
 

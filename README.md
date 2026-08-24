@@ -142,9 +142,9 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 | Env | Default |
 |---|---|
 | `GASWORKS_STS_URL` | `https://works.gascity.com` |
-| `GASWORKS_OIDC_ISSUER` | `https://auth.gascity.com/realms/gascity` |
+| `GASWORKS_OIDC_ISSUER` | `https://auth.gascity.com/realms/gasworks-customers` |
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
-| `GASWORKS_LOOPBACK_PORT` | `9822` (browser-flow loopback callback; non-numeric falls back to the default) |
+| `GASWORKS_LOOPBACK_PORT` | OS-assigned ephemeral port on `127.0.0.1` (set a numeric fixed-port override for tests/dev) |
 | `GASWORKS_CONFIG_DIR` | the platform config dir |
 
 ### Forwarder (`gasworks-forwarder`)

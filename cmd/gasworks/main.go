@@ -138,7 +138,7 @@ func printUsage() {
 	const usage = `gasworks: SSO login + getToken (EIA) for Gas City.
 
 Usage:
-  gasworks login [--device|--browser] [--org <id|slug>]
+  gasworks login [--device|--browser] [--staff] [--org <id|slug>]
   gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--json] [--refresh]
   gasworks credential-provider
   gasworks whoami

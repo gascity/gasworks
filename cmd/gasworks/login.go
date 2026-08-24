@@ -15,6 +15,7 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	fs.SetOutput(stderrWriter())
 	device := fs.Bool("device", false, "force the device-code flow (headless)")
 	browser := fs.Bool("browser", false, "force the browser loopback flow")
+	staff := fs.Bool("staff", false, "use the approved staff SSO route (browser only)")
 	org := fs.String("org", "", "remember a default org for getToken")
 	if err := fs.Parse(argv); err != nil {
 		return die("%s", err)
@@ -22,11 +23,16 @@ func cmdLogin(cfg config.Config, argv []string) error {
 
 	// Default to device-code unless a display is present; --device/--browser force it.
 	useDevice := *device || (!*browser && !hasDisplay())
+	if *staff && useDevice {
+		return die("--staff requires the browser flow; use `gasworks login --staff --browser`")
+	}
 
 	var tok oidc.Tokens
 	var err error
 	if useDevice {
 		tok, err = oidc.DeviceLogin(cfg, eprintln)
+	} else if *staff {
+		tok, err = oidc.BrowserLoginStaff(cfg, eprintln)
 	} else {
 		tok, err = oidc.BrowserLogin(cfg, eprintln)
 	}

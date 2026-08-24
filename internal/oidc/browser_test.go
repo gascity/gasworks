@@ -28,26 +28,34 @@ func mkIDToken(nonce string) string {
 // browserHarness wires a Keycloak-token stub + an openBrowser override that drives the
 // loopback /callback. nonceMutator lets a test forge a wrong nonce; stateMutator a wrong state.
 type browserHarness struct {
-	t            *testing.T
-	cfg          config.Config
-	mu           sync.Mutex
-	nonce        string // captured from the authorize URL
-	state        string
-	tokenSrv     *httptest.Server
-	stateMutator func(string) string
-	nonceForIDT  func(realNonce string) string
-	callbackErr  string // if set, callback carries ?error= and no code
-	omitCode     bool
-	emptyIDToken bool // if set, the token response carries an empty id_token
+	t                *testing.T
+	cfg              config.Config
+	mu               sync.Mutex
+	nonce            string // captured from the authorize URL
+	state            string
+	tokenSrv         *httptest.Server
+	stateMutator     func(string) string
+	nonceForIDT      func(realNonce string) string
+	callbackErr      string // if set, callback carries ?error= and no code
+	omitCode         bool
+	emptyIDToken     bool   // if set, the token response carries an empty id_token
+	redirectURI      string // captured from the authorization request
+	tokenRedirectURI string // captured from the token exchange
+	authorizeParams  url.Values
 }
 
 func newBrowserHarness(t *testing.T) *browserHarness {
 	h := &browserHarness{t: t, stateMutator: func(s string) string { return s }, nonceForIDT: func(n string) string { return n }}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/realms/g/protocol/openid-connect/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad form", http.StatusBadRequest)
+			return
+		}
 		h.mu.Lock()
 		nonce := h.nonce
 		empty := h.emptyIDToken
+		h.tokenRedirectURI = r.Form.Get("redirect_uri")
 		h.mu.Unlock()
 		idt := mkIDToken(h.nonceForIDT(nonce))
 		if empty {
@@ -65,7 +73,7 @@ func newBrowserHarness(t *testing.T) *browserHarness {
 		STSBase:      h.tokenSrv.URL,
 		OIDCIssuer:   h.tokenSrv.URL + "/realms/g",
 		ClientID:     "gasworks-cli",
-		LoopbackPort: freePort(t),
+		LoopbackPort: 0,
 	}
 	return h
 }
@@ -82,12 +90,14 @@ func (h *browserHarness) install() {
 			return
 		}
 		q := u.Query()
+		redirectURI := q.Get("redirect_uri")
 		h.mu.Lock()
 		h.nonce = q.Get("nonce")
 		h.state = q.Get("state")
+		h.redirectURI = redirectURI
+		h.authorizeParams = q
 		h.mu.Unlock()
 
-		cb := fmt.Sprintf("http://127.0.0.1:%d/callback", h.cfg.LoopbackPort)
 		params := url.Values{}
 		if h.callbackErr != "" {
 			params.Set("error", h.callbackErr)
@@ -100,7 +110,7 @@ func (h *browserHarness) install() {
 		// Fire asynchronously so BrowserLogin's server is already accepting.
 		go func() {
 			for i := 0; i < 50; i++ {
-				resp, err := http.Get(cb + "?" + params.Encode())
+				resp, err := http.Get(redirectURI + "?" + params.Encode())
 				if err == nil {
 					resp.Body.Close()
 					return
@@ -133,6 +143,63 @@ func TestBrowserLoginHappyPath(t *testing.T) {
 	}
 	if tok.IDToken == "" {
 		t.Error("missing id_token")
+	}
+}
+
+func TestBrowserLoginDefaultUsesEphemeralExactCallback(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	if _, err := BrowserLogin(h.cfg, func(string) {}); err != nil {
+		t.Fatalf("BrowserLogin: %v", err)
+	}
+
+	h.mu.Lock()
+	redirectURI := h.redirectURI
+	tokenRedirectURI := h.tokenRedirectURI
+	h.mu.Unlock()
+	u, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("parse redirect URI: %v", err)
+	}
+	if u.Scheme != "http" || u.Hostname() != "127.0.0.1" {
+		t.Fatalf("redirect URI origin = %q, want http://127.0.0.1", u.Scheme+"://"+u.Hostname())
+	}
+	if u.Port() == "" || u.Port() == "0" {
+		t.Fatalf("redirect URI port = %q, want an OS-assigned nonzero port", u.Port())
+	}
+	if u.EscapedPath() != "/callback" || u.RawQuery != "" || u.Fragment != "" {
+		t.Fatalf("redirect URI = %q, want exact /callback path with no query or fragment", redirectURI)
+	}
+	if tokenRedirectURI != redirectURI {
+		t.Fatalf("token redirect_uri = %q, want authorization redirect_uri %q", tokenRedirectURI, redirectURI)
+	}
+}
+
+func TestBrowserLoginStaffUsesOnlyTheApprovedBrokerHint(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	if _, err := BrowserLoginStaff(h.cfg, func(string) {}); err != nil {
+		t.Fatalf("BrowserLoginStaff: %v", err)
+	}
+	h.mu.Lock()
+	hint := h.authorizeParams.Get("kc_idp_hint")
+	h.mu.Unlock()
+	if hint != staffBrokerHint {
+		t.Fatalf("kc_idp_hint = %q, want %q", hint, staffBrokerHint)
+	}
+}
+
+func TestBrowserLoginCustomerDoesNotEmitStaffBrokerHint(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	if _, err := BrowserLogin(h.cfg, func(string) {}); err != nil {
+		t.Fatalf("BrowserLogin: %v", err)
+	}
+	h.mu.Lock()
+	_, present := h.authorizeParams["kc_idp_hint"]
+	h.mu.Unlock()
+	if present {
+		t.Fatal("customer browser login sent a staff broker hint")
 	}
 }
 
@@ -204,17 +271,19 @@ func TestBrowserLoginSends404OnOtherPaths(t *testing.T) {
 		go func() {
 			defer close(done)
 			base := fmt.Sprintf("http://127.0.0.1:%d", port)
-			// A non-callback path must 404.
-			for i := 0; i < 50; i++ {
-				resp, err := http.Get(base + "/other")
-				if err == nil {
-					if resp.StatusCode != http.StatusNotFound {
-						t.Errorf("/other status = %d, want 404", resp.StatusCode)
+			// Non-callback paths, including a callback subtree, must 404.
+			for _, path := range []string{"/other", "/callback/"} {
+				for i := 0; i < 50; i++ {
+					resp, err := http.Get(base + path)
+					if err == nil {
+						if resp.StatusCode != http.StatusNotFound {
+							t.Errorf("%s status = %d, want 404", path, resp.StatusCode)
+						}
+						resp.Body.Close()
+						break
 					}
-					resp.Body.Close()
-					break
+					time.Sleep(10 * time.Millisecond)
 				}
-				time.Sleep(10 * time.Millisecond)
 			}
 			// Then complete the flow so BrowserLogin returns instead of timing out.
 			http.Get(fmt.Sprintf("%s/callback?code=X&state=", base))

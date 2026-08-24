@@ -31,6 +31,10 @@ import (
 // and refresh — dropping `openid` makes Keycloak omit the id_token.
 const OIDCScope = "openid profile email offline_access"
 
+// staffBrokerHint is deliberately reachable only through BrowserLoginStaff. Customer login
+// calls BrowserLogin and therefore never emit this Keycloak routing parameter.
+const staffBrokerHint = "gascity-sso"
+
 const (
 	grantDeviceCode = "urn:ietf:params:oauth:grant-type:device_code"
 	grantAuthCode   = "authorization_code"
@@ -202,11 +206,22 @@ func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 	return Tokens{}, errors.New("device login timed out")
 }
 
-// BrowserLogin runs the authorization-code + PKCE grant on a 127.0.0.1 loopback. The fixed
-// port must be a registered redirect URI on the gasworks-cli client (Keycloak's `*` does not
-// span the port). It binds 127.0.0.1 ONLY, serves exactly one /callback, fails closed on any
-// error/CSRF/nonce mismatch, and exchanges the code for tokens.
+// BrowserLogin runs the authorization-code + PKCE grant on a 127.0.0.1 loopback. Port 0
+// selects an OS-assigned ephemeral port; Config.LoopbackPort may explicitly select a fixed
+// port for tests and development. It binds 127.0.0.1 ONLY, serves exactly one /callback,
+// fails closed on any error/CSRF/nonce mismatch, and exchanges the code for tokens.
 func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
+	return browserLogin(cfg, logf, "")
+}
+
+// BrowserLoginStaff runs the browser flow through the approved staff broker. The device grant
+// has no browser authorization request to route, so callers must reject that combination rather
+// than silently changing device-flow behavior.
+func BrowserLoginStaff(cfg config.Config, logf func(string)) (Tokens, error) {
+	return browserLogin(cfg, logf, staffBrokerHint)
+}
+
+func browserLogin(cfg config.Config, logf func(string), idpHint string) (Tokens, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
@@ -223,8 +238,20 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 		return Tokens{}, err
 	}
 
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", cfg.LoopbackPort)
-	authURL := cfg.AuthorizeURL() + "?" + url.Values{
+	// Bind before constructing the authorization request so a port-0 listener's actual
+	// selected port is used byte-for-byte in both the authorization and token requests.
+	// Bind 127.0.0.1 ONLY (never localhost or 0.0.0.0) so the callback is not reachable
+	// off-host and its registered path remains exactly /callback.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.LoopbackPort))
+	if err != nil {
+		if cfg.LoopbackPort == 0 {
+			return Tokens{}, fmt.Errorf("allocate loopback callback port: %w", err)
+		}
+		return Tokens{}, fmt.Errorf("loopback port %d is busy (%v); free it or use --device", cfg.LoopbackPort, err)
+	}
+	selectedPort := ln.Addr().(*net.TCPAddr).Port
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", selectedPort)
+	authParams := url.Values{
 		"client_id":             {cfg.ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {redirectURI},
@@ -233,13 +260,11 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 		"nonce":                 {nonce},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
-	}.Encode()
-
-	// Bind 127.0.0.1 ONLY (never 0.0.0.0) so the callback is not reachable off-host.
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cfg.LoopbackPort))
-	if err != nil {
-		return Tokens{}, fmt.Errorf("loopback port %d is busy (%v); free it or use --device", cfg.LoopbackPort, err)
 	}
+	if idpHint != "" {
+		authParams.Set("kc_idp_hint", idpHint)
+	}
+	authURL := cfg.AuthorizeURL() + "?" + authParams.Encode()
 
 	type result struct {
 		code     string
