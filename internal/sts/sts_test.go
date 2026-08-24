@@ -152,6 +152,11 @@ func TestLoginAndExchangeOmitSubjectTokenType(t *testing.T) {
 	if got := loginReq[0].form.Get("subject_token"); got != "ID.TOK.EN" {
 		t.Errorf("login subject_token = %q, want ID.TOK.EN", got)
 	}
+	if got := athOf(t, loginReq[0].headers.Get("DPoP")); got != ath("ID.TOK.EN") {
+		t.Errorf("login ath = %q, want hash of the exact id_token", got)
+	} else if got == ath("SESS") {
+		t.Error("login ath incorrectly binds the session token instead of the id_token")
+	}
 
 	tokReq := srv.reqs("/sts/v0/token")
 	if len(tokReq) != 1 {
@@ -168,6 +173,11 @@ func TestLoginAndExchangeOmitSubjectTokenType(t *testing.T) {
 	}
 	if got := tokReq[0].form.Get("subject_token"); got != "SESS" {
 		t.Errorf("exchange subject_token = %q, want SESS (the session token, not the id_token)", got)
+	}
+	if got := athOf(t, tokReq[0].headers.Get("DPoP")); got != ath("SESS") {
+		t.Errorf("exchange ath = %q, want hash of the exact session token", got)
+	} else if got == ath("ID.TOK.EN") {
+		t.Error("exchange ath incorrectly binds the id_token instead of the session token")
 	}
 }
 
