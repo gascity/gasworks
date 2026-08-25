@@ -35,6 +35,10 @@ const OIDCScope = "openid profile email offline_access"
 // calls BrowserLogin and therefore never emit this Keycloak routing parameter.
 const staffBrokerHint = "gascity-sso"
 
+// staffRouteScope is an optional, claim-free client scope used only to select the
+// staff broker flow. It does not grant roles or add token claims.
+const staffRouteScope = "gasworks-cli-staff-route"
+
 const (
 	grantDeviceCode = "urn:ietf:params:oauth:grant-type:device_code"
 	grantAuthCode   = "authorization_code"
@@ -116,6 +120,16 @@ func asInt(v any, def int) int {
 // server-supplied interval, and returns the tokens on success. It stops polling at the
 // server's expires_in lifetime, capped at deviceLoginCap (600s).
 func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
+	return deviceLogin(cfg, logf, OIDCScope)
+}
+
+// DeviceLoginStaff runs the device-authorization grant through the approved staff route.
+// The route scope selects the staff broker flow; it carries no claims or permissions.
+func DeviceLoginStaff(cfg config.Config, logf func(string)) (Tokens, error) {
+	return deviceLogin(cfg, logf, OIDCScope+" "+staffRouteScope)
+}
+
+func deviceLogin(cfg config.Config, logf func(string), scope string) (Tokens, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
@@ -126,7 +140,7 @@ func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 
 	_, body, err := httpc.PostForm(cfg.DeviceAuthURL(), url.Values{
 		"client_id":             {cfg.ClientID},
-		"scope":                 {OIDCScope},
+		"scope":                 {scope},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}, nil)
@@ -214,14 +228,16 @@ func BrowserLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 	return browserLogin(cfg, logf, "")
 }
 
-// BrowserLoginStaff runs the browser flow through the approved staff broker. The device grant
-// has no browser authorization request to route, so callers must reject that combination rather
-// than silently changing device-flow behavior.
+// BrowserLoginStaff runs the browser flow through the approved staff broker.
 func BrowserLoginStaff(cfg config.Config, logf func(string)) (Tokens, error) {
-	return browserLogin(cfg, logf, staffBrokerHint)
+	return browserLoginWithScope(cfg, logf, staffBrokerHint, OIDCScope+" "+staffRouteScope)
 }
 
 func browserLogin(cfg config.Config, logf func(string), idpHint string) (Tokens, error) {
+	return browserLoginWithScope(cfg, logf, idpHint, OIDCScope)
+}
+
+func browserLoginWithScope(cfg config.Config, logf func(string), idpHint, scope string) (Tokens, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
@@ -255,7 +271,7 @@ func browserLogin(cfg config.Config, logf func(string), idpHint string) (Tokens,
 		"client_id":             {cfg.ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {redirectURI},
-		"scope":                 {OIDCScope},
+		"scope":                 {scope},
 		"state":                 {state},
 		"nonce":                 {nonce},
 		"code_challenge":        {challenge},

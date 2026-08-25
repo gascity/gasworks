@@ -183,9 +183,13 @@ func TestBrowserLoginStaffUsesOnlyTheApprovedBrokerHint(t *testing.T) {
 	}
 	h.mu.Lock()
 	hint := h.authorizeParams.Get("kc_idp_hint")
+	scope := h.authorizeParams.Get("scope")
 	h.mu.Unlock()
 	if hint != staffBrokerHint {
 		t.Fatalf("kc_idp_hint = %q, want %q", hint, staffBrokerHint)
+	}
+	if scope != OIDCScope+" "+staffRouteScope {
+		t.Fatalf("staff browser scope = %q, want %q", scope, OIDCScope+" "+staffRouteScope)
 	}
 }
 
