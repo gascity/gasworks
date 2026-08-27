@@ -120,6 +120,14 @@ Three short-lived layers, each cached and auto-renewed:
 
 All narrowing happens **server-side**: the client only ever learns what it may mint and asks for it; the STS fails closed if you ask for more. Products verify the EIA offline — there is nothing to call back.
 
+The Go STS client exposes optional fixed-label origin-selection events (`operation`, `origin`,
+`outcome`, `reason`) through `Config.STSTelemetry`. Only non-provisioning (read-only)
+`/sts/v0/context` requests may fall back from the canonical origin to the legacy origin.
+Provisioning context (`?provision=true`) and session/token POSTs (`/login`, `/machine`, `/token`)
+make one attempt at the selected origin and never cross-origin retry after an uncertain response.
+The CLI does not enable an exporter or persist these events, so this hook is an integration seam
+rather than a production counter. Events never include URLs, tokens, subjects, or DPoP proofs.
+
 ## Storage & security
 
 Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. The file holds the refresh token, the per-org session, and the session's DPoP key. A **stolen credentials file is co-located-key vulnerable** (DPoP binds the key, not the file) — keep it as private as an SSH key. `logout` revokes the refresh token at the IdP before clearing.
@@ -141,7 +149,8 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 
 | Env | Default |
 |---|---|
-| `GASWORKS_STS_URL` | `https://works.gascity.com` |
+| `GASWORKS_STS_CANONICAL_URL` | `https://api.gascity.com` (preferred STS origin; non-provisioning context falls back to the legacy origin for network/404/5xx failures) |
+| `GASWORKS_STS_URL` | `https://works.gascity.com` (legacy/compatibility origin; setting this explicitly disables the implicit canonical probe) |
 | `GASWORKS_OIDC_ISSUER` | `https://auth.gascity.com/realms/gasworks-customers` |
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
 | `GASWORKS_LOOPBACK_PORT` | OS-assigned ephemeral port on `127.0.0.1` (set a numeric fixed-port override for tests/dev) |

@@ -123,7 +123,11 @@ func mintServicePrincipalEIA(cfg config.Config, principal servicePrincipalConfig
 		return mintResult{}, dieCredential(credentialErrorDenied, "service-principal session was invalid")
 	}
 	startedAt := now()
-	eia, err := sts.Exchange(cfg, session.SessionToken, principal.audience, strings.Join(request.RequiredScopes, " "), key)
+	exchangeCfg := cfg
+	if session.Origin != "" {
+		exchangeCfg = cfg.WithSTSBase(session.Origin)
+	}
+	eia, err := sts.Exchange(exchangeCfg, session.SessionToken, principal.audience, strings.Join(request.RequiredScopes, " "), key)
 	if err != nil {
 		return mintResult{}, classifyServicePrincipalSTSError(err)
 	}
