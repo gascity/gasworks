@@ -360,18 +360,26 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 					t.Errorf("canonical request = %q, want provisioning context", r.URL.RequestURI())
 				}
 				if tc.network {
-					// The network case closes the listener before the request below; this
-					// branch is only a defensive fallback if the close races the handler.
+					// Model an origin that receives the provisioning request but drops the
+					// connection before a response. The mutation may already have committed,
+					// so the client must not replay it at the legacy origin.
+					hijacker, ok := w.(http.Hijacker)
+					if !ok {
+						t.Errorf("canonical writer does not support hijacking")
+						return
+					}
+					conn, _, err := hijacker.Hijack()
+					if err != nil {
+						t.Errorf("hijack canonical connection: %v", err)
+						return
+					}
+					_ = conn.Close()
 					return
 				}
 				writeJSON(w, tc.status, map[string]any{"error": "unavailable"})
 			}))
 			canonicalURL := canonical.URL
-			if tc.network {
-				canonical.Close()
-			} else {
-				t.Cleanup(canonical.Close)
-			}
+			t.Cleanup(canonical.Close)
 			_, legacy := newStub(t)
 			var events []Event
 			cfg := config.Config{
@@ -384,7 +392,7 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 			if _, err := Context(cfg, "ID.TOK.EN", true); err == nil {
 				t.Fatal("provisioning Context unexpectedly succeeded")
 			}
-			if !tc.network && canonicalHits.Load() != 1 {
+			if canonicalHits.Load() != 1 {
 				t.Fatalf("canonical provisioning request count = %d, want 1", canonicalHits.Load())
 			}
 			if got := len(legacy.reqs("/sts/v0/context")); got != 0 {
