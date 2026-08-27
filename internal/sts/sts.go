@@ -114,12 +114,12 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 				return ContextResolution{}, fmt.Errorf("context: %w", err)
 			}
 			res.Origin = origin
-			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: outcome(i, false), Reason: "success"})
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: contextSuccessOutcome(i), Reason: "success"})
 			return res, nil
 		}
 		last = err
 		if !retryable(err) || i == len(endpoints)-1 {
-			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: contextFailureOutcome(i), Reason: reason(err)})
 			return ContextResolution{}, err
 		}
 	}
@@ -128,108 +128,105 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 
 // Login establishes a DPoP-bound session at /sts/v0/login. The DPoP proof is bound to the
 // login URL and signed by key; pass the SAME key to Exchange so the server's jkt-pin holds.
-// On a non-2xx it returns the raw *httpc.HTTPError.
+// Login is state-changing: it makes exactly one attempt against the selected origin and never
+// retries on another origin after an uncertain response. On a non-2xx it returns the raw
+// *httpc.HTTPError.
 func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, error) {
-	var last error
-	endpoints := cfg.STSEndpoints()
-	if len(endpoints) == 0 {
-		return Session{}, errNoSTSEndpoint
+	origin, err := selectedOrigin(cfg)
+	if err != nil {
+		return Session{}, err
 	}
-	for i, origin := range endpoints {
-		u := origin + "/sts/v0/login"
-		proof, err := key.Proof("POST", u, idToken)
-		if err != nil {
-			return Session{}, err
-		}
-		_, body, err := httpc.PostForm(u, url.Values{"subject_token": {idToken}, "org": {org}}, map[string]string{"DPoP": proof})
-		if err == nil {
-			var sess Session
-			if err := remarshal(body, &sess); err != nil {
-				return Session{}, fmt.Errorf("login: %w", err)
-			}
-			if sess.ExpiresIn == 0 {
-				sess.ExpiresIn = defaultSessionExpiresIn
-			}
-			sess.Origin = origin
-			emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: outcome(i, false), Reason: "success"})
-			return sess, nil
-		}
-		last = err
-		if !retryable(err) || i == len(endpoints)-1 {
-			emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
-			return Session{}, err
-		}
+	u := origin + "/sts/v0/login"
+	proof, err := key.Proof("POST", u, idToken)
+	if err != nil {
+		return Session{}, err
 	}
-	return Session{}, last
+	_, body, err := httpc.PostForm(u, url.Values{"subject_token": {idToken}, "org": {org}}, map[string]string{"DPoP": proof})
+	if err != nil {
+		emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
+		return Session{}, err
+	}
+	var sess Session
+	if err := remarshal(body, &sess); err != nil {
+		emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "failure", Reason: "other"})
+		return Session{}, fmt.Errorf("login: %w", err)
+	}
+	if sess.ExpiresIn == 0 {
+		sess.ExpiresIn = defaultSessionExpiresIn
+	}
+	sess.Origin = origin
+	emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "success", Reason: "success"})
+	return sess, nil
 }
 
 // Machine establishes a DPoP-bound service-principal session at /sts/v0/machine. The same
-// key must be passed to Exchange so the STS session's jkt pin holds.
+// key must be passed to Exchange so the STS session's jkt pin holds. Machine is state-changing:
+// it makes exactly one attempt against the selected origin and never retries on another origin.
 func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, error) {
-	var last error
-	endpoints := cfg.STSEndpoints()
-	if len(endpoints) == 0 {
-		return Session{}, errNoSTSEndpoint
+	origin, err := selectedOrigin(cfg)
+	if err != nil {
+		return Session{}, err
 	}
-	for i, origin := range endpoints {
-		u := origin + "/sts/v0/machine"
-		proof, err := key.Proof("POST", u, clientSecret)
-		if err != nil {
-			return Session{}, err
-		}
-		_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantClientCredentials}, "client_secret": {clientSecret}}, map[string]string{"DPoP": proof})
-		if err == nil {
-			var sess Session
-			if err := remarshal(body, &sess); err != nil {
-				return Session{}, fmt.Errorf("machine: %w", err)
-			}
-			sess.Origin = origin
-			emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: outcome(i, false), Reason: "success"})
-			return sess, nil
-		}
-		last = err
-		if !retryable(err) || i == len(endpoints)-1 {
-			emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
-			return Session{}, err
-		}
+	u := origin + "/sts/v0/machine"
+	proof, err := key.Proof("POST", u, clientSecret)
+	if err != nil {
+		return Session{}, err
 	}
-	return Session{}, last
+	_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantClientCredentials}, "client_secret": {clientSecret}}, map[string]string{"DPoP": proof})
+	if err != nil {
+		emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
+		return Session{}, err
+	}
+	var sess Session
+	if err := remarshal(body, &sess); err != nil {
+		emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "failure", Reason: "other"})
+		return Session{}, fmt.Errorf("machine: %w", err)
+	}
+	sess.Origin = origin
+	emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "success", Reason: "success"})
+	return sess, nil
 }
 
 // Exchange performs the RFC 8693 token-exchange at /sts/v0/token, returning the EIA
 // (access_token). subject_token_type is intentionally OMITTED: the STS accepts only empty or
 // the gascity session URN, so the RFC-canonical access_token default would 400. The DPoP
-// proof is bound to the token URL and MUST be signed by the same key as Login. On a non-2xx
-// it returns the raw *httpc.HTTPError.
+// proof is bound to the token URL and MUST be signed by the same key as Login. Exchange is
+// state-changing: it makes exactly one attempt against the selected origin and never retries
+// on another origin after an uncertain response. On a non-2xx it returns the raw *httpc.HTTPError.
 func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key) (EIA, error) {
-	var last error
+	origin, err := selectedOrigin(cfg)
+	if err != nil {
+		return EIA{}, err
+	}
+	u := origin + "/sts/v0/token"
+	proof, err := key.Proof("POST", u, sessionToken)
+	if err != nil {
+		return EIA{}, err
+	}
+	_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantTokenExchange}, "subject_token": {sessionToken}, "audience": {audience}, "scope": {scope}}, map[string]string{"DPoP": proof})
+	if err != nil {
+		emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
+		return EIA{}, err
+	}
+	var eia EIA
+	if err := remarshal(body, &eia); err != nil {
+		emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: "failure", Reason: "other"})
+		return EIA{}, fmt.Errorf("exchange: %w", err)
+	}
+	eia.Origin = origin
+	emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: "success", Reason: "success"})
+	return eia, nil
+}
+
+// selectedOrigin returns the first configured origin. Discovery may select a legacy origin by
+// returning it in ContextResolution. Callers must narrow their config with WithSTSBase before
+// invoking a state-changing operation when they need to use that selected origin.
+func selectedOrigin(cfg config.Config) (string, error) {
 	endpoints := cfg.STSEndpoints()
 	if len(endpoints) == 0 {
-		return EIA{}, errNoSTSEndpoint
+		return "", errNoSTSEndpoint
 	}
-	for i, origin := range endpoints {
-		u := origin + "/sts/v0/token"
-		proof, err := key.Proof("POST", u, sessionToken)
-		if err != nil {
-			return EIA{}, err
-		}
-		_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantTokenExchange}, "subject_token": {sessionToken}, "audience": {audience}, "scope": {scope}}, map[string]string{"DPoP": proof})
-		if err == nil {
-			var eia EIA
-			if err := remarshal(body, &eia); err != nil {
-				return EIA{}, fmt.Errorf("exchange: %w", err)
-			}
-			eia.Origin = origin
-			emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: outcome(i, false), Reason: "success"})
-			return eia, nil
-		}
-		last = err
-		if !retryable(err) || i == len(endpoints)-1 {
-			emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
-			return EIA{}, err
-		}
-	}
-	return EIA{}, last
+	return endpoints[0], nil
 }
 
 func emit(cfg config.Config, e Event) {
@@ -243,20 +240,23 @@ func originClass(cfg config.Config, origin string) string {
 	}
 	return "legacy"
 }
-func outcome(i int, _ bool) string {
+func contextSuccessOutcome(i int) string {
 	if i == 0 {
 		return "success"
 	}
 	return "fallback"
 }
 
-func failureOutcome(i int) string {
+func contextFailureOutcome(i int) string {
 	if i == 0 {
 		return "failure"
 	}
 	return "fallback"
 }
 
+// retryable reports whether a failed read-only context request may be attempted on the next
+// configured origin. It is intentionally not used by Login, Machine, or Exchange: replaying
+// those state-changing POSTs after an uncertain response can mint duplicate sessions/tokens.
 func retryable(err error) bool {
 	var he *httpc.HTTPError
 	if errors.As(err, &he) {

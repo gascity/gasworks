@@ -20,9 +20,10 @@ const (
 // FromEnv; the URL accessors derive everything from the two base URLs.
 type Config struct {
 	STSBase string
-	// STSCanonical is the preferred machine origin. STSBase remains the
-	// compatibility/legacy origin and is used when the canonical origin is
-	// unavailable. An empty STSCanonical disables dual-origin behavior.
+	// STSCanonical is the preferred STS origin. STSBase remains the
+	// compatibility/legacy origin and is used as a fallback only for the
+	// read-only context discovery request. State-changing STS requests are
+	// always single-origin. An empty STSCanonical disables dual-origin behavior.
 	STSCanonical string
 	// STSTelemetry receives fixed-label events from the STS client. It must not
 	// be used to emit URLs, credentials, subjects, or proofs.
@@ -110,7 +111,8 @@ func (c Config) WithSTSBase(origin string) Config {
 func (c Config) CanonicalOrigin() string { return strings.TrimRight(c.STSCanonical, "/") }
 
 // WithPreferredSTS returns a config whose endpoint order starts at origin and
-// retains the other configured origin as a fallback.
+// retains the other configured origin as a fallback for read-only discovery.
+// State-changing callers should use WithSTSBase to pin one origin before POSTing.
 func (c Config) WithPreferredSTS(origin string) Config {
 	origin = strings.TrimRight(origin, "/")
 	if origin == "" {

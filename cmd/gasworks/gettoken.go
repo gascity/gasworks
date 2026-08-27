@@ -176,9 +176,10 @@ func mintEIA(
 		}
 	}
 
-	// Keep the origin that successfully served discovery first for session
-	// establishment, while retaining the other origin as a bounded fallback.
-	stsCfg := cfg.WithPreferredSTS(cacheOrigin)
+	// Pin all state-changing session operations to the origin that served discovery. The STS
+	// client may fall back between origins for the read-only context request, but login and token
+	// exchange must never replay an uncertain POST at a second host.
+	stsCfg := cfg.WithSTSBase(cacheOrigin)
 	sessionToken, key, sessionOrigin, err := ensureSession(stsCfg, data, org, idToken, generation, cacheOrigin)
 	if err != nil {
 		return mintResult{}, err
@@ -189,7 +190,9 @@ func mintEIA(
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 401 {
-			// Session not resolvable — re-establish ONCE (fresh key) and retry exactly once.
+			// A 401 is a definitive authentication rejection, not an uncertain transport
+			// outcome. Re-establish once with a fresh key and retry the exchange on the SAME
+			// pinned origin; Login/Exchange themselves never cross-origin retry.
 			sessionToken, key, sessionOrigin, err = newSession(stsCfg, org, idToken, generation)
 			if err != nil {
 				return mintResult{}, err
@@ -480,20 +483,19 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 	return sess.SessionToken, key, origin, nil
 }
 
-// ensureSession reuses the stored per-org session when it has >30s left (loading its DPoP key
-// from PEM), otherwise establishes a fresh one.
+// ensureSession reuses the stored per-org session at the selected origin when it has >30s left
+// (loading its DPoP key from PEM), otherwise establishes a fresh one at that same origin. A
+// session cached for another origin is deliberately not a fallback: the origin is part of the
+// session's security binding and switching hosts could replay a state-changing request.
 func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation, preferredOrigin string) (string, *dpop.Key, string, error) {
-	origins := cfg.STSEndpoints()
-	if preferredOrigin != "" {
-		ordered := []string{preferredOrigin}
-		for _, origin := range origins {
-			if origin != preferredOrigin {
-				ordered = append(ordered, origin)
-			}
+	origin := preferredOrigin
+	if origin == "" {
+		endpoints := cfg.STSEndpoints()
+		if len(endpoints) > 0 {
+			origin = endpoints[0]
 		}
-		origins = ordered
 	}
-	for _, origin := range origins {
+	if origin != "" {
 		if sess, ok := data.Sessions[sessionCacheKey(origin, org, generation)]; ok && sess.ExpiresAt-now() > sessionSkewSecs {
 			key, err := dpop.FromPEM(sess.DPoPPEM)
 			if err == nil {
@@ -502,7 +504,7 @@ func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation
 			// A corrupt stored key falls through to a fresh session rather than crashing.
 		}
 	}
-	return newSession(cfg, org, idToken, generation)
+	return newSession(cfg.WithSTSBase(origin), org, idToken, generation)
 }
 
 func sessionCacheKey(stsAuthority, org, generation string) string {
