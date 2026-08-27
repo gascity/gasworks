@@ -141,7 +141,8 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 
 | Env | Default |
 |---|---|
-| `GASWORKS_STS_URL` | `https://works.gascity.com` |
+| `GASWORKS_STS_CANONICAL_URL` | `https://api.gascity.com` (preferred STS origin; falls back to the legacy origin for network/404/5xx failures) |
+| `GASWORKS_STS_URL` | `https://works.gascity.com` (legacy/compatibility origin; setting this explicitly disables the implicit canonical probe) |
 | `GASWORKS_OIDC_ISSUER` | `https://auth.gascity.com/realms/gasworks-customers` |
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
 | `GASWORKS_LOOPBACK_PORT` | OS-assigned ephemeral port on `127.0.0.1` (set a numeric fixed-port override for tests/dev) |

@@ -159,7 +159,11 @@ func mintEIA(
 		return mintResult{}, dieCredential(credentialErrorDenied, "requested scopes are not mintable for '%s' in org %s", canonicalAudience, orgCtx.Slug)
 	}
 
-	cacheKey := eiaCacheKey(cfg.STSBase, org, canonicalAudience, generation, requestedScopes)
+	cacheOrigin := cfg.STSBase
+	if ctx.Origin != "" {
+		cacheOrigin = ctx.Origin
+	}
+	cacheKey := eiaCacheKey(cacheOrigin, org, canonicalAudience, generation, requestedScopes)
 	if !forceRefresh {
 		if cached, ok := data.EIACache[cacheKey]; ok &&
 			validOpaqueToken(cached.EIA) && credentialFreshAt(cached.ExpiresAt, now(), eiaSkewSecs) {
@@ -172,27 +176,33 @@ func mintEIA(
 		}
 	}
 
-	sessionToken, key, err := ensureSession(cfg, data, org, idToken, generation)
+	// Keep the origin that successfully served discovery first for session
+	// establishment, while retaining the other origin as a bounded fallback.
+	stsCfg := cfg.WithPreferredSTS(cacheOrigin)
+	sessionToken, key, sessionOrigin, err := ensureSession(stsCfg, data, org, idToken, generation, cacheOrigin)
 	if err != nil {
 		return mintResult{}, err
 	}
 
 	exchangeStartedAt := now()
-	res, err := sts.Exchange(cfg, sessionToken, canonicalAudience, strings.Join(requestedScopes, " "), key)
+	res, err := sts.Exchange(cfg.WithSTSBase(sessionOrigin), sessionToken, canonicalAudience, strings.Join(requestedScopes, " "), key)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 401 {
 			// Session not resolvable — re-establish ONCE (fresh key) and retry exactly once.
-			sessionToken, key, err = newSession(cfg, org, idToken, generation)
+			sessionToken, key, sessionOrigin, err = newSession(stsCfg, org, idToken, generation)
 			if err != nil {
 				return mintResult{}, err
 			}
 			exchangeStartedAt = now()
-			res, err = sts.Exchange(cfg, sessionToken, canonicalAudience, strings.Join(requestedScopes, " "), key)
+			res, err = sts.Exchange(cfg.WithSTSBase(sessionOrigin), sessionToken, canonicalAudience, strings.Join(requestedScopes, " "), key)
 		}
 	}
 	if err != nil {
 		return mintResult{}, classifyExchangeError(err)
+	}
+	if res.Origin != "" && res.Origin != cacheOrigin {
+		cacheKey = eiaCacheKey(res.Origin, org, canonicalAudience, generation, requestedScopes)
 	}
 	if !validOpaqueToken(res.AccessToken) {
 		return mintResult{}, die("getToken returned an invalid credential")
@@ -423,22 +433,22 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 
 // newSession generates a FRESH DPoP key, establishes a new STS session, and persists it
 // (locked). A fresh key per new session matches the server's per-session jkt-pin.
-func newSession(cfg config.Config, org, idToken, generation string) (string, *dpop.Key, error) {
+func newSession(cfg config.Config, org, idToken, generation string) (string, *dpop.Key, string, error) {
 	key, err := dpop.NewKey()
 	if err != nil {
-		return "", nil, die("could not generate a session key: %s", err)
+		return "", nil, "", die("could not generate a session key: %s", err)
 	}
 	sess, err := sts.Login(cfg, idToken, org, key)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 403 {
-			return "", nil, dieCredential(credentialErrorDenied, "not a member of org %s (%s)", org, he.OAuthError())
+			return "", nil, "", dieCredential(credentialErrorDenied, "not a member of org %s (%s)", org, he.OAuthError())
 		}
-		return "", nil, die("login to org %s failed: %s", org, err)
+		return "", nil, "", die("login to org %s failed: %s", org, err)
 	}
 	pem, err := key.ToPEM()
 	if err != nil {
-		return "", nil, die("could not serialize the session key: %s", err)
+		return "", nil, "", die("could not serialize the session key: %s", err)
 	}
 	if err := store.Update(func(d *store.Data) error {
 		if d.CredentialGeneration != generation {
@@ -447,7 +457,11 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		if d.Sessions == nil {
 			d.Sessions = map[string]store.Session{}
 		}
-		d.Sessions[sessionCacheKey(cfg.STSBase, org, generation)] = store.Session{
+		origin := sess.Origin
+		if origin == "" {
+			origin = cfg.STSBase
+		}
+		d.Sessions[sessionCacheKey(origin, org, generation)] = store.Session{
 			SessionToken: sess.SessionToken,
 			DPoPPEM:      pem,
 			ExpiresAt:    now() + int64(sess.ExpiresIn),
@@ -455,22 +469,38 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		return nil
 	}); err != nil {
 		if errors.Is(err, errCredentialGenerationChanged) {
-			return "", nil, credentialChangedError()
+			return "", nil, "", credentialChangedError()
 		}
-		return "", nil, die("could not save the session: %s", err)
+		return "", nil, "", die("could not save the session: %s", err)
 	}
-	return sess.SessionToken, key, nil
+	origin := sess.Origin
+	if origin == "" {
+		origin = cfg.STSBase
+	}
+	return sess.SessionToken, key, origin, nil
 }
 
 // ensureSession reuses the stored per-org session when it has >30s left (loading its DPoP key
 // from PEM), otherwise establishes a fresh one.
-func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation string) (string, *dpop.Key, error) {
-	if sess, ok := data.Sessions[sessionCacheKey(cfg.STSBase, org, generation)]; ok && sess.ExpiresAt-now() > sessionSkewSecs {
-		key, err := dpop.FromPEM(sess.DPoPPEM)
-		if err == nil {
-			return sess.SessionToken, key, nil
+func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation, preferredOrigin string) (string, *dpop.Key, string, error) {
+	origins := cfg.STSEndpoints()
+	if preferredOrigin != "" {
+		ordered := []string{preferredOrigin}
+		for _, origin := range origins {
+			if origin != preferredOrigin {
+				ordered = append(ordered, origin)
+			}
 		}
-		// A corrupt stored key falls through to a fresh session rather than crashing.
+		origins = ordered
+	}
+	for _, origin := range origins {
+		if sess, ok := data.Sessions[sessionCacheKey(origin, org, generation)]; ok && sess.ExpiresAt-now() > sessionSkewSecs {
+			key, err := dpop.FromPEM(sess.DPoPPEM)
+			if err == nil {
+				return sess.SessionToken, key, origin, nil
+			}
+			// A corrupt stored key falls through to a fresh session rather than crashing.
+		}
 	}
 	return newSession(cfg, org, idToken, generation)
 }

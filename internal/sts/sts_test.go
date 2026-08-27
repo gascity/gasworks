@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -284,6 +285,127 @@ func TestEveryCallCarriesUserAgent(t *testing.T) {
 	}
 }
 
+func TestCanonical404FallsBackAndRebindsDPoP(t *testing.T) {
+	var canonicalProof string
+	canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		canonicalProof = r.Header.Get("DPoP")
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+	}))
+	t.Cleanup(canonical.Close)
+	legacyCfg, legacy := newStub(t)
+	cfg := legacyCfg
+	cfg.STSCanonical = canonical.URL
+	var events []Event
+	cfg.STSTelemetry = func(op, origin, outcome, reason string) { events = append(events, Event{op, origin, outcome, reason}) }
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := Login(cfg, "ID.TOK.EN", "org_a", key)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if sess.Origin != legacyCfg.STSBase {
+		t.Fatalf("session origin = %q, want %q", sess.Origin, legacyCfg.STSBase)
+	}
+	if len(legacy.reqs("/sts/v0/login")) != 1 {
+		t.Fatalf("legacy login request count = %d", len(legacy.reqs("/sts/v0/login")))
+	}
+	legacyProof := legacy.reqs("/sts/v0/login")[0].headers.Get("DPoP")
+	if got := htuOf(t, canonicalProof); got != canonical.URL+"/sts/v0/login" {
+		t.Errorf("canonical proof htu = %q", got)
+	}
+	if got := htuOf(t, legacyProof); got != legacyCfg.STSBase+"/sts/v0/login" {
+		t.Errorf("legacy proof htu = %q", got)
+	}
+	if canonicalProof == legacyProof {
+		t.Error("fallback reused the canonical DPoP proof")
+	}
+	if len(events) != 1 || events[0].Origin != "legacy" || events[0].Outcome != "fallback" || events[0].Reason != "success" {
+		t.Fatalf("telemetry = %+v", events)
+	}
+}
+
+func TestAuthenticationFailureNeverFallsBack(t *testing.T) {
+	canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_token"})
+	}))
+	t.Cleanup(canonical.Close)
+	_, legacy := newStub(t)
+	cfg := config.Config{STSCanonical: canonical.URL, STSBase: legacy.srv.URL}
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Login(cfg, "ID.TOK.EN", "org_a", key); err == nil {
+		t.Fatal("Login unexpectedly succeeded")
+	}
+	if got := len(legacy.reqs("/sts/v0/login")); got != 0 {
+		t.Fatalf("legacy received %d requests after canonical 401", got)
+	}
+}
+
+func TestForbiddenAndInvalidRequestNeverFallBack(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		body map[string]any
+	}{
+		{name: "forbidden", code: http.StatusForbidden, body: map[string]any{"error": "access_denied"}},
+		{name: "invalid request", code: http.StatusBadRequest, body: map[string]any{"error": "invalid_request"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writeJSON(w, tc.code, tc.body)
+			}))
+			t.Cleanup(canonical.Close)
+			_, legacy := newStub(t)
+			cfg := config.Config{STSCanonical: canonical.URL, STSBase: legacy.srv.URL}
+			key, err := dpop.NewKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Login(cfg, "ID.TOK.EN", "org_a", key); err == nil {
+				t.Fatal("Login unexpectedly succeeded")
+			}
+			if got := len(legacy.reqs("/sts/v0/login")); got != 0 {
+				t.Fatalf("legacy received %d requests", got)
+			}
+		})
+	}
+}
+
+func TestLegacyOnlyTelemetryIsNotMislabelledCanonical(t *testing.T) {
+	cfg, _ := newStub(t)
+	var events []Event
+	cfg.STSTelemetry = func(op, origin, outcome, reason string) {
+		events = append(events, Event{op, origin, outcome, reason})
+	}
+	if _, err := Context(cfg, "ID.TOK.EN", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Origin != "legacy" || events[0].Outcome != "success" {
+		t.Fatalf("telemetry = %+v", events)
+	}
+}
+
+func TestMalformedCanonicalURLDoesNotFallBack(t *testing.T) {
+	_, legacy := newStub(t)
+	cfg := config.Config{STSCanonical: "://malformed", STSBase: legacy.srv.URL}
+	if _, err := Context(cfg, "ID.TOK.EN", false); err == nil {
+		t.Fatal("Context unexpectedly succeeded")
+	}
+	if got := len(legacy.reqs("/sts/v0/context")); got != 0 {
+		t.Fatalf("legacy received %d requests after malformed canonical URL", got)
+	}
+}
+
+func TestRetryableRejectsPlainNonNetworkError(t *testing.T) {
+	if retryable(errors.New("configuration invalid")) {
+		t.Fatal("plain non-network error classified retryable")
+	}
+}
+
 // jwkOf extracts the header.jwk object (as canonical JSON) from a DPoP proof's first segment.
 func jwkOf(t *testing.T, proof string) string {
 	t.Helper()
@@ -322,6 +444,25 @@ func athOf(t *testing.T, proof string) string {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
 	return claims.ATH
+}
+
+func htuOf(t *testing.T, proof string) string {
+	t.Helper()
+	parts := strings.Split(proof, ".")
+	if len(parts) != 3 {
+		t.Fatalf("malformed DPoP proof: %q", proof)
+	}
+	raw, err := base64urlDecode(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims struct {
+		HTU string `json:"htu"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return claims.HTU
 }
 
 func ath(credential string) string {
