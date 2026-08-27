@@ -389,6 +389,22 @@ func TestLegacyOnlyTelemetryIsNotMislabelledCanonical(t *testing.T) {
 	}
 }
 
+func TestNarrowedConfigKeepsCanonicalTelemetryClassification(t *testing.T) {
+	cfg := config.Config{
+		STSCanonical: "https://api.gascity.com",
+		STSBase:      "https://works.gascity.com",
+	}
+	if got := originClass(cfg.WithPreferredSTS(cfg.STSBase), cfg.STSBase); got != "legacy" {
+		t.Fatalf("legacy preference classified as %q, want legacy", got)
+	}
+	if got := originClass(cfg.WithSTSBase(cfg.STSBase), cfg.STSBase); got != "legacy" {
+		t.Fatalf("legacy narrowing classified as %q, want legacy", got)
+	}
+	if got := originClass(cfg.WithSTSBase(cfg.STSCanonical), cfg.STSCanonical); got != "canonical" {
+		t.Fatalf("canonical narrowing classified as %q, want canonical", got)
+	}
+}
+
 func TestMalformedCanonicalURLDoesNotFallBack(t *testing.T) {
 	_, legacy := newStub(t)
 	cfg := config.Config{STSCanonical: "://malformed", STSBase: legacy.srv.URL}

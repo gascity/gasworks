@@ -27,6 +27,13 @@ type Config struct {
 	// STSTelemetry receives fixed-label events from the STS client. It must not
 	// be used to emit URLs, credentials, subjects, or proofs.
 	STSTelemetry func(operation, origin, outcome, reason string)
+	// selectedSTS narrows one operation to a previously successful origin. It
+	// is internal state carried by WithSTSBase; STSCanonical remains immutable
+	// so telemetry can classify the selected origin correctly.
+	selectedSTS string
+	// preferredSTS reorders the configured dual-host set without changing the
+	// canonical-vs-legacy classification.
+	preferredSTS string
 	OIDCIssuer   string
 	ClientID     string
 	LoopbackPort int
@@ -63,9 +70,16 @@ func FromEnv() Config {
 // STSEndpoints returns the deterministic canonical-first origin set. Duplicate
 // or empty origins are removed while preserving order.
 func (c Config) STSEndpoints() []string {
+	if c.selectedSTS != "" {
+		return []string{strings.TrimRight(c.selectedSTS, "/")}
+	}
 	seen := make(map[string]struct{}, 2)
 	var out []string
-	for _, origin := range []string{strings.TrimRight(c.STSCanonical, "/"), strings.TrimRight(c.STSBase, "/")} {
+	configured := []string{strings.TrimRight(c.STSCanonical, "/"), strings.TrimRight(c.STSBase, "/")}
+	if c.preferredSTS != "" {
+		configured = append([]string{strings.TrimRight(c.preferredSTS, "/")}, configured...)
+	}
+	for _, origin := range configured {
 		if origin == "" {
 			continue
 		}
@@ -82,10 +96,18 @@ func (c Config) STSEndpoints() []string {
 // unrelated identity settings. It is used to keep a session and its exchange
 // on the same origin after fallback.
 func (c Config) WithSTSBase(origin string) Config {
-	c.STSBase = strings.TrimRight(origin, "/")
-	c.STSCanonical = ""
+	origin = strings.TrimRight(origin, "/")
+	c.STSBase = origin
+	c.selectedSTS = origin
+	// A narrowed config is single-origin; discard any transient preference that
+	// may have been carried from a prior dual-origin config.
+	c.preferredSTS = ""
 	return c
 }
+
+// CanonicalOrigin returns the immutable configured canonical origin, if any.
+// Narrowing or reordering endpoints must not rewrite this classification.
+func (c Config) CanonicalOrigin() string { return strings.TrimRight(c.STSCanonical, "/") }
 
 // WithPreferredSTS returns a config whose endpoint order starts at origin and
 // retains the other configured origin as a fallback.
@@ -94,15 +116,17 @@ func (c Config) WithPreferredSTS(origin string) Config {
 	if origin == "" {
 		return c
 	}
+	// Preferences apply to the configured dual-origin set, not to a prior
+	// single-origin narrowing. Clear transient selection before evaluating the
+	// available origins so repeated config transforms remain composable.
+	c.selectedSTS = ""
 	for _, candidate := range c.STSEndpoints() {
 		if candidate != origin {
-			c.STSBase = candidate
-			c.STSCanonical = origin
+			c.preferredSTS = origin
 			return c
 		}
 	}
-	c.STSBase = origin
-	c.STSCanonical = ""
+	c.preferredSTS = origin
 	return c
 }
 

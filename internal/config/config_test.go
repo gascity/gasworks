@@ -24,6 +24,40 @@ func TestFromEnvDefaults(t *testing.T) {
 	}
 }
 
+func TestNarrowedConfigsPreserveCanonicalOriginRole(t *testing.T) {
+	c := Config{STSCanonical: "https://api.gascity.com", STSBase: "https://works.gascity.com"}
+	assertEndpoints := func(name string, got, want []string) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%s endpoints = %#v, want %#v", name, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s endpoints = %#v, want %#v", name, got, want)
+			}
+		}
+	}
+	assertEndpoints("dual", c.STSEndpoints(), []string{"https://api.gascity.com", "https://works.gascity.com"})
+
+	preferredLegacy := c.WithPreferredSTS("https://works.gascity.com")
+	assertEndpoints("preferred legacy", preferredLegacy.STSEndpoints(), []string{"https://works.gascity.com", "https://api.gascity.com"})
+	if got := preferredLegacy.STSCanonical; got != "https://api.gascity.com" {
+		t.Fatalf("canonical origin was rewritten to %q", got)
+	}
+	if got := preferredLegacy.CanonicalOrigin(); got != "https://api.gascity.com" {
+		t.Fatalf("canonical origin after legacy preference = %q, want canonical origin", got)
+	}
+
+	narrowedLegacy := c.WithSTSBase("https://works.gascity.com")
+	assertEndpoints("narrow legacy", narrowedLegacy.STSEndpoints(), []string{"https://works.gascity.com"})
+	if got := narrowedLegacy.CanonicalOrigin(); got != "https://api.gascity.com" {
+		t.Fatalf("canonical origin after legacy narrowing = %q, want canonical origin", got)
+	}
+
+	narrowedCanonical := c.WithSTSBase(c.STSCanonical)
+	assertEndpoints("narrow canonical", narrowedCanonical.STSEndpoints(), []string{"https://api.gascity.com"})
+}
+
 func TestFromEnvOverridesAndTrimsSlash(t *testing.T) {
 	t.Setenv("GASWORKS_STS_URL", "http://localhost:8080/")
 	t.Setenv("GASWORKS_STS_CANONICAL_URL", "https://api.example/")

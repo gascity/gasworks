@@ -120,6 +120,11 @@ Three short-lived layers, each cached and auto-renewed:
 
 All narrowing happens **server-side**: the client only ever learns what it may mint and asks for it; the STS fails closed if you ask for more. Products verify the EIA offline — there is nothing to call back.
 
+The Go STS client exposes optional fixed-label fallback events (`operation`, `origin`,
+`outcome`, `reason`) through `Config.STSTelemetry`. The CLI does not enable an exporter or
+persist these events, so this hook is an integration seam rather than a production counter.
+Events never include URLs, tokens, subjects, or DPoP proofs.
+
 ## Storage & security
 
 Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. The file holds the refresh token, the per-org session, and the session's DPoP key. A **stolen credentials file is co-located-key vulnerable** (DPoP binds the key, not the file) — keep it as private as an SSH key. `logout` revokes the refresh token at the IdP before clearing.

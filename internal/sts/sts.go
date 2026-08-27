@@ -221,7 +221,7 @@ func emit(cfg config.Config, e Event) {
 	}
 }
 func originClass(cfg config.Config, origin string) string {
-	if cfg.STSCanonical != "" && strings.TrimRight(cfg.STSCanonical, "/") == origin {
+	if cfg.CanonicalOrigin() != "" && cfg.CanonicalOrigin() == origin {
 		return "canonical"
 	}
 	return "legacy"
