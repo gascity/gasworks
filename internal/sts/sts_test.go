@@ -341,6 +341,63 @@ func TestContextCanonical404FallsBack(t *testing.T) {
 	}
 }
 
+func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		network bool
+		reason  string
+	}{
+		{name: "404", status: http.StatusNotFound, reason: "404"},
+		{name: "5xx", status: http.StatusServiceUnavailable, reason: "5xx"},
+		{name: "network", network: true, reason: "network"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var canonicalHits atomic.Int32
+			canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				canonicalHits.Add(1)
+				if r.URL.Path != "/sts/v0/context" || r.URL.Query().Get("provision") != "true" {
+					t.Errorf("canonical request = %q, want provisioning context", r.URL.RequestURI())
+				}
+				if tc.network {
+					// The network case closes the listener before the request below; this
+					// branch is only a defensive fallback if the close races the handler.
+					return
+				}
+				writeJSON(w, tc.status, map[string]any{"error": "unavailable"})
+			}))
+			canonicalURL := canonical.URL
+			if tc.network {
+				canonical.Close()
+			} else {
+				t.Cleanup(canonical.Close)
+			}
+			_, legacy := newStub(t)
+			var events []Event
+			cfg := config.Config{
+				STSCanonical: canonicalURL,
+				STSBase:      legacy.srv.URL,
+				STSTelemetry: func(op, origin, outcome, reason string) {
+					events = append(events, Event{op, origin, outcome, reason})
+				},
+			}
+			if _, err := Context(cfg, "ID.TOK.EN", true); err == nil {
+				t.Fatal("provisioning Context unexpectedly succeeded")
+			}
+			if !tc.network && canonicalHits.Load() != 1 {
+				t.Fatalf("canonical provisioning request count = %d, want 1", canonicalHits.Load())
+			}
+			if got := len(legacy.reqs("/sts/v0/context")); got != 0 {
+				t.Fatalf("legacy received %d provisioning context requests", got)
+			}
+			if len(events) != 1 || events[0].Operation != "context" || events[0].Origin != "canonical" ||
+				events[0].Outcome != "failure" || events[0].Reason != tc.reason {
+				t.Fatalf("telemetry = %+v", events)
+			}
+		})
+	}
+}
+
 func TestStateChangingCallsDoNotCrossOriginOnRetryableFailure(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusServiceUnavailable} {
 		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {

@@ -94,13 +94,22 @@ type Event struct {
 type Telemetry func(Event)
 
 // Context fetches /sts/v0/context — the caller's orgs + per-org mintable scopes. It carries
-// the id_token as a Bearer and NO DPoP (it mints nothing). On a non-2xx it returns the raw
-// *httpc.HTTPError so the caller can branch on status.
+// the id_token as a Bearer and NO DPoP. A non-provisioning request is read-only and may fall
+// back to the next configured origin on a network/404/5xx failure. A provisioning request
+// (provision=true) may create or link identity/org state, so it makes exactly one attempt at
+// the selected origin and never crosses origins after an uncertain response. On a non-2xx it
+// returns the raw *httpc.HTTPError so the caller can branch on status.
 func Context(cfg config.Config, idToken string, provision bool) (ContextResolution, error) {
 	var last error
 	endpoints := cfg.STSEndpoints()
 	if len(endpoints) == 0 {
 		return ContextResolution{}, errNoSTSEndpoint
+	}
+	if provision {
+		// Provisioning is state-changing even though it uses GET: the server may create
+		// or link an Accounts identity/org membership. Never replay it at another origin
+		// after a response/transport failure that could have committed the mutation.
+		endpoints = endpoints[:1]
 	}
 	for i, origin := range endpoints {
 		u := origin + "/sts/v0/context"
