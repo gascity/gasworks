@@ -29,6 +29,8 @@ const grantClientCredentials = "client_credentials"
 // expires_in.
 const defaultSessionExpiresIn = 28800
 
+var errNoSTSEndpoint = errors.New("sts: no endpoint configured")
+
 // Product is a per-org mintable product: the EIA audience and the scopes the caller may
 // request for it.
 type Product struct {
@@ -97,6 +99,9 @@ type Telemetry func(Event)
 func Context(cfg config.Config, idToken string, provision bool) (ContextResolution, error) {
 	var last error
 	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return ContextResolution{}, errNoSTSEndpoint
+	}
 	for i, origin := range endpoints {
 		u := origin + "/sts/v0/context"
 		if provision {
@@ -126,7 +131,11 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 // On a non-2xx it returns the raw *httpc.HTTPError.
 func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, error) {
 	var last error
-	for i, origin := range cfg.STSEndpoints() {
+	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return Session{}, errNoSTSEndpoint
+	}
+	for i, origin := range endpoints {
 		u := origin + "/sts/v0/login"
 		proof, err := key.Proof("POST", u, idToken)
 		if err != nil {
@@ -146,7 +155,7 @@ func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, erro
 			return sess, nil
 		}
 		last = err
-		if !retryable(err) || i == len(cfg.STSEndpoints())-1 {
+		if !retryable(err) || i == len(endpoints)-1 {
 			emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
 			return Session{}, err
 		}
@@ -158,7 +167,11 @@ func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, erro
 // key must be passed to Exchange so the STS session's jkt pin holds.
 func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, error) {
 	var last error
-	for i, origin := range cfg.STSEndpoints() {
+	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return Session{}, errNoSTSEndpoint
+	}
+	for i, origin := range endpoints {
 		u := origin + "/sts/v0/machine"
 		proof, err := key.Proof("POST", u, clientSecret)
 		if err != nil {
@@ -175,7 +188,7 @@ func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, er
 			return sess, nil
 		}
 		last = err
-		if !retryable(err) || i == len(cfg.STSEndpoints())-1 {
+		if !retryable(err) || i == len(endpoints)-1 {
 			emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
 			return Session{}, err
 		}
@@ -190,7 +203,11 @@ func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, er
 // it returns the raw *httpc.HTTPError.
 func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key) (EIA, error) {
 	var last error
-	for i, origin := range cfg.STSEndpoints() {
+	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return EIA{}, errNoSTSEndpoint
+	}
+	for i, origin := range endpoints {
 		u := origin + "/sts/v0/token"
 		proof, err := key.Proof("POST", u, sessionToken)
 		if err != nil {
@@ -207,7 +224,7 @@ func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop
 			return eia, nil
 		}
 		last = err
-		if !retryable(err) || i == len(cfg.STSEndpoints())-1 {
+		if !retryable(err) || i == len(endpoints)-1 {
 			emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
 			return EIA{}, err
 		}

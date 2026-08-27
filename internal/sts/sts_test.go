@@ -224,6 +224,26 @@ func TestMachineUsesClientCredentialsAndATH(t *testing.T) {
 	}
 }
 
+func TestOperationsRejectMissingSTSEndpoint(t *testing.T) {
+	cfg := config.Config{}
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatalf("NewKey: %v", err)
+	}
+	if _, err := Context(cfg, "id", false); !errors.Is(err, errNoSTSEndpoint) {
+		t.Fatalf("Context error = %v, want %v", err, errNoSTSEndpoint)
+	}
+	if _, err := Login(cfg, "id", "org", key); !errors.Is(err, errNoSTSEndpoint) {
+		t.Fatalf("Login error = %v, want %v", err, errNoSTSEndpoint)
+	}
+	if _, err := Machine(cfg, "secret", key); !errors.Is(err, errNoSTSEndpoint) {
+		t.Fatalf("Machine error = %v, want %v", err, errNoSTSEndpoint)
+	}
+	if _, err := Exchange(cfg, "session", "manifold", "scope", key); !errors.Is(err, errNoSTSEndpoint) {
+		t.Fatalf("Exchange error = %v, want %v", err, errNoSTSEndpoint)
+	}
+}
+
 func TestContextSendsBearerAndProvision(t *testing.T) {
 	cfg, srv := newStub(t)
 	ctx, err := Context(cfg, "ID.TOK.EN", true)
