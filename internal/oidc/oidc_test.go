@@ -108,7 +108,8 @@ func newStub(t *testing.T) (config.Config, *stubServer) {
 
 func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 	cfg, srv := newStub(t)
-	tok, err := DeviceLogin(cfg, func(string) {})
+	var logs []string
+	tok, err := DeviceLogin(cfg, func(line string) { logs = append(logs, line) })
 	if err != nil {
 		t.Fatalf("DeviceLogin: %v", err)
 	}
@@ -135,6 +136,20 @@ func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 	if !strings.Contains(dev[0].form.Get("scope"), "openid") {
 		t.Errorf("scope = %q, must contain openid", dev[0].form.Get("scope"))
 	}
+	if got := verificationURLFromLogs(logs); got == "" {
+		t.Fatal("customer device login did not print a verification URL")
+	} else {
+		u, err := url.Parse(got)
+		if err != nil {
+			t.Fatalf("customer verification URL %q: %v", got, err)
+		}
+		if u.Query().Get("user_code") != "ABCD-EFGH" {
+			t.Errorf("customer verification URL user_code = %q, want server-provided code", u.Query().Get("user_code"))
+		}
+		if _, present := u.Query()["kc_idp_hint"]; present {
+			t.Errorf("customer verification URL unexpectedly contains kc_idp_hint=%q", u.Query().Get("kc_idp_hint"))
+		}
+	}
 
 	polls2 := srv.reqs("/openid-connect/token")
 	if len(polls2) == 0 {
@@ -148,7 +163,8 @@ func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 
 func TestDeviceLoginStaffRequestsStaffRouteScope(t *testing.T) {
 	cfg, srv := newStub(t)
-	if _, err := DeviceLoginStaff(cfg, func(string) {}); err != nil {
+	var logs []string
+	if _, err := DeviceLoginStaff(cfg, func(line string) { logs = append(logs, line) }); err != nil {
 		t.Fatalf("DeviceLoginStaff: %v", err)
 	}
 	dev := srv.reqs("/auth/device")
@@ -158,6 +174,33 @@ func TestDeviceLoginStaffRequestsStaffRouteScope(t *testing.T) {
 	if got := dev[0].form.Get("scope"); got != OIDCScope+" "+staffRouteScope {
 		t.Fatalf("staff device scope = %q, want %q", got, OIDCScope+" "+staffRouteScope)
 	}
+	if got := verificationURLFromLogs(logs); got == "" {
+		t.Fatal("staff device login did not print a verification URL")
+	} else {
+		u, err := url.Parse(got)
+		if err != nil {
+			t.Fatalf("staff verification URL %q: %v", got, err)
+		}
+		if u.Query().Get("user_code") != "ABCD-EFGH" {
+			t.Errorf("staff verification URL user_code = %q, want server-provided code", u.Query().Get("user_code"))
+		}
+		if _, present := u.Query()["kc_idp_hint"]; present {
+			t.Errorf("staff verification URL unexpectedly contains kc_idp_hint=%q; routing is scope-only", u.Query().Get("kc_idp_hint"))
+		}
+	}
+}
+
+// verificationURLFromLogs extracts the URL printed after the device grant's "Open:" label.
+// Keeping this assertion at the logging boundary pins what a headless user actually receives,
+// while leaving the server-issued verification URI untouched.
+func verificationURLFromLogs(logs []string) string {
+	for _, line := range logs {
+		const prefix = "  1. Open:  "
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
 }
 
 // TestDeviceLoginHonorsServerExpiresIn proves the poll deadline follows the device-auth
