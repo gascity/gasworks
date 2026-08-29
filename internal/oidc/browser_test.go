@@ -201,9 +201,13 @@ func TestBrowserLoginCustomerDoesNotEmitStaffBrokerHint(t *testing.T) {
 	}
 	h.mu.Lock()
 	_, present := h.authorizeParams["kc_idp_hint"]
+	scope := h.authorizeParams.Get("scope")
 	h.mu.Unlock()
 	if present {
 		t.Fatal("customer browser login sent a staff broker hint")
+	}
+	if scope != OIDCScope {
+		t.Errorf("customer browser scope = %q, want %q", scope, OIDCScope)
 	}
 }
 
