@@ -196,6 +196,43 @@ func TestServicePrincipalCredentialProviderMintsWithoutHumanStore(t *testing.T) 
 	}
 }
 
+func TestServicePrincipalUsesExplicitlyPinnedLegacyOrigin(t *testing.T) {
+	legacy := newServicePrincipalStub(t)
+	var canonicalMachine, canonicalToken int
+	canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sts/v0/machine":
+			canonicalMachine++
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "must not contact canonical"})
+		case "/sts/v0/token":
+			canonicalToken++
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "must not exchange on canonical"})
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "not_found"})
+		}
+	}))
+	t.Cleanup(canonical.Close)
+	credentialFile := filepath.Join(t.TempDir(), "service-principal-key")
+	if err := os.WriteFile(credentialFile, []byte("svc_key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := `{"version":"gascity.dev/credential-provider/v1","audience":"manifold","required_scopes":["manifold:proxy"],"org":"org_a","interactive":false}`
+	// State-changing machine/token calls do not retry across origins. A caller that has
+	// explicitly selected the compatibility origin must narrow the config before minting.
+	cfg := (config.Config{STSCanonical: canonical.URL, STSBase: legacy.server.URL}).WithSTSBase(legacy.server.URL)
+	response, errOut, code := runServicePrincipalProvider(t, cfg, servicePrincipalArgs(credentialFile), request)
+	if code != 0 || errOut != "" || response.AccessToken != "SERVICE.EIA" {
+		t.Fatalf("response = exit %d stderr %q %+v", code, errOut, response)
+	}
+	if canonicalMachine != 0 || canonicalToken != 0 {
+		t.Fatalf("canonical requests machine=%d token=%d, want machine=0 token=0", canonicalMachine, canonicalToken)
+	}
+	requests := legacy.snapshot()
+	if len(requests) != 2 || requests[0].path != "/sts/v0/machine" || requests[1].path != "/sts/v0/token" {
+		t.Fatalf("legacy requests = %#v", requests)
+	}
+}
+
 func TestServicePrincipalCredentialProviderRereadsKeyAndUsesFreshState(t *testing.T) {
 	stub := newServicePrincipalStub(t)
 	credentialFile := filepath.Join(t.TempDir(), "service-principal-key")

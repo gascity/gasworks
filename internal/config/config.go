@@ -10,6 +10,7 @@ import (
 
 const (
 	defaultSTSBase      = "https://works.gascity.com"
+	defaultCanonicalSTS = "https://api.gascity.com"
 	defaultOIDCIssuer   = "https://auth.gascity.com/realms/gasworks-customers"
 	defaultClientID     = "gasworks-cli"
 	defaultLoopbackPort = 0
@@ -18,7 +19,23 @@ const (
 // Config is the resolved endpoint + client configuration. Treat it as immutable after
 // FromEnv; the URL accessors derive everything from the two base URLs.
 type Config struct {
-	STSBase      string
+	STSBase string
+	// STSCanonical is the preferred STS origin. STSBase remains the
+	// compatibility/legacy origin and is used as a fallback only for the
+	// non-provisioning (read-only) context discovery request. Provisioning
+	// context and all other state-changing STS requests are always single-origin.
+	// An empty STSCanonical disables dual-origin behavior.
+	STSCanonical string
+	// STSTelemetry receives fixed-label events from the STS client. It must not
+	// be used to emit URLs, credentials, subjects, or proofs.
+	STSTelemetry func(operation, origin, outcome, reason string)
+	// selectedSTS narrows one operation to a previously successful origin. It
+	// is internal state carried by WithSTSBase; STSCanonical remains immutable
+	// so telemetry can classify the selected origin correctly.
+	selectedSTS string
+	// preferredSTS reorders the configured dual-host set without changing the
+	// canonical-vs-legacy classification.
+	preferredSTS string
 	OIDCIssuer   string
 	ClientID     string
 	LoopbackPort int
@@ -36,12 +53,85 @@ func FromEnv() Config {
 			port = n
 		}
 	}
+	legacy := strings.TrimRight(env("GASWORKS_STS_URL", defaultSTSBase), "/")
+	canonical := strings.TrimRight(os.Getenv("GASWORKS_STS_CANONICAL_URL"), "/")
+	// An explicit GASWORKS_STS_URL is a complete local/test override. Do not
+	// unexpectedly probe production before honoring that override.
+	if canonical == "" && os.Getenv("GASWORKS_STS_URL") == "" {
+		canonical = defaultCanonicalSTS
+	}
 	return Config{
-		STSBase:      strings.TrimRight(env("GASWORKS_STS_URL", defaultSTSBase), "/"),
+		STSBase:      legacy,
+		STSCanonical: canonical,
 		OIDCIssuer:   strings.TrimRight(env("GASWORKS_OIDC_ISSUER", defaultOIDCIssuer), "/"),
 		ClientID:     env("GASWORKS_CLIENT_ID", defaultClientID),
 		LoopbackPort: port,
 	}
+}
+
+// STSEndpoints returns the deterministic canonical-first origin set. Duplicate
+// or empty origins are removed while preserving order.
+func (c Config) STSEndpoints() []string {
+	if c.selectedSTS != "" {
+		return []string{strings.TrimRight(c.selectedSTS, "/")}
+	}
+	seen := make(map[string]struct{}, 2)
+	var out []string
+	configured := []string{strings.TrimRight(c.STSCanonical, "/"), strings.TrimRight(c.STSBase, "/")}
+	if c.preferredSTS != "" {
+		configured = append([]string{strings.TrimRight(c.preferredSTS, "/")}, configured...)
+	}
+	for _, origin := range configured {
+		if origin == "" {
+			continue
+		}
+		if _, ok := seen[origin]; ok {
+			continue
+		}
+		seen[origin] = struct{}{}
+		out = append(out, origin)
+	}
+	return out
+}
+
+// WithSTSBase narrows a config to one selected STS origin, preserving all
+// unrelated identity settings. It is used to keep a session and its exchange
+// on the same origin after fallback.
+func (c Config) WithSTSBase(origin string) Config {
+	origin = strings.TrimRight(origin, "/")
+	c.STSBase = origin
+	c.selectedSTS = origin
+	// A narrowed config is single-origin; discard any transient preference that
+	// may have been carried from a prior dual-origin config.
+	c.preferredSTS = ""
+	return c
+}
+
+// CanonicalOrigin returns the immutable configured canonical origin, if any.
+// Narrowing or reordering endpoints must not rewrite this classification.
+func (c Config) CanonicalOrigin() string { return strings.TrimRight(c.STSCanonical, "/") }
+
+// WithPreferredSTS returns a config whose endpoint order starts at origin and
+// retains the other configured origin as a fallback for non-provisioning (read-only)
+// discovery. Provisioning context and state-changing callers should use WithSTSBase to pin
+// one origin before making the request.
+func (c Config) WithPreferredSTS(origin string) Config {
+	origin = strings.TrimRight(origin, "/")
+	if origin == "" {
+		return c
+	}
+	// Preferences apply to the configured dual-origin set, not to a prior
+	// single-origin narrowing. Clear transient selection before evaluating the
+	// available origins so repeated config transforms remain composable.
+	c.selectedSTS = ""
+	for _, candidate := range c.STSEndpoints() {
+		if candidate != origin {
+			c.preferredSTS = origin
+			return c
+		}
+	}
+	c.preferredSTS = origin
+	return c
 }
 
 func env(key, def string) string {
