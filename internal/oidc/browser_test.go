@@ -31,6 +31,7 @@ type browserHarness struct {
 	t                *testing.T
 	cfg              config.Config
 	mu               sync.Mutex
+	openedAuthURL    string
 	nonce            string // captured from the authorize URL
 	state            string
 	tokenSrv         *httptest.Server
@@ -92,6 +93,7 @@ func (h *browserHarness) install() {
 		q := u.Query()
 		redirectURI := q.Get("redirect_uri")
 		h.mu.Lock()
+		h.openedAuthURL = authURL
 		h.nonce = q.Get("nonce")
 		h.state = q.Get("state")
 		h.redirectURI = redirectURI
@@ -118,6 +120,142 @@ func (h *browserHarness) install() {
 				time.Sleep(10 * time.Millisecond)
 			}
 		}()
+	}
+}
+
+func TestRedactAuthorizationURLPreservesOnlySafeRoutingParameters(t *testing.T) {
+	raw := "https://operator:password@auth.example/realms/customers/protocol/openid-connect/auth?" + url.Values{
+		"client_id":             {"gasworks-cli"},
+		"redirect_uri":          {"http://127.0.0.1:49152/callback"},
+		"response_type":         {"code"},
+		"scope":                 {"openid email profile gasworks-cli-staff-route"},
+		"code_challenge_method": {"S256"},
+		"kc_idp_hint":           {"gascity-sso"},
+		"state":                 {"state-secret"},
+		"nonce":                 {"nonce-secret"},
+		"code_challenge":        {"challenge-secret"},
+		"code":                  {"authorization-code-secret"},
+		"token":                 {"generic-token-secret"},
+		"access_token":          {"access-token-secret"},
+		"id_token":              {"id-token-secret"},
+		"refresh_token":         {"refresh-token-secret"},
+		"client_secret":         {"client-secret"},
+		"future_parameter":      {"future-secret"},
+	}.Encode() + "#fragment-secret"
+
+	got := redactAuthorizationURL(raw)
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse redacted authorization URL: %v", err)
+	}
+	if u.Scheme != "https" || u.Host != "auth.example" || u.Path != "/realms/customers/protocol/openid-connect/auth" {
+		t.Fatalf("redacted endpoint = %q, want issuer host and authorization path", u.Scheme+"://"+u.Host+u.Path)
+	}
+	if u.User != nil || u.Fragment != "" {
+		t.Fatalf("redacted URL retained userinfo or fragment: user=%v fragment=%q", u.User, u.Fragment)
+	}
+
+	wantSafe := url.Values{
+		"client_id":             {"gasworks-cli"},
+		"redirect_uri":          {"http://127.0.0.1:49152/callback"},
+		"response_type":         {"code"},
+		"scope":                 {"openid email profile gasworks-cli-staff-route"},
+		"code_challenge_method": {"S256"},
+		"kc_idp_hint":           {"gascity-sso"},
+	}
+	q := u.Query()
+	for key, want := range wantSafe {
+		if got := q[key]; len(got) != 1 || got[0] != want[0] {
+			t.Errorf("safe query %s = %q, want %q", key, got, want)
+		}
+	}
+	for _, key := range []string{
+		"state", "nonce", "code_challenge", "code", "token", "access_token",
+		"id_token", "refresh_token", "client_secret", "future_parameter",
+	} {
+		if got := q.Get(key); got != "[redacted]" {
+			t.Errorf("sensitive query %s = %q, want redaction marker", key, got)
+		}
+	}
+	for _, secret := range []string{
+		"password", "fragment-secret", "state-secret", "nonce-secret", "challenge-secret",
+		"authorization-code-secret", "generic-token-secret", "access-token-secret",
+		"id-token-secret", "refresh-token-secret", "client-secret", "future-secret",
+	} {
+		if strings.Contains(got, secret) {
+			t.Errorf("redacted authorization URL retained sensitive value %q", secret)
+		}
+	}
+}
+
+func TestRedactAuthorizationURLFailsClosedOnMalformedInput(t *testing.T) {
+	const secret = "must-not-escape"
+	got := redactAuthorizationURL("://not-an-absolute-url?state=" + secret)
+	if got != "[authorization URL unavailable]" {
+		t.Fatalf("malformed authorization URL redaction = %q", got)
+	}
+	if strings.Contains(got, secret) {
+		t.Fatal("malformed authorization URL leaked its query value")
+	}
+}
+
+func TestRedactAuthorizationURLPreservesSafeDuplicatesAndEscapesValues(t *testing.T) {
+	raw := "https://auth.example/authorize?client_id=gasworks-cli&scope=openid&scope=profile&kc_idp_hint=sso%2Broute&state=state%0Asecret&future=%25hidden%0D%0A"
+	got := redactAuthorizationURL(raw)
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Fatalf("redacted URL contains terminal control characters: %q", got)
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse escaped redacted URL: %v", err)
+	}
+	q := u.Query()
+	if scopes := q["scope"]; len(scopes) != 2 || scopes[0] != "openid" || scopes[1] != "profile" {
+		t.Fatalf("scope values = %q, want both safe values in order", scopes)
+	}
+	if got := q.Get("kc_idp_hint"); got != "sso+route" {
+		t.Fatalf("kc_idp_hint = %q, want decoded safe routing value", got)
+	}
+	if got := q.Get("state"); got != authorizationURLRedactionMarker {
+		t.Fatalf("state = %q, want redaction marker", got)
+	}
+	if got := q.Get("future"); got != authorizationURLRedactionMarker {
+		t.Fatalf("future parameter = %q, want redaction marker", got)
+	}
+}
+
+func TestBrowserLoginLogsRedactedAuthorizationURLButOpensFullURL(t *testing.T) {
+	h := newBrowserHarness(t)
+	h.install()
+	var logged strings.Builder
+	if _, err := BrowserLoginStaff(h.cfg, func(line string) { logged.WriteString(line) }); err != nil {
+		t.Fatalf("BrowserLoginStaff: %v", err)
+	}
+
+	h.mu.Lock()
+	opened := h.openedAuthURL
+	h.mu.Unlock()
+	u, err := url.Parse(opened)
+	if err != nil {
+		t.Fatalf("parse URL passed to browser: %v", err)
+	}
+	for _, key := range []string{"state", "nonce", "code_challenge"} {
+		value := u.Query().Get(key)
+		if value == "" {
+			t.Fatalf("browser URL is missing full %s value", key)
+		}
+		if strings.Contains(logged.String(), value) {
+			t.Errorf("browser login log leaked %s value", key)
+		}
+	}
+	if !strings.Contains(logged.String(), "client_id=gasworks-cli") ||
+		!strings.Contains(logged.String(), "kc_idp_hint=gascity-sso") ||
+		!strings.Contains(logged.String(), "%5Bredacted%5D") {
+		t.Fatalf("browser login log did not retain a useful redacted URL: %q", logged.String())
+	}
+	if strings.Contains(logged.String(), "If it doesn't open, visit:") ||
+		!strings.Contains(logged.String(), "not a complete login URL") {
+		t.Fatalf("browser login log misrepresented the redacted URL as manually usable: %q", logged.String())
 	}
 }
 
