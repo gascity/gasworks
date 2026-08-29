@@ -123,6 +123,55 @@ func asInt(v any, def int) int {
 	}
 }
 
+const (
+	authorizationURLRedactionMarker = "[redacted]"
+	authorizationURLUnavailable     = "[authorization URL unavailable]"
+)
+
+// redactAuthorizationURL returns a diagnostic-safe form of an OAuth authorization URL.
+// Authorization requests contain transaction-bound values (state, nonce, and the PKCE
+// challenge) that must not be copied into terminal logs. Keep the endpoint and the small
+// set of non-secret routing parameters useful for troubleshooting, while replacing every
+// other query value so newly-added provider parameters do not silently become log leaks.
+// The complete URL must still be passed to the browser; this helper is for human-facing
+// output only.
+func redactAuthorizationURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
+		return authorizationURLUnavailable
+	}
+	// ParseQuery reports malformed escapes that URL.Query silently ignores. Do not return a
+	// partially parsed URL because an ignored fragment could contain an authorization secret.
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return authorizationURLUnavailable
+	}
+	safe := make(url.Values, len(q))
+	for key, values := range q {
+		if authorizationURLQueryParameterIsSafe(key) {
+			safe[key] = append([]string(nil), values...)
+			continue
+		}
+		// Preserve the parameter name for diagnostics, but never its value. This also
+		// covers state/nonce/code_challenge and future provider-specific parameters.
+		safe[key] = []string{authorizationURLRedactionMarker}
+	}
+	u.User = nil
+	u.Fragment = ""
+	u.RawFragment = ""
+	u.RawQuery = safe.Encode()
+	return u.String()
+}
+
+func authorizationURLQueryParameterIsSafe(key string) bool {
+	switch key {
+	case "client_id", "response_type", "redirect_uri", "scope", "code_challenge_method", "kc_idp_hint":
+		return true
+	default:
+		return false
+	}
+}
+
 // deviceVerificationURI validates the server-authored URI before it reaches the
 // terminal. It intentionally returns the original value (rather than normalizing it)
 // so a valid verification_uri_complete remains usable byte-for-byte.
@@ -365,7 +414,7 @@ func browserLoginWithScope(cfg config.Config, logf func(string), idpHint, scope 
 	go func() { _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close() }()
 
-	logf(fmt.Sprintf("\nOpening your browser to sign in...\nIf it doesn't open, visit:\n\n    %s\n", authURL))
+	logf(fmt.Sprintf("\nOpening your browser to sign in...\nIf it doesn't open, retry with a browser available.\nDiagnostic endpoint (transaction values redacted; not a complete login URL):\n\n    %s\n", redactAuthorizationURL(authURL)))
 	openBrowser(authURL) // best-effort; overridable in tests to drive the callback
 
 	var res result
