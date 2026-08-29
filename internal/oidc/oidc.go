@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,6 +48,12 @@ const (
 	deviceLoginCap   = 600 * time.Second
 	browserTimeout   = 300 * time.Second
 	slowDownIncrease = 5 * time.Second
+
+	// Device authorization metadata is displayed verbatim to a terminal. Keep these
+	// values small and restricted to printable ASCII so an untrusted IdP response
+	// cannot inject terminal controls or force an unbounded display allocation.
+	maxDeviceVerificationURILength = 2048
+	maxDeviceUserCodeLength        = 128
 )
 
 // b64url is base64url WITHOUT padding.
@@ -115,6 +122,47 @@ func asInt(v any, def int) int {
 	}
 }
 
+// deviceVerificationURI validates the server-authored URI before it reaches the
+// terminal. It intentionally returns the original value (rather than normalizing it)
+// so a valid verification_uri_complete remains usable byte-for-byte.
+func deviceVerificationURI(raw string) (string, error) {
+	if raw == "" || len(raw) > maxDeviceVerificationURILength || !printableASCII(raw) {
+		return "", errors.New("device login: invalid verification URI")
+	}
+	u, err := url.ParseRequestURI(raw)
+	if err != nil || u.Host == "" || u.User != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) {
+		return "", errors.New("device login: invalid verification URI")
+	}
+	return raw, nil
+}
+
+// deviceUserCode applies the same terminal-safety boundary to the fallback code
+// printed when the provider does not supply verification_uri_complete.
+func deviceUserCode(raw string) (string, error) {
+	if raw == "" || len(raw) > maxDeviceUserCodeLength || !printableASCIIWithSpace(raw) {
+		return "", errors.New("device login: invalid user code")
+	}
+	return raw, nil
+}
+
+func printableASCII(s string) bool {
+	for _, b := range []byte(s) {
+		if b < 0x21 || b > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func printableASCIIWithSpace(s string) bool {
+	for _, b := range []byte(s) {
+		if b < 0x20 || b > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 // DeviceLogin runs the device-authorization grant (headless). It prints the verification URL
 // (and user code, if no complete URL) to stderr via logf, polls the token endpoint at the
 // server-supplied interval, and returns the tokens on success. It stops polling at the
@@ -157,16 +205,31 @@ func deviceLogin(cfg config.Config, logf func(string), scope string) (Tokens, er
 		return Tokens{}, errors.New("device login: no device_code in response")
 	}
 	interval := time.Duration(asInt(m["interval"], 5)) * time.Second
-	uri := asString(m["verification_uri_complete"])
+	completeURI := asString(m["verification_uri_complete"])
+	uri := completeURI
 	if uri == "" {
 		uri = asString(m["verification_uri"])
+	}
+	uri, err = deviceVerificationURI(uri)
+	if err != nil {
+		return Tokens{}, err
+	}
+	var userCode string
+	if completeURI == "" {
+		userCode = asString(m["user_code"])
+		if userCode != "" {
+			userCode, err = deviceUserCode(userCode)
+			if err != nil {
+				return Tokens{}, err
+			}
+		}
 	}
 	logf("")
 	logf("Sign in to Gas City to continue:")
 	logf("")
 	logf(fmt.Sprintf("  1. Open:  %s", uri))
-	if uc := asString(m["user_code"]); uc != "" && asString(m["verification_uri_complete"]) == "" {
-		logf(fmt.Sprintf("  2. Enter code:  %s", uc))
+	if userCode != "" {
+		logf(fmt.Sprintf("  2. Enter code:  %s", userCode))
 	}
 	logf("")
 	logf("Waiting for you to authorize... (Ctrl-C to cancel)")
