@@ -160,6 +160,112 @@ func TestDeviceLoginStaffRequestsStaffRouteScope(t *testing.T) {
 	}
 }
 
+func TestDeviceVerificationURIRejectsUnsafeDisplayValues(t *testing.T) {
+	tests := map[string]string{
+		"missing":           "",
+		"oversized":         "https://auth.gascity.com/device?code=" + strings.Repeat("A", maxDeviceVerificationURILength),
+		"newline injection": "https://auth.gascity.com/device\nforged log line",
+		"ANSI injection":    "https://auth.gascity.com/device\x1b[31m",
+		"relative":          "/device?user_code=ABCD-EFGH",
+		"non-HTTP scheme":   "javascript:alert(1)",
+		"missing host":      "https:///device",
+		"userinfo":          "https://user:password@auth.gascity.com/device",
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got, err := deviceVerificationURI(raw); err == nil || got != "" {
+				t.Fatalf("deviceVerificationURI() = %q, %v; want empty, safe error", got, err)
+			} else if raw != "" && strings.Contains(err.Error(), raw) {
+				t.Fatalf("error reflects untrusted verification URI: %q", err)
+			}
+		})
+	}
+}
+
+func TestDeviceVerificationURIPreservesValidServerURL(t *testing.T) {
+	const raw = "https://auth.gascity.com/realms/gasworks-customers/device?user_code=ABCD-EFGH"
+	got, err := deviceVerificationURI(raw)
+	if err != nil || got != raw {
+		t.Fatalf("deviceVerificationURI() = %q, %v; want exact server URL", got, err)
+	}
+}
+
+func TestDeviceUserCodeRejectsUnsafeDisplayValues(t *testing.T) {
+	for name, raw := range map[string]string{
+		"oversized":         strings.Repeat("A", maxDeviceUserCodeLength+1),
+		"newline injection": "ABCD\nforged log line",
+		"ANSI injection":    "ABCD\x1b[31m",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := deviceUserCode(raw); err == nil || got != "" {
+				t.Fatalf("deviceUserCode() = %q, %v; want empty, safe error", got, err)
+			} else if strings.Contains(err.Error(), raw) {
+				t.Fatalf("error reflects untrusted user code: %q", err)
+			}
+		})
+	}
+}
+
+func TestDeviceUserCodePreservesValidServerValue(t *testing.T) {
+	const raw = "ABCD-EFGH"
+	got, err := deviceUserCode(raw)
+	if err != nil || got != raw {
+		t.Fatalf("deviceUserCode() = %q, %v; want exact server value", got, err)
+	}
+}
+
+func TestDeviceLoginRejectsUnsafeVerificationMetadataBeforePolling(t *testing.T) {
+	tests := map[string]map[string]any{
+		"malformed URL": {
+			"verification_uri_complete": "javascript:alert(1)",
+		},
+		"control character URL": {
+			"verification_uri_complete": "https://auth.gascity.com/device\nforged",
+		},
+		"oversized URL": {
+			"verification_uri_complete": "https://auth.gascity.com/device?code=" + strings.Repeat("A", maxDeviceVerificationURILength),
+		},
+		"control character user code": {
+			"verification_uri": "https://auth.gascity.com/device",
+			"user_code":        "ABCD\x1b[31m",
+		},
+	}
+	for name, metadata := range tests {
+		t.Run(name, func(t *testing.T) {
+			polls := 0
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/auth/device"):
+					response := map[string]any{"device_code": "dev1", "expires_in": 60, "interval": 1}
+					for key, value := range metadata {
+						response[key] = value
+					}
+					writeJSON(w, http.StatusOK, response)
+				case strings.HasSuffix(r.URL.Path, "/openid-connect/token"):
+					polls++
+					writeJSON(w, http.StatusOK, map[string]any{"id_token": "ID", "refresh_token": "RT"})
+				default:
+					writeJSON(w, http.StatusNotFound, map[string]any{"error": "nope"})
+				}
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			cfg := config.Config{STSBase: srv.URL, OIDCIssuer: srv.URL + "/realms/g", ClientID: "gasworks-cli"}
+			var logs []string
+			if _, err := DeviceLogin(cfg, func(line string) { logs = append(logs, line) }); err == nil {
+				t.Fatal("DeviceLogin accepted unsafe display metadata")
+			}
+			if len(logs) != 0 {
+				t.Fatalf("DeviceLogin logged unsafe metadata before rejection: %q", logs)
+			}
+			if polls != 0 {
+				t.Fatalf("DeviceLogin polled token endpoint after unsafe metadata: %d polls", polls)
+			}
+		})
+	}
+}
+
 // TestDeviceLoginHonorsServerExpiresIn proves the poll deadline follows the device-auth
 // response's expires_in (here 2s) rather than the 600s cap: when the user never authorizes
 // (the token endpoint always returns authorization_pending), DeviceLogin must give up
