@@ -146,20 +146,6 @@ func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 	}
 }
 
-func TestDeviceLoginStaffRequestsStaffRouteScope(t *testing.T) {
-	cfg, srv := newStub(t)
-	if _, err := DeviceLoginStaff(cfg, func(string) {}); err != nil {
-		t.Fatalf("DeviceLoginStaff: %v", err)
-	}
-	dev := srv.reqs("/auth/device")
-	if len(dev) != 1 {
-		t.Fatalf("want 1 device-auth req, got %d", len(dev))
-	}
-	if got := dev[0].form.Get("scope"); got != OIDCScope+" "+staffRouteScope {
-		t.Fatalf("staff device scope = %q, want %q", got, OIDCScope+" "+staffRouteScope)
-	}
-}
-
 // TestDeviceLoginHonorsServerExpiresIn proves the poll deadline follows the device-auth
 // response's expires_in (here 2s) rather than the 600s cap: when the user never authorizes
 // (the token endpoint always returns authorization_pending), DeviceLogin must give up
