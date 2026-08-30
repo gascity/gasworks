@@ -135,9 +135,6 @@ func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 	if !strings.Contains(dev[0].form.Get("scope"), "openid") {
 		t.Errorf("scope = %q, must contain openid", dev[0].form.Get("scope"))
 	}
-	if got := dev[0].form.Get("scope"); got != OIDCScope {
-		t.Errorf("customer device scope = %q, want %q (must not select staff route)", got, OIDCScope)
-	}
 
 	polls2 := srv.reqs("/openid-connect/token")
 	if len(polls2) == 0 {
@@ -146,20 +143,6 @@ func TestDeviceLoginPollsThroughPendingWithPKCE(t *testing.T) {
 	last := polls2[len(polls2)-1]
 	if last.form.Get("code_verifier") == "" {
 		t.Error("PKCE code_verifier missing on the poll")
-	}
-}
-
-func TestDeviceLoginStaffRequestsStaffRouteScope(t *testing.T) {
-	cfg, srv := newStub(t)
-	if _, err := DeviceLoginStaff(cfg, func(string) {}); err != nil {
-		t.Fatalf("DeviceLoginStaff: %v", err)
-	}
-	dev := srv.reqs("/auth/device")
-	if len(dev) != 1 {
-		t.Fatalf("want 1 device-auth request, got %d", len(dev))
-	}
-	if got, want := dev[0].form.Get("scope"), OIDCScope+" "+staffRouteScope; got != want {
-		t.Fatalf("staff device scope = %q, want %q", got, want)
 	}
 }
 

@@ -590,23 +590,15 @@ func TestLoginOrgSelection(t *testing.T) {
 	}
 }
 
-func TestLoginStaffDeviceFlowUsesStaffRouteScope(t *testing.T) {
+func TestLoginStaffRejectsDeviceFlow(t *testing.T) {
 	srv := newStub(t)
-	srv.refreshTok = map[string]any{"id_token": validIDTokenIss(srv.srv.URL + "/realms/g"), "refresh_token": "RT-STAFF"}
 	seed(t, srv, map[string]any{"refresh_token": "OLD", "id_token": "OLD"})
-	out, errOut, code := capture(t, func() int { return run([]string{"login", "--staff", "--device"}) })
-	if code != 0 {
-		t.Fatalf("login = exit %d stderr %q", code, errOut)
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--staff", "--device"}) })
+	if code == 0 || !strings.Contains(errOut, "--staff requires the browser flow") {
+		t.Fatalf("login = exit %d stderr %q, want staff/device rejection", code, errOut)
 	}
-	if !strings.Contains(out, "Logged in as u@gascity.com.") {
-		t.Fatalf("stdout = %q, want logged-in greeting", out)
-	}
-	dev := srv.reqs("/protocol/openid-connect/auth/device")
-	if len(dev) != 1 {
-		t.Fatalf("want 1 staff device authorization request, got %d", len(dev))
-	}
-	if got := dev[0].form.Get("scope"); got != "openid profile email offline_access gasworks-cli-staff-route" {
-		t.Fatalf("staff device scope = %q, want staff route scope", got)
+	if got := len(srv.reqs("/protocol/openid-connect/auth/device")); got != 0 {
+		t.Fatalf("staff/device made %d device authorization requests, want none", got)
 	}
 }
 
