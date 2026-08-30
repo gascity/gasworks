@@ -48,6 +48,19 @@ jobs:
       - name: Verify module integrity
         run: go mod verify
 
+      # Exercise the exact authentication contract from the tagged source before any artifact
+      # is signed or published.  In particular this keeps a release from regressing to the
+      # legacy gascity issuer or re-enabling staff device routing after those paths were retired.
+      # The same tests pin DPoP ath to the exact credential presented on each STS leg.
+      - name: Verify CLI authentication contract
+        run: >-
+          go test -mod=vendor
+          ./internal/config
+          ./internal/oidc
+          ./internal/sts
+          ./cmd/gasworks
+          -count=1
+
       # syft provides the SBOMs referenced by `sboms:` in .goreleaser.yaml.
       - name: Install syft
         uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
