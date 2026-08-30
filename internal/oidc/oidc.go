@@ -28,8 +28,8 @@ import (
 	"github.com/gascity/gasworks/internal/jwtutil"
 )
 
-// OIDCScope is the base scope on every grant. It MUST be byte-identical across device,
-// customer-browser, and refresh; the staff browser route appends its claim-free selector.
+// OIDCScope is the base scope on every grant. Customer requests are byte-identical across
+// device, browser, and refresh; the staff route appends only its claim-free selector.
 // Dropping `openid` makes Keycloak omit the id_token.
 const OIDCScope = "openid profile email offline_access"
 
@@ -218,6 +218,16 @@ func printableASCIIWithSpace(s string) bool {
 // server-supplied interval, and returns the tokens on success. It stops polling at the
 // server's expires_in lifetime, capped at deviceLoginCap (600s).
 func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
+	return deviceLogin(cfg, logf, OIDCScope)
+}
+
+// DeviceLoginStaff runs the device-authorization grant through the approved staff route.
+// The route scope selects the staff broker flow; it carries no claims or permissions.
+func DeviceLoginStaff(cfg config.Config, logf func(string)) (Tokens, error) {
+	return deviceLogin(cfg, logf, OIDCScope+" "+staffRouteScope)
+}
+
+func deviceLogin(cfg config.Config, logf func(string), scope string) (Tokens, error) {
 	if logf == nil {
 		logf = func(string) {}
 	}
@@ -228,7 +238,7 @@ func DeviceLogin(cfg config.Config, logf func(string)) (Tokens, error) {
 
 	_, body, err := httpc.PostForm(cfg.DeviceAuthURL(), url.Values{
 		"client_id":             {cfg.ClientID},
-		"scope":                 {OIDCScope},
+		"scope":                 {scope},
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}, nil)

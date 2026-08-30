@@ -30,6 +30,7 @@ Download the archive for your OS/arch from the [GitHub Releases](https://github.
 gasworks login                 # SSO sign-in (browser on a laptop, device-code when headless)
 gasworks login --device        # force the device-code flow (SSH / sandboxes / CI)
 gasworks login --browser       # force the loopback browser flow
+gasworks login --staff --device # staff SSO through the approved headless route
 gasworks login --org acme      # remember a default org for getToken
 
 gasworks getToken manifold     # mint an EIA for manifold (raw token on stdout — pipeable)
@@ -47,7 +48,7 @@ gasworks version               # print the build version
 
 | Command | Description |
 |---|---|
-| `gasworks login [--device\|--browser] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--org` remembers a default org. |
+| `gasworks login [--device\|--browser] [--staff] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--staff` selects the approved staff SSO route and `--org` remembers a default org. |
 | `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
 | `gasworks credential-provider` | Read a v1 credential request from stdin and emit one typed JSON response for automation. |
 | `gasworks whoami` | Print your subject/email and the orgs (with roles + products) you can mint for. |
