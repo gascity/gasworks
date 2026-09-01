@@ -1,0 +1,10 @@
+.git
+.github
+dist
+*.env
+*.pem
+*.key
+*.sig
+*.bundle
+**/.env
+**/.env.*

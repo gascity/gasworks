@@ -1,4 +1,5 @@
-# Signed release pipeline for the gasworks Go binaries.
+# Signed release pipeline for the gasworks Go binaries and the provenance-bearing
+# Linux/amd64 OCI CLI artifact.
 #
 # GATED: this workflow only fires on a pushed `v*` tag (e.g. `git tag v1.2.3 && git push
 # --tags`). Until such a tag is pushed it never runs — merging to main does NOT release.
@@ -13,13 +14,16 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write # create the GitHub Release + upload assets
-  id-token: write # OIDC token for cosign KEYLESS signing (Fulcio) — the load-bearing perm
+# Every job opts into only the permissions it needs.  In particular, a future
+# validation job cannot inherit package publishing or OIDC signing authority.
+permissions: {}
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload assets
+      id-token: write # keyless GoReleaser signatures and SLSA provenance
     # The base64-encoded sha256 subjects of the released artifacts, consumed by the SLSA
     # provenance job below. Produced by the `hash` step from GoReleaser's artifacts.json.
     outputs:
@@ -43,6 +47,19 @@ jobs:
       # the supply chain we then sign.
       - name: Verify module integrity
         run: go mod verify
+
+      # Exercise the exact authentication contract from the tagged source before any artifact
+      # is signed or published.  In particular this keeps a release from regressing to the
+      # legacy gascity issuer or re-enabling staff device routing after those paths were retired.
+      # The same tests pin DPoP ath to the exact credential presented on each STS leg.
+      - name: Verify CLI authentication contract
+        run: >-
+          go test -mod=vendor
+          ./internal/config
+          ./internal/oidc
+          ./internal/sts
+          ./cmd/gasworks
+          -count=1
 
       # syft provides the SBOMs referenced by `sboms:` in .goreleaser.yaml.
       - name: Install syft
@@ -85,6 +102,255 @@ jobs:
               | base64 -w0
           )"
           echo "hashes=${hashes}" >> "$GITHUB_OUTPUT"
+
+  # The OCI image is a separate, opt-in release artifact.  It does not replace
+  # the archive/Homebrew channel: consumers must select this immutable image
+  # explicitly, and the inventory remains unready until a real protected-tag
+  # run supplies this image and its detached bundle to the source-index step.
+  gasworks-cli-image:
+    name: Publish gasworks CLI image provenance
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      github.repository == 'gascity/gasworks'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/gascity/gasworks-cli
+      IMAGE_SOURCE: https://github.com/gascity/gasworks
+      DOCKERFILE: Dockerfile.gasworks-cli
+      PREDICATE_TYPE: https://slsa.dev/provenance/v1
+      COSIGN_VERSION: 3.1.1
+      COSIGN_SHA256: ae1ecd212663f3693ad9edf8b1a183900c9a52d3155ba6e354237f9a0f6463fc
+    steps:
+      - name: Checkout exact release-tag commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate protected release context
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "gascity/gasworks"
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_REF_TYPE" = "tag"
+          test "$GITHUB_REF_PROTECTED" = "true"
+          test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
+          # Only a strict semantic-version tag can mint a source-index input.
+          # Repository administrators must protect v* tags with independent
+          # review/signature rules before enabling this publisher.
+          printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          printf '%s\n' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git show-ref --verify "$GITHUB_REF"
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable CLI image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/gascity/gasworks-cli:${{ github.sha }}
+          build-args: |
+            OCI_SOURCE=${{ env.IMAGE_SOURCE }}
+            OCI_REVISION=${{ github.sha }}
+            OCI_VERSION=${{ github.ref_name }}
+
+      - name: Resolve exact image subject
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${{ steps.image.outputs.digest }}" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          printf 'IMAGE_DIGEST=%s\n' "${{ steps.image.outputs.digest }}" >> "$GITHUB_ENV"
+          printf 'EXACT_IMAGE=%s@%s\n' "$IMAGE" "${{ steps.image.outputs.digest }}" >> "$GITHUB_ENV"
+
+      - name: Install checksum-pinned Cosign
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"
+          install -d "$bin"
+          curl -fsSL \
+            "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64" \
+            -o "$bin/cosign"
+          echo "${COSIGN_SHA256}  ${bin}/cosign" | sha256sum -c -
+          chmod 0755 "$bin/cosign"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Create and verify detached image signature
+        env:
+          SIGNATURE_BUNDLE: ${{ runner.temp }}/gasworks-cli-dpop-attestation/signature.bundle
+          SIGNATURE_VERIFY: ${{ runner.temp }}/gasworks-cli-dpop-attestation/signature-verify.json
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$(dirname "$SIGNATURE_BUNDLE")"
+          identity="https://github.com/gascity/gasworks/.github/workflows/release.yml@${GITHUB_REF}"
+          issuer='https://token.actions.githubusercontent.com'
+          cosign sign --yes --bundle "$SIGNATURE_BUNDLE" "$EXACT_IMAGE"
+          test -s "$SIGNATURE_BUNDLE"
+          cosign verify \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            --certificate-github-workflow-repository gascity/gasworks \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-name release \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger push \
+            --output=json \
+            "$EXACT_IMAGE" > "$SIGNATURE_VERIFY"
+          test -s "$SIGNATURE_VERIFY"
+
+      - name: Create source-bound in-toto Statement v1
+        env:
+          ATTESTATION_DIR: ${{ runner.temp }}/gasworks-cli-dpop-attestation
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$ATTESTATION_DIR/bundles"
+          export WORKFLOW_PATH='.github/workflows/release.yml'
+          export WORKFLOW_URL="https://github.com/${GITHUB_REPOSITORY}/${WORKFLOW_PATH}"
+          python3 - "$ATTESTATION_DIR/statement.json" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          digest = os.environ["IMAGE_DIGEST"]
+          revision = os.environ["GITHUB_SHA"]
+          workflow_ref = os.environ["GITHUB_REF"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          image = os.environ["IMAGE"]
+          workflow_url = os.environ["WORKFLOW_URL"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("invalid image digest")
+          if not re.fullmatch(r"[0-9a-f]{40}", revision):
+              raise SystemExit("invalid source revision")
+          if repository != "gascity/gasworks":
+              raise SystemExit("unexpected source repository")
+          if not re.fullmatch(
+              r"refs/tags/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+              workflow_ref,
+          ):
+              raise SystemExit("invalid protected release-tag ref")
+          predicate = {
+              "buildDefinition": {
+                  "buildType": workflow_url,
+                  "externalParameters": {
+                      "image": image,
+                      "image_digest": digest,
+                      "workflow_ref": workflow_ref,
+                  },
+                  "resolvedDependencies": [{
+                      "uri": "https://github.com/gascity/gasworks",
+                      "digest": {"gitCommit": revision},
+                  }],
+              },
+              "runDetails": {
+                  "builder": {"id": workflow_url},
+                  "metadata": {
+                      "invocationId": (
+                          f"https://github.com/{repository}/actions/runs/"
+                          f"{os.environ['GITHUB_RUN_ID']}"
+                      ),
+                  },
+              },
+          }
+          statement = {
+              "_type": "https://in-toto.io/Statement/v1",
+              "subject": [{
+                  "name": image,
+                  "digest": {"sha256": digest.removeprefix("sha256:")},
+              }],
+              "predicateType": "https://slsa.dev/provenance/v1",
+              "predicate": predicate,
+          }
+          Path(sys.argv[1]).write_text(
+              json.dumps(statement, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          test -s "$ATTESTATION_DIR/statement.json"
+
+      - name: Create and verify detached source attestation
+        env:
+          ATTESTATION_DIR: ${{ runner.temp }}/gasworks-cli-dpop-attestation
+          ATTESTATION_BUNDLE: ${{ runner.temp }}/gasworks-cli-dpop-attestation/bundles/gasworks-cli-dpop.bundle
+          STATEMENT: ${{ runner.temp }}/gasworks-cli-dpop-attestation/statement.json
+        run: |
+          set -euo pipefail
+          identity="https://github.com/gascity/gasworks/.github/workflows/release.yml@${GITHUB_REF}"
+          issuer='https://token.actions.githubusercontent.com'
+          # --statement is intentional: --predicate emits legacy Statement/v0.1,
+          # while the inventory gate requires the explicit Statement/v1 above.
+          cosign attest-blob --yes \
+            --bundle "$ATTESTATION_BUNDLE" \
+            --statement "$STATEMENT" \
+            --type "$PREDICATE_TYPE"
+          test -s "$ATTESTATION_BUNDLE"
+          cosign verify-blob-attestation \
+            --bundle "$ATTESTATION_BUNDLE" \
+            --certificate-identity "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            --certificate-github-workflow-repository gascity/gasworks \
+            --certificate-github-workflow-ref "$GITHUB_REF" \
+            --certificate-github-workflow-name release \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger push \
+            --digest "${IMAGE_DIGEST#sha256:}" \
+            --digestAlg sha256 \
+            --check-claims=true \
+            --type "$PREDICATE_TYPE"
+
+      - name: Write source-index input metadata
+        env:
+          ATTESTATION_DIR: ${{ runner.temp }}/gasworks-cli-dpop-attestation
+        run: |
+          set -euo pipefail
+          # build_dpop_source_attestation_index.py intentionally accepts only
+          # this one mutable value; all source/image/bundle fields are derived
+          # from the reviewed infra inventory and the verified bundle itself.
+          printf '{"workflow_ref":"%s"}\n' "$GITHUB_REF" > "$ATTESTATION_DIR/gasworks-cli-dpop.json"
+          test "$(jq -r '.workflow_ref' "$ATTESTATION_DIR/gasworks-cli-dpop.json")" = "$GITHUB_REF"
+          sha256sum "$ATTESTATION_DIR/bundles/gasworks-cli-dpop.bundle" > "$ATTESTATION_DIR/bundle.sha256"
+          cat > "$ATTESTATION_DIR/image.json" <<EOF
+          {"image_ref":"${EXACT_IMAGE}","source_repository":"${IMAGE_SOURCE}","source_revision":"${GITHUB_SHA}","workflow_ref":"${GITHUB_REF}"}
+          EOF
+
+      - name: Upload signed source provenance evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gasworks-cli-dpop-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/statement.json
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/bundles/gasworks-cli-dpop.bundle
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/signature.bundle
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/signature-verify.json
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/gasworks-cli-dpop.json
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/image.json
+            ${{ runner.temp }}/gasworks-cli-dpop-attestation/bundle.sha256
 
   # SLSA provenance (authoritative). DECISION: produce the SLSA Build L3 provenance via the
   # audited slsa-github-generator rather than a hand-rolled goreleaser hook. This is the

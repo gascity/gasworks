@@ -1,0 +1,54 @@
+# OCI release boundary for the gasworks CLI.
+#
+# Both bases are pinned by digest.  The image is an additional, Linux/amd64
+# distribution artifact for provenance and controlled consumers; the existing
+# GoReleaser archives and Homebrew path remain unchanged.
+FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS build
+
+ARG OCI_REVISION
+ARG OCI_VERSION
+
+WORKDIR /src
+
+# Copy only build inputs.  In particular, credentials, local configuration,
+# release metadata, and the .git directory never enter the build context used
+# by a layer below.
+COPY go.mod go.sum ./
+COPY vendor ./vendor
+COPY cmd/gasworks ./cmd/gasworks
+# Keep the release context limited to the CLI's dependency closure.  Other
+# internal packages (observer/recall/usage) are separate binaries and must not
+# silently become inputs to this image build.
+COPY internal/config ./internal/config
+COPY internal/dpop ./internal/dpop
+COPY internal/httpc ./internal/httpc
+COPY internal/jwtutil ./internal/jwtutil
+COPY internal/oidc ./internal/oidc
+COPY internal/store ./internal/store
+COPY internal/sts ./internal/sts
+COPY internal/version ./internal/version
+
+RUN test -n "$OCI_REVISION" \
+    && test -n "$OCI_VERSION" \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+       go build -mod=vendor -trimpath -buildvcs=false \
+       -ldflags "-s -w -X github.com/gascity/gasworks/internal/version.Version=${OCI_VERSION} -X github.com/gascity/gasworks/internal/version.Commit=${OCI_REVISION}" \
+       -o /out/gasworks ./cmd/gasworks \
+    && test -x /out/gasworks
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+
+ARG OCI_SOURCE
+ARG OCI_REVISION
+ARG OCI_VERSION
+
+LABEL org.opencontainers.image.source="$OCI_SOURCE" \
+      org.opencontainers.image.revision="$OCI_REVISION" \
+      org.opencontainers.image.version="$OCI_VERSION" \
+      org.opencontainers.image.title="gasworks" \
+      org.opencontainers.image.description="Gas City SSO and getToken CLI"
+
+COPY --from=build /out/gasworks /usr/local/bin/gasworks
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/gasworks"]
