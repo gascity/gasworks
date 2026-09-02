@@ -31,6 +31,13 @@ const defaultSessionExpiresIn = 28800
 
 var errNoSTSEndpoint = errors.New("sts: no endpoint configured")
 
+// getJSON and postForm are the HTTP verbs this package uses. They are indirected so tests can
+// inject a DNS resolution failure, which no stub server can produce.
+var (
+	getJSON  = httpc.GetJSON
+	postForm = httpc.PostForm
+)
+
 // Product is a per-org mintable product: the EIA audience and the scopes the caller may
 // request for it.
 type Product struct {
@@ -96,39 +103,33 @@ type Telemetry func(Event)
 // Context fetches /sts/v0/context — the caller's orgs + per-org mintable scopes. It carries
 // the id_token as a Bearer and NO DPoP. A non-provisioning request is read-only and may fall
 // back to the next configured origin on a network/404/5xx failure. A provisioning request
-// (provision=true) may create or link identity/org state, so it makes exactly one attempt at
-// the selected origin and never crosses origins after an uncertain response. On a non-2xx it
-// returns the raw *httpc.HTTPError so the caller can branch on status.
+// (provision=true) may create or link identity/org state, so it crosses to the next origin
+// only when the current one's name did not resolve, and never after an uncertain response.
+// On a non-2xx it returns the raw *httpc.HTTPError so the caller can branch on status.
 func Context(cfg config.Config, idToken string, provision bool) (ContextResolution, error) {
 	var last error
 	endpoints := cfg.STSEndpoints()
 	if len(endpoints) == 0 {
 		return ContextResolution{}, errNoSTSEndpoint
 	}
-	if provision {
-		// Provisioning is state-changing even though it uses GET: the server may create
-		// or link an Accounts identity/org membership. Never replay it at another origin
-		// after a response/transport failure that could have committed the mutation.
-		endpoints = endpoints[:1]
-	}
 	for i, origin := range endpoints {
 		u := origin + "/sts/v0/context"
 		if provision {
 			u += "?provision=true"
 		}
-		_, body, err := httpc.GetJSON(u, map[string]string{"Authorization": "Bearer " + idToken})
+		_, body, err := getJSON(u, map[string]string{"Authorization": "Bearer " + idToken})
 		if err == nil {
 			var res ContextResolution
 			if err := remarshal(body, &res); err != nil {
 				return ContextResolution{}, fmt.Errorf("context: %w", err)
 			}
 			res.Origin = origin
-			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: contextSuccessOutcome(i), Reason: "success"})
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: successOutcome(i), Reason: "success"})
 			return res, nil
 		}
 		last = err
-		if !retryable(err) || i == len(endpoints)-1 {
-			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: contextFailureOutcome(i), Reason: reason(err)})
+		if !mayCrossOrigin(err, provision) || i == len(endpoints)-1 {
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
 			return ContextResolution{}, err
 		}
 	}
@@ -137,71 +138,75 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 
 // Login establishes a DPoP-bound session at /sts/v0/login. The DPoP proof is bound to the
 // login URL and signed by key; pass the SAME key to Exchange so the server's jkt-pin holds.
-// Login is state-changing: it makes exactly one attempt against the selected origin and never
-// retries on another origin after an uncertain response. On a non-2xx it returns the raw
-// *httpc.HTTPError.
+// Login is state-changing: it attempts one origin and crosses to the next only when that
+// origin's name did not resolve. On a non-2xx it returns the raw *httpc.HTTPError.
 func Login(cfg config.Config, idToken, org string, key *dpop.Key) (Session, error) {
-	origin, err := selectedOrigin(cfg)
+	sess, err := establishSession(cfg, "login", "/sts/v0/login", idToken,
+		url.Values{"subject_token": {idToken}, "org": {org}}, key)
 	if err != nil {
 		return Session{}, err
-	}
-	u := origin + "/sts/v0/login"
-	proof, err := key.Proof("POST", u, idToken)
-	if err != nil {
-		return Session{}, err
-	}
-	_, body, err := httpc.PostForm(u, url.Values{"subject_token": {idToken}, "org": {org}}, map[string]string{"DPoP": proof})
-	if err != nil {
-		emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
-		return Session{}, err
-	}
-	var sess Session
-	if err := remarshal(body, &sess); err != nil {
-		emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "failure", Reason: "other"})
-		return Session{}, fmt.Errorf("login: %w", err)
 	}
 	if sess.ExpiresIn == 0 {
 		sess.ExpiresIn = defaultSessionExpiresIn
 	}
-	sess.Origin = origin
-	emit(cfg, Event{Operation: "login", Origin: originClass(cfg, origin), Outcome: "success", Reason: "success"})
 	return sess, nil
 }
 
 // Machine establishes a DPoP-bound service-principal session at /sts/v0/machine. The same
 // key must be passed to Exchange so the STS session's jkt pin holds. Machine is state-changing:
-// it makes exactly one attempt against the selected origin and never retries on another origin.
+// it attempts one origin and crosses to the next only when that origin's name did not resolve.
 func Machine(cfg config.Config, clientSecret string, key *dpop.Key) (Session, error) {
-	origin, err := selectedOrigin(cfg)
-	if err != nil {
-		return Session{}, err
+	return establishSession(cfg, "machine", "/sts/v0/machine", clientSecret,
+		url.Values{"grant_type": {grantClientCredentials}, "client_secret": {clientSecret}}, key)
+}
+
+// establishSession POSTs a DPoP-bound session request (login or machine) at the first
+// configured origin. It re-issues at the next origin only when the current origin's name did
+// not resolve: resolution precedes the dial, so no request left the client and no session can
+// exist there. Every other failure — 4xx, 5xx, or a connection dropped mid-request — stops at
+// that origin, because the session may already have been created. The returned Session carries
+// the origin that served it; callers must pin Exchange to it.
+func establishSession(cfg config.Config, operation, path, proofPayload string, values url.Values, key *dpop.Key) (Session, error) {
+	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return Session{}, errNoSTSEndpoint
 	}
-	u := origin + "/sts/v0/machine"
-	proof, err := key.Proof("POST", u, clientSecret)
-	if err != nil {
-		return Session{}, err
+	var last error
+	for i, origin := range endpoints {
+		u := origin + path
+		proof, err := key.Proof("POST", u, proofPayload)
+		if err != nil {
+			return Session{}, err
+		}
+		_, body, err := postForm(u, values, map[string]string{"DPoP": proof})
+		if err != nil {
+			last = err
+			if unresolvedHost(err) && i < len(endpoints)-1 {
+				continue
+			}
+			emit(cfg, Event{Operation: operation, Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
+			return Session{}, err
+		}
+		var sess Session
+		if err := remarshal(body, &sess); err != nil {
+			emit(cfg, Event{Operation: operation, Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: "other"})
+			return Session{}, fmt.Errorf("%s: %w", operation, err)
+		}
+		sess.Origin = origin
+		emit(cfg, Event{Operation: operation, Origin: originClass(cfg, origin), Outcome: successOutcome(i), Reason: "success"})
+		return sess, nil
 	}
-	_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantClientCredentials}, "client_secret": {clientSecret}}, map[string]string{"DPoP": proof})
-	if err != nil {
-		emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
-		return Session{}, err
-	}
-	var sess Session
-	if err := remarshal(body, &sess); err != nil {
-		emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "failure", Reason: "other"})
-		return Session{}, fmt.Errorf("machine: %w", err)
-	}
-	sess.Origin = origin
-	emit(cfg, Event{Operation: "machine", Origin: originClass(cfg, origin), Outcome: "success", Reason: "success"})
-	return sess, nil
+	return Session{}, last
 }
 
 // Exchange performs the RFC 8693 token-exchange at /sts/v0/token, returning the EIA
 // (access_token). subject_token_type is intentionally OMITTED: the STS accepts only empty or
 // the gascity session URN, so the RFC-canonical access_token default would 400. The DPoP
 // proof is bound to the token URL and MUST be signed by the same key as Login. Exchange is
-// state-changing: it makes exactly one attempt against the selected origin and never retries
-// on another origin after an uncertain response. On a non-2xx it returns the raw *httpc.HTTPError.
+// state-changing and session-bound: it makes exactly one attempt against the selected origin
+// and never retries on another origin — not even when the name fails to resolve, since a
+// session token is only valid at the origin that issued it. On a non-2xx it returns the raw
+// *httpc.HTTPError.
 func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop.Key) (EIA, error) {
 	origin, err := selectedOrigin(cfg)
 	if err != nil {
@@ -212,7 +217,7 @@ func Exchange(cfg config.Config, sessionToken, audience, scope string, key *dpop
 	if err != nil {
 		return EIA{}, err
 	}
-	_, body, err := httpc.PostForm(u, url.Values{"grant_type": {grantTokenExchange}, "subject_token": {sessionToken}, "audience": {audience}, "scope": {scope}}, map[string]string{"DPoP": proof})
+	_, body, err := postForm(u, url.Values{"grant_type": {grantTokenExchange}, "subject_token": {sessionToken}, "audience": {audience}, "scope": {scope}}, map[string]string{"DPoP": proof})
 	if err != nil {
 		emit(cfg, Event{Operation: "token", Origin: originClass(cfg, origin), Outcome: "failure", Reason: reason(err)})
 		return EIA{}, err
@@ -249,18 +254,42 @@ func originClass(cfg config.Config, origin string) string {
 	}
 	return "legacy"
 }
-func contextSuccessOutcome(i int) string {
+
+// successOutcome and failureOutcome label an attempt by its position in the origin walk: the
+// first origin reports plainly, a later one reports that a fallback took place.
+func successOutcome(i int) string {
 	if i == 0 {
 		return "success"
 	}
 	return "fallback"
 }
 
-func contextFailureOutcome(i int) string {
+func failureOutcome(i int) string {
 	if i == 0 {
 		return "failure"
 	}
 	return "fallback"
+}
+
+// mayCrossOrigin reports whether a failed context attempt may be re-issued at the next
+// configured origin. Read-only discovery may cross on any retryable failure. A provisioning
+// request is state-changing even though it uses GET — the server may create or link an
+// Accounts identity/org membership — so it crosses only when the origin's name failed to
+// resolve. Every other failure, including a 4xx/5xx and a connection dropped mid-request,
+// leaves the outcome uncertain and must not be replayed elsewhere.
+func mayCrossOrigin(err error, provision bool) bool {
+	if provision {
+		return unresolvedHost(err)
+	}
+	return retryable(err)
+}
+
+// unresolvedHost reports whether err is a name-resolution failure (NXDOMAIN, SERVFAIL, or a
+// resolver timeout). Resolution precedes the dial, so no request ever left the client and no
+// state can have changed at that origin.
+func unresolvedHost(err error) bool {
+	var de *net.DNSError
+	return errors.As(err, &de)
 }
 
 // retryable reports whether a failed read-only context request may be attempted on the next

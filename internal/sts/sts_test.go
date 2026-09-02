@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -349,6 +350,8 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 		reason  string
 	}{
 		{name: "404", status: http.StatusNotFound, reason: "404"},
+		{name: "401", status: http.StatusUnauthorized, reason: "401"},
+		{name: "403", status: http.StatusForbidden, reason: "403"},
 		{name: "5xx", status: http.StatusServiceUnavailable, reason: "5xx"},
 		{name: "network", network: true, reason: "network"},
 	} {
@@ -403,6 +406,164 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 				t.Fatalf("telemetry = %+v", events)
 			}
 		})
+	}
+}
+
+func TestProvisioningContextFallsBackOnDNSResolutionError(t *testing.T) {
+	// A name-resolution failure is the one provisioning failure that is safe to re-issue
+	// elsewhere: nothing left the client, so the canonical origin cannot have created or
+	// linked identity/org state. httptest cannot produce one, so inject it at the seam.
+	const canonical = "https://api.gascity.com"
+	_, legacy := newStub(t)
+	live := getJSON
+	getJSON = func(u string, headers map[string]string) (int, any, error) {
+		if strings.HasPrefix(u, canonical) {
+			return 0, nil, &url.Error{Op: "Get", URL: u, Err: &net.DNSError{
+				Err: "no such host", Name: "api.gascity.com", IsNotFound: true,
+			}}
+		}
+		return live(u, headers)
+	}
+	t.Cleanup(func() { getJSON = live })
+
+	var events []Event
+	cfg := config.Config{
+		STSCanonical: canonical,
+		STSBase:      legacy.srv.URL,
+		STSTelemetry: func(op, origin, outcome, reason string) {
+			events = append(events, Event{op, origin, outcome, reason})
+		},
+	}
+	ctx, err := Context(cfg, "ID.TOK.EN", true)
+	if err != nil {
+		t.Fatalf("Context: %v", err)
+	}
+	if ctx.Origin != legacy.srv.URL {
+		t.Fatalf("context origin = %q, want %q", ctx.Origin, legacy.srv.URL)
+	}
+	got := legacy.reqs("/sts/v0/context?provision=true")
+	if len(got) != 1 {
+		t.Fatalf("legacy provisioning request count = %d, want 1", len(got))
+	}
+	if auth := got[0].headers.Get("Authorization"); auth != "Bearer ID.TOK.EN" {
+		t.Errorf("Authorization = %q, want Bearer ID.TOK.EN", auth)
+	}
+	if len(events) != 1 || events[0].Operation != "context" || events[0].Origin != "legacy" ||
+		events[0].Outcome != "fallback" || events[0].Reason != "success" {
+		t.Fatalf("telemetry = %+v", events)
+	}
+}
+
+// dnsFailingPostForm points the postForm seam at a name-resolution failure for one origin and
+// at the real transport for everything else. httptest cannot produce a DNS error, and the test
+// must not touch a resolver.
+func dnsFailingPostForm(t *testing.T, origin string) {
+	t.Helper()
+	live := postForm
+	postForm = func(u string, values url.Values, headers map[string]string) (int, any, error) {
+		if strings.HasPrefix(u, origin) {
+			return 0, nil, &url.Error{Op: "Post", URL: u, Err: &net.DNSError{
+				Err: "no such host", Name: "api.gascity.com", IsNotFound: true,
+			}}
+		}
+		return live(u, values, headers)
+	}
+	t.Cleanup(func() { postForm = live })
+}
+
+func TestSessionEstablishmentFallsBackOnDNSResolutionError(t *testing.T) {
+	// Session establishment gets the same exception as provisioning discovery: resolution
+	// precedes the dial, so the canonical origin cannot hold a half-created session. Without
+	// it the service-principal credential provider is dead on a default build for as long as
+	// api.gascity.com is NXDOMAIN.
+	const canonical = "https://api.gascity.com"
+	for _, tc := range []struct {
+		name string
+		path string
+		call func(config.Config, *dpop.Key) (Session, error)
+	}{
+		{
+			name: "login",
+			path: "/sts/v0/login",
+			call: func(cfg config.Config, key *dpop.Key) (Session, error) {
+				return Login(cfg, "ID.TOK.EN", "org_a", key)
+			},
+		},
+		{
+			name: "machine",
+			path: "/sts/v0/machine",
+			call: func(cfg config.Config, key *dpop.Key) (Session, error) {
+				return Machine(cfg, "service-key", key)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, legacy := newStub(t)
+			dnsFailingPostForm(t, canonical)
+			var events []Event
+			cfg := config.Config{
+				STSCanonical: canonical,
+				STSBase:      legacy.srv.URL,
+				STSTelemetry: func(op, origin, outcome, reason string) {
+					events = append(events, Event{op, origin, outcome, reason})
+				},
+			}
+			key, err := dpop.NewKey()
+			if err != nil {
+				t.Fatal(err)
+			}
+			sess, err := tc.call(cfg, key)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if sess.SessionToken != "SESS" || sess.Origin != legacy.srv.URL {
+				t.Fatalf("session = %+v, want SESS at %q", sess, legacy.srv.URL)
+			}
+			got := legacy.reqs(tc.path)
+			if len(got) != 1 {
+				t.Fatalf("legacy %s request count = %d, want 1", tc.name, len(got))
+			}
+			// The proof must be re-signed for the fallback URL; a canonical htu would be
+			// rejected by the server that actually received it.
+			if htu := htuOf(t, got[0].headers.Get("DPoP")); htu != legacy.srv.URL+tc.path {
+				t.Errorf("DPoP htu = %q, want %q", htu, legacy.srv.URL+tc.path)
+			}
+			if len(events) != 1 || events[0].Operation != tc.name || events[0].Origin != "legacy" ||
+				events[0].Outcome != "fallback" || events[0].Reason != "success" {
+				t.Fatalf("telemetry = %+v", events)
+			}
+		})
+	}
+}
+
+func TestExchangeDoesNotCrossOriginOnDNSResolutionError(t *testing.T) {
+	// Exchange is session-bound, not merely state-changing: the session token is only valid at
+	// the origin that issued it, so an unresolvable origin is a hard failure with nothing to
+	// retry elsewhere.
+	const canonical = "https://api.gascity.com"
+	_, legacy := newStub(t)
+	dnsFailingPostForm(t, canonical)
+	var events []Event
+	cfg := config.Config{
+		STSCanonical: canonical,
+		STSBase:      legacy.srv.URL,
+		STSTelemetry: func(op, origin, outcome, reason string) {
+			events = append(events, Event{op, origin, outcome, reason})
+		},
+	}
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Exchange(cfg, "SESS", "manifold", "manifold:proxy", key); err == nil {
+		t.Fatal("Exchange unexpectedly succeeded")
+	}
+	if got := len(legacy.reqs("/sts/v0/token")); got != 0 {
+		t.Fatalf("legacy token request count = %d, want 0", got)
+	}
+	if len(events) != 1 || events[0].Operation != "token" || events[0].Origin != "canonical" ||
+		events[0].Outcome != "failure" || events[0].Reason != "network" {
+		t.Fatalf("telemetry = %+v", events)
 	}
 }
 

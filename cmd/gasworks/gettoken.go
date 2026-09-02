@@ -192,7 +192,8 @@ func mintEIA(
 		if errors.As(err, &he) && he.Status == 401 {
 			// A 401 is a definitive authentication rejection, not an uncertain transport
 			// outcome. Re-establish once with a fresh key and retry the exchange on the SAME
-			// pinned origin; Login/Exchange themselves never cross-origin retry.
+			// pinned origin — stsCfg is already narrowed to it, and Login/Exchange never
+			// replay an uncertain response at another host.
 			sessionToken, key, sessionOrigin, err = newSession(stsCfg, org, idToken, generation)
 			if err != nil {
 				return mintResult{}, err
