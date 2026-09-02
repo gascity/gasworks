@@ -40,6 +40,11 @@ MANIFOLD_TOKEN=$(gasworks getToken manifold) # capture for a tool
 
 gasworks credential-provider < request.json  # versioned noninteractive JSON protocol
 
+gasworks inspect               # what the SDK is holding: sessions, keys, EIA claims
+gasworks inspect --json        # the same, machine-readable
+gasworks rotate-key            # new DPoP key + re-enrollment at the STS
+gasworks rotate-key --org acme # rotate one org's session key
+
 gasworks whoami                # who you are + the orgs you can mint for
 gasworks logout                # revoke the refresh token + wipe local credentials
 gasworks version               # print the build version
@@ -48,8 +53,10 @@ gasworks version               # print the build version
 | Command | Description |
 |---|---|
 | `gasworks login [--device\|--browser] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--org` remembers a default org. |
-| `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
+| `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh] [--allow-file-keystore]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
 | `gasworks credential-provider` | Read a v1 credential request from stdin and emit one typed JSON response for automation. |
+| `gasworks inspect [--json]` | Decode what is cached locally — login, sessions and where their DPoP keys live, and each cached EIA's Auth Access v1 claims (`authn_class`, `auth_time`, `acr`, `amr`, `session_id`, delegation). Offline; prints claims, never credentials. |
+| `gasworks rotate-key [--org <id\|slug>] [--allow-file-keystore]` | Generate a fresh DPoP key and re-enroll at the STS, so the new session is jkt-pinned to the new key. Drops the cached EIAs minted from the superseded session. |
 | `gasworks whoami` | Print your subject/email and the orgs (with roles + products) you can mint for. |
 | `gasworks logout` | Revoke the refresh token at the IdP and wipe local credentials. |
 | `gasworks version` | Print the build version (`--version` also works). |
@@ -137,13 +144,43 @@ rather than a production counter. Events never include URLs, tokens, subjects, o
 
 ## Storage & security
 
-Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. The file holds the refresh token, the per-org session, and the session's DPoP key. A **stolen credentials file is co-located-key vulnerable** (DPoP binds the key, not the file) — keep it as private as an SSH key. `logout` revokes the refresh token at the IdP before clearing.
+Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. It does **not** hold the sessions' DPoP private keys: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key. `logout` revokes the refresh token at the IdP, purges every enrolled key, and then clears the file.
+
+### Credential custody: where the DPoP key lives
+
+The key that proves a session is held in an approved credential store, chosen from a closed per-platform registry (`gasworks.dev/keystore-registry/v1`). `gasworks inspect` prints the registry for the host you are on, with each store's exportability, backup, access-control and deletion semantics.
+
+| Store | Platform | Default |
+|---|---|---|
+| `keychain` — macOS login keychain (generic password, service `com.gascity.gasworks.dpop`) | macOS | selected automatically |
+| `file` — one `0600` PKCS#8 PEM per session under `<config dir>/dpop-keys/` (`0700`) | all | **opt-in only** |
+
+Selection prefers a *non-exportable* store — one whose key material cannot be read back out at all — over an exportable one, regardless of registry order. No store registered today is non-exportable; a Secure Enclave / TPM backend that signs inside the store would be, and would sort ahead of both of the above. Linux (Secret Service, TPM2/PKCS#11) and Windows (CNG, Credential Manager) are registry slots this build does not fill yet.
+
+**There is no silent fallback to a plaintext file.** On a host with no platform keystore — a Linux workstation, a CI runner, an agent sandbox — enrolment fails closed before the STS is contacted:
+
+```
+gasworks: keystore: no approved credential store is available (registry gasworks.dev/keystore-registry/v1: file registered but requires an explicit opt-in).
+The DPoP private key is never written to a plain file unless you ask for it: re-run with --allow-file-keystore, or set GASWORKS_ALLOW_FILE_KEYSTORE=1, to keep it in a 0600 file under /home/you/.config/gasworks.
+```
+
+Opt in with `--allow-file-keystore` on `getToken` / `rotate-key`, or `GASWORKS_ALLOW_FILE_KEYSTORE=1` for every command (including `credential-provider`, which takes no such flag). Reading back a key you already enrolled never needs the opt-in — the gate is on choosing where a *new* key goes.
+
+`gasworks rotate-key` generates a fresh key and re-enrolls at `/sts/v0/login`, so the new session is jkt-pinned to the new key and the cached EIAs minted from the superseded one are dropped. The superseded **session** stays valid at the STS until it expires: server-side revocation of the old session family is not available yet, and `rotate-key` says so.
+
+Headless automation does not persist a key at all: `credential-provider --service-principal-credential-file …` mints with an **ephemeral** DPoP key held only in memory, so the managed secret and a signing key are never on disk together.
+
+### Who refreshes
+
+The SDK does, at every layer, before expiry — a caller holds a credential and never writes a refresh loop. `gasworks inspect` prints the thresholds in force (`id_token` at 60s remaining, the STS session at 30s, the EIA at 15s). `--refresh` / `force_refresh` exist to *discard* a cached credential, not to drive renewal.
 
 ### Security limitations
 
 These are acknowledged, documented limitations of the current design — not bugs. They are listed so operators can reason about the trust model:
 
-- **Co-located-key / stolen credentials file.** The credentials file holds the DPoP private key next to the session it's bound to. DPoP binds the key to the request, *not* the file to a machine, so anyone who can read the file can mint EIAs until the session/refresh token expires. Protect it like an SSH private key (it's `0600` / user-only-ACL, but that's only as strong as the host). OS-keyring storage is a documented follow-up.
+- **Co-located key theft on the host.** DPoP protects against token-only exfiltration, not against an attacker who is already running as you. Splitting the key out of `credentials.json` means one stolen file is not enough, but a same-uid attacker can read both halves — and with the opt-in `file` store, both halves sit in the same config directory. Exclude `<config dir>/dpop-keys/` from dotfile sync and backups, and prefer a platform keystore where one exists.
+- **No store registered today is non-exportable.** The macOS keychain releases the key to this process once unlocked, and the `file` store is a plain PEM. Hardware-held keys that sign in-place (Secure Enclave, TPM) are a registry slot, not a shipped backend.
+- **Rotation does not revoke the old session.** `rotate-key` re-enrolls with a new key, but the superseded session remains usable at the STS until its own expiry (≤8h); there is no re-enrollment route that revokes the old session family yet.
 - **Recall forwarder default filter is a blocklist (not an allowlist).** See the forwarder section above: secret-bearing JSON under a provider root with an unanticipated name is forwarded unless `RECALL_FORWARDER_STRICT_ALLOWLIST=1` is set.
 - **Hardlinks inside a transcript dir.** A hardlink in a scanned directory pointing at a sensitive inode is read and forwarded if its content isn't PEM-shaped (the PEM sniff still catches key files). Exploiting this requires a same-uid local writer who can already read the target. A possible future guard is to drop in-scope files with `st_nlink > 1`; it is not implemented today.
 - **Env-token `/proc` exposure.** `RECALL_FORWARDER_TOKEN` (the dev-only env path) is visible in `/proc/<pid>/environ` to the same user. It is popped from the environment at start and flagged with a warning; the production path (`RECALL_FORWARDER_TOKEN_FILE`, mode `0600`, re-read each cycle) avoids this.
@@ -162,6 +199,7 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
 | `GASWORKS_LOOPBACK_PORT` | OS-assigned ephemeral port on `127.0.0.1` (set a numeric fixed-port override for tests/dev) |
 | `GASWORKS_CONFIG_DIR` | the platform config dir |
+| `GASWORKS_ALLOW_FILE_KEYSTORE` | unset (fail closed). Set to `1` to permit storing the DPoP private key as a `0600` PEM when the host has no platform keystore. |
 
 ### Forwarder (`gasworks-forwarder`)
 

@@ -22,6 +22,9 @@ func cmdLogout(cfg config.Config, argv []string) error {
 	if data.RefreshToken != "" {
 		oidc.Revoke(cfg, data.RefreshToken) // best-effort server-side revocation BEFORE clearing
 	}
+	// The DPoP keys live outside credentials.json, so clearing the file is not enough:
+	// purge every registered credential store so a sign-out leaves no key material behind.
+	purgeSessionKeys()
 	if err := store.Clear(); err != nil {
 		return die("could not clear credentials: %s", err)
 	}

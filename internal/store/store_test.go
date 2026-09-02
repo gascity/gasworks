@@ -22,7 +22,7 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 		RefreshToken:         "rt",
 		CredentialGeneration: "g1:00000000000000000000000000000001",
 		Sessions: map[string]Session{
-			"org_a": {SessionToken: "t", DPoPPEM: "...", ExpiresAt: 42},
+			"org_a": {SessionToken: "t", Key: KeyRef{Backend: "file", Handle: "dpop-abc"}, ExpiresAt: 42},
 		},
 		EIACache: map[string]EIACacheEntry{
 			"k": {EIA: "eia", ExpiresAt: 99},

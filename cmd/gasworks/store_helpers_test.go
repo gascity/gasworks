@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gascity/gasworks/internal/config"
+	"github.com/gascity/gasworks/internal/dpop"
+	"github.com/gascity/gasworks/internal/keystore"
 	"github.com/gascity/gasworks/internal/store"
 )
 
@@ -41,4 +44,32 @@ func loadStore(t *testing.T) *store.Data {
 	}
 	_ = d
 	return &fresh
+}
+
+// useFileKeystore points the credential stores at a fresh temp config dir and opts into the
+// plaintext-file backend. Every test that establishes a session needs it: on a host with no
+// platform keystore the SDK fails closed rather than write a key to a plain file.
+func useFileKeystore(t *testing.T) {
+	t.Helper()
+	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	t.Setenv(config.AllowFileKeystoreEnv, "1")
+}
+
+// enrollTestKey generates a DPoP key, enrolls it under handle, and returns the reference a
+// stored session would carry.
+func enrollTestKey(t *testing.T, handle string) store.KeyRef {
+	t.Helper()
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatalf("dpop.NewKey: %v", err)
+	}
+	backend, err := keystore.Select(keystoreRegistry(), true)
+	if err != nil {
+		t.Fatalf("keystore.Select: %v", err)
+	}
+	ref, err := enrollSessionKey(backend, handle, key)
+	if err != nil {
+		t.Fatalf("enrollSessionKey: %v", err)
+	}
+	return ref
 }

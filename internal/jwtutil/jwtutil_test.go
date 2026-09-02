@@ -94,3 +94,22 @@ func TestExpFromRealDecode(t *testing.T) {
 		t.Errorf("Exp = %d, want 1734000000", got)
 	}
 }
+
+// Int64 distinguishes "absent" from "zero": a claim like auth_time is only meaningful when it
+// was actually present on the wire.
+func TestInt64ReportsPresence(t *testing.T) {
+	tok := makeJWT(t, map[string]any{"auth_time": 1734000000, "acr": "silver"})
+	claims, err := DecodeClaims(tok)
+	if err != nil {
+		t.Fatalf("DecodeClaims: %v", err)
+	}
+	if got, ok := Int64(claims, "auth_time"); !ok || got != 1734000000 {
+		t.Errorf("Int64(auth_time) = (%d, %v), want (1734000000, true)", got, ok)
+	}
+	if got, ok := Int64(claims, "acr"); ok || got != 0 {
+		t.Errorf("Int64(acr) = (%d, %v), want (0, false) for a non-numeric claim", got, ok)
+	}
+	if got, ok := Int64(claims, "missing"); ok || got != 0 {
+		t.Errorf("Int64(missing) = (%d, %v), want (0, false)", got, ok)
+	}
+}

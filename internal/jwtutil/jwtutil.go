@@ -66,14 +66,21 @@ func Issuer(claims map[string]any) string {
 // Exp returns the `exp` claim as a Unix timestamp, or 0 if absent/non-numeric. JSON numbers
 // decode to float64, so a fractional exp truncates toward zero.
 func Exp(claims map[string]any) int64 {
-	switch v := claims["exp"].(type) {
+	v, _ := Int64(claims, "exp")
+	return v
+}
+
+// Int64 reads a numeric claim, reporting whether it was present and numeric. JSON numbers
+// decode to float64, so a fractional value truncates toward zero.
+func Int64(claims map[string]any, key string) (int64, bool) {
+	switch v := claims[key].(type) {
 	case float64:
-		return int64(v)
+		return int64(v), true
 	case int64:
-		return v
+		return v, true
 	case int:
-		return int64(v)
+		return int64(v), true
 	default:
-		return 0
+		return 0, false
 	}
 }

@@ -1,10 +1,11 @@
 // Package store is the credential store: $CONFIG/gasworks/credentials.json (0600),
 // atomic + cross-process locked.
 //
-// It holds the Keycloak refresh token, the per-org STS session + its DPoP key (PEM), and
-// an EIA cache. A stolen credentials file is co-located-key vulnerable (the token scheme's
-// acknowledged limit — DPoP binds the key, not the file); OS-keyring storage is a
-// documented follow-up.
+// It holds the Keycloak refresh token, the per-org STS session, and an EIA cache. It does
+// NOT hold the session's DPoP private key: Auth Access v1 credential custody requires the
+// opaque session and the key it is bound to never to be stored together, so a Session
+// carries only a KeyRef naming the credential store (internal/keystore) that holds the key.
+// A stolen credentials file therefore yields no signing key.
 //
 // A missing or corrupt-JSON file degrades to "logged out" (empty Data), never a crash. An
 // unreadable-but-present file (a transient IO/perms error) returns a real error instead, so
@@ -19,10 +20,26 @@ import (
 	"runtime"
 )
 
-// Session is a per-org STS session plus the DPoP key (PEM) it is jkt-pinned to.
+// KeyRef locates the DPoP private key a session is jkt-pinned to: the registry id of the
+// credential store holding it, plus that store's handle. It is a pointer to a secret, never
+// the secret.
+type KeyRef struct {
+	Backend string `json:"backend"`
+	Handle  string `json:"handle"`
+}
+
+// Enrolled reports whether the reference names a key at all.
+func (r KeyRef) Enrolled() bool { return r.Backend != "" && r.Handle != "" }
+
+// Session is a per-org STS session and a reference to the DPoP key it is jkt-pinned to.
+//
+// Sessions written before split credential storage carried the key inline as a "dpop_pem"
+// field. That field is deliberately absent from this struct: an old document decodes into a
+// Session with no KeyRef (unusable, so the CLI re-establishes the session) and the next Save
+// writes the document back WITHOUT the PEM, which erases the co-located key from disk.
 type Session struct {
 	SessionToken string `json:"session_token"`
-	DPoPPEM      string `json:"dpop_pem"`
+	Key          KeyRef `json:"key"`
 	ExpiresAt    int64  `json:"expires_at"`
 }
 
