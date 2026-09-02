@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -84,8 +83,8 @@ func TestGetTokenAcceptsTheKeystoreOptInFlag(t *testing.T) {
 }
 
 // A credentials.json written before split storage carries the key inline. It is not reused,
-// and the next write erases it from disk.
-func TestPreSplitStorageSessionIsDroppedAndItsKeyErased(t *testing.T) {
+// and the session that replaces it takes that key off disk.
+func TestPreSplitStorageSessionIsReplacedAndItsKeyErased(t *testing.T) {
 	srv := newStub(t)
 	seed(t, srv, nil)
 	legacy := map[string]any{
@@ -134,7 +133,7 @@ func TestLogoutPurgesEnrolledKeys(t *testing.T) {
 	if _, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) }); code != 0 {
 		t.Fatalf("getToken exit=%d stderr=%q", code, errOut)
 	}
-	keyDir := filepath.Join(store.ConfigDir(), "dpop-keys")
+	keyDir := store.KeyDir()
 	if entries, err := os.ReadDir(keyDir); err != nil || len(entries) == 0 {
 		t.Fatalf("no key was enrolled before logout (%d entries, err %v)", len(entries), err)
 	}
@@ -176,5 +175,63 @@ func TestSDKReMintsAnExpiringCachedEIAWithoutBeingAsked(t *testing.T) {
 	}
 	if mints := len(srv.reqs("/sts/v0/token")); mints != 2 {
 		t.Fatalf("made %d mints, want the expiring credential re-minted by the SDK", mints)
+	}
+}
+
+// bd-enterprise vendors this credential store and shares credentials.json with us, writing
+// its own sessions (with the key inline) under its own STS authority. Establishing a session
+// must replace OUR entry and leave everything else exactly as it was found — dropping every
+// key-less session would sign every bd user out on each gasworks command.
+func TestEstablishingASessionLeavesForeignSessionsAlone(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, nil)
+	foreignKey := sessionCacheKey("https://works.gascity.com", "org_a", testCredentialGenerationA)
+	writeCreds(t, map[string]any{
+		"refresh_token":         "RT",
+		"id_token":              validIDToken(),
+		"credential_generation": testCredentialGenerationA,
+		"sessions": map[string]any{
+			foreignKey: map[string]any{
+				"session_token": "BD-SESSION",
+				"dpop_pem":      "-----BEGIN PRIVATE KEY-----\nbd\n-----END PRIVATE KEY-----\n",
+				"expires_at":    1 << 40,
+			},
+		},
+	})
+
+	if _, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) }); code != 0 {
+		t.Fatalf("getToken exit=%d stderr=%q", code, errOut)
+	}
+
+	data := loadStore(t)
+	if len(data.Sessions) != 2 {
+		t.Fatalf("stored %d sessions, want the foreign one plus ours", len(data.Sessions))
+	}
+	foreign, ok := data.Sessions[foreignKey]
+	if !ok {
+		t.Fatal("the foreign session was deleted by our write")
+	}
+	if foreign.SessionToken != "BD-SESSION" || !strings.Contains(foreign.InlineKeyPEM, "BEGIN PRIVATE KEY") {
+		t.Fatalf("the foreign session was rewritten: %+v", foreign)
+	}
+}
+
+// A fresh login invalidates every session, so the private keys they were pinned to must go
+// too — otherwise each login leaves another live key on the host.
+func TestInvalidatingSessionsDeletesTheirKeys(t *testing.T) {
+	useFileKeystore(t)
+	ref := enrollTestKey(t, "dpop-invalidated")
+	data := &store.Data{
+		Sessions: map[string]store.Session{"k": {SessionToken: "s", Key: ref, ExpiresAt: 1 << 40}},
+		EIACache: map[string]store.EIACacheEntry{"e": {EIA: "eia", ExpiresAt: 1 << 40}},
+	}
+
+	forgetSessionKeys(dropSessions(data))
+
+	if data.Sessions != nil || data.EIACache != nil {
+		t.Fatalf("dropSessions left state behind: %+v", data)
+	}
+	if _, err := loadSessionKey(ref); err == nil {
+		t.Fatal("the key of an invalidated session is still readable")
 	}
 }

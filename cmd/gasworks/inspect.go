@@ -63,7 +63,6 @@ type keystoreReport struct {
 	ID            string `json:"id"`
 	Summary       string `json:"summary"`
 	Status        string `json:"status"`
-	NonExportable bool   `json:"non_exportable"`
 	Exportability string `json:"exportability"`
 	Backup        string `json:"backup"`
 	AccessControl string `json:"access_control"`
@@ -112,6 +111,11 @@ type cachedEIAReport struct {
 // off the (unverified) payload. Claim names follow the EIA wire contract; acr/amr are
 // included because a step-up-aware caller wants to see what the login leg asserted, and are
 // simply absent when the assertion does not carry them.
+//
+// These names duplicate the gascity/eia Claims contract (acr/amr/auth_time landed there in
+// v0.10.0) and must be kept in step with it. The module is not imported: it exposes only
+// Verify/VerifyClaims, which need the edge JWKS and an audience, and `inspect` is an offline
+// decode of what is already cached.
 type eiaClaims struct {
 	Issuer         string   `json:"iss,omitempty"`
 	Subject        string   `json:"sub,omitempty"`
@@ -158,7 +162,6 @@ func inspectReport(cfg config.Config, data *store.Data, instant int64) inspectio
 			ID:            d.ID,
 			Summary:       d.Summary,
 			Status:        keystore.Status(backend, cfg.AllowFileKeystore),
-			NonExportable: d.NonExportable,
 			Exportability: d.Exportability,
 			Backup:        d.Backup,
 			AccessControl: d.AccessControl,

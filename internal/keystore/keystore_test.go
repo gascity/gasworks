@@ -9,14 +9,13 @@ import (
 // fakeBackend is a registry entry under test. It records nothing beyond what the selection
 // rules read, so the tests exercise the policy and not a store implementation.
 type fakeBackend struct {
-	id            string
-	available     bool
-	nonExportable bool
-	optIn         bool
+	id        string
+	available bool
+	optIn     bool
 }
 
 func (f fakeBackend) Descriptor() Descriptor {
-	return Descriptor{ID: f.id, NonExportable: f.nonExportable, RequiresOptIn: f.optIn}
+	return Descriptor{ID: f.id, RequiresOptIn: f.optIn}
 }
 func (f fakeBackend) Available() bool            { return f.available }
 func (f fakeBackend) Put(string, string) error   { return nil }
@@ -24,23 +23,23 @@ func (f fakeBackend) Get(string) (string, error) { return "", ErrNotFound }
 func (f fakeBackend) Delete(string) error        { return nil }
 func (f fakeBackend) Purge() error               { return nil }
 
-func TestSelectPrefersANonExportableStoreOverRegistryOrder(t *testing.T) {
+func TestSelectTakesTheFirstEligibleStoreInRegistryOrder(t *testing.T) {
 	registry := []Backend{
-		fakeBackend{id: "exportable", available: true},
-		fakeBackend{id: "hardware", available: true, nonExportable: true},
+		fakeBackend{id: "keychain", available: true},
+		fakeBackend{id: FileBackendID, available: true},
 	}
 	backend, err := Select(registry, false)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
-	if got := backend.Descriptor().ID; got != "hardware" {
-		t.Fatalf("selected %q, want the non-exportable store even though it is listed second", got)
+	if got := backend.Descriptor().ID; got != "keychain" {
+		t.Fatalf("selected %q, want the platform keystore that is listed first", got)
 	}
 }
 
 func TestSelectSkipsUnavailableStores(t *testing.T) {
 	registry := []Backend{
-		fakeBackend{id: "keychain", nonExportable: true},
+		fakeBackend{id: "keychain"},
 		fakeBackend{id: "wincred", available: true},
 	}
 	backend, err := Select(registry, false)
@@ -133,7 +132,7 @@ func TestStatusExplainsWhyABackendIsOrIsNotEligible(t *testing.T) {
 // Every registered backend must document the four custody properties Auth Access v1 requires
 // before a store may hold a key. This is the registry's entry ticket, enforced as a test.
 func TestRegisteredBackendsDocumentTheirCustodyProperties(t *testing.T) {
-	for _, backend := range Registry(t.TempDir()) {
+	for _, backend := range Registry(t.TempDir(), t.TempDir()) {
 		d := backend.Descriptor()
 		for label, value := range map[string]string{
 			"ID":            d.ID,
@@ -150,19 +149,32 @@ func TestRegisteredBackendsDocumentTheirCustodyProperties(t *testing.T) {
 	}
 }
 
-// The file backend is registered on every platform and must never be selectable by default.
-func TestTheFileBackendIsAlwaysOptIn(t *testing.T) {
-	registry := Registry(t.TempDir())
-	found := false
+// The file backend is registered on every platform, and it is opt-in exactly where this
+// build has a platform keystore to prefer over it.
+func TestTheFileBackendIsOptInWhereAPlatformKeystoreExists(t *testing.T) {
+	registry := Registry(t.TempDir(), t.TempDir())
+	var file Backend
+	platform := 0
 	for _, backend := range registry {
 		if backend.Descriptor().ID == FileBackendID {
-			found = true
-			if !backend.Descriptor().RequiresOptIn {
-				t.Error("the plaintext-file backend is selectable without an opt-in")
-			}
+			file = backend
+			continue
 		}
+		platform++
 	}
-	if !found {
+	if file == nil {
 		t.Fatal("the per-platform registry has no file backend")
+	}
+	if got, want := file.Descriptor().RequiresOptIn, platform > 0; got != want {
+		t.Errorf("file backend RequiresOptIn = %v with %d platform keystore(s) registered, want %v",
+			got, platform, want)
+	}
+}
+
+// The file backend is last: a platform keystore is always preferred over a plain file.
+func TestTheFileBackendIsRegisteredLast(t *testing.T) {
+	registry := Registry(t.TempDir(), t.TempDir())
+	if last := registry[len(registry)-1].Descriptor().ID; last != FileBackendID {
+		t.Fatalf("last registry entry is %q, want the file backend", last)
 	}
 }

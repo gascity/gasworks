@@ -2,16 +2,20 @@
 // a DPoP private key in.
 //
 // Auth Access v1 ("Client credential custody") requires the DPoP private key to live in an
-// approved per-platform store, SEPARATE from the opaque STS session it is bound to, and
-// forbids a silent fallback to a plaintext dotfile: when no approved store is available the
-// SDK fails closed with an actionable enrollment error. A plain 0600 file IS a registered
-// backend — but it is opt-in, so nothing lands there unless the operator asked for it.
+// approved per-platform store, SEPARATE from the opaque STS session it is bound to. When no
+// eligible store is available the SDK fails closed with an actionable enrollment error
+// rather than inventing a place to put the key.
+//
+// A plain 0600 file is a registered backend. On a platform this build has a real keystore
+// backend for (macOS today) it is opt-in only, so a key never lands in a file while a
+// keychain is available. On a platform with no backend yet (Linux, Windows) it is the only
+// store there is, and refusing to use it would leave the CLI unable to establish a session
+// at all — so it is selected by default there, and the enrolment says so on stderr. That
+// default reverts to opt-in for a platform as soon as this build has a keystore for it.
 //
 // Every backend documents its exportability, backup behaviour, access control and deletion
 // semantics in its Descriptor; that documentation is the entry ticket to the registry.
-// Select prefers a NON-EXPORTABLE backend (one whose key material cannot be read back out
-// at all). None of the backends registered today is non-exportable — a Secure Enclave / TPM
-// backend that signs inside the store would be, and would sort ahead of these when added.
+// Registry order is the preference order: Select takes the first eligible entry.
 package keystore
 
 import (
@@ -38,11 +42,9 @@ type Descriptor struct {
 	ID string
 	// Summary is a one-line human description ("macOS login keychain").
 	Summary string
-	// NonExportable reports that key material cannot be read back out of the store at
-	// all (the store signs internally). Select prefers these.
-	NonExportable bool
 	// RequiresOptIn marks a backend that must be asked for explicitly. It exists so the
-	// plaintext-file backend can be registered without ever being chosen silently.
+	// plaintext-file backend is never chosen silently on a platform that has a real
+	// keystore backend in this build.
 	RequiresOptIn bool
 
 	Exportability string
@@ -86,21 +88,13 @@ func ValidHandle(h string) bool {
 	return true
 }
 
-// Select returns the backend a NEW key must be enrolled in: the first available backend,
-// non-exportable stores first, skipping opt-in stores unless allowOptIn is set. When nothing
-// is eligible it fails closed with an error naming every registry entry and why it was
-// skipped — the caller adds the product-specific "here is how to opt in" advice.
+// Select returns the backend a NEW key must be enrolled in: the first available backend in
+// registry order, skipping opt-in stores unless allowOptIn is set. When nothing is eligible
+// it fails closed with an error naming every registry entry and why it was skipped — the
+// caller adds the product-specific "here is how to opt in" advice.
 func Select(backends []Backend, allowOptIn bool) (Backend, error) {
-	eligible := func(b Backend) bool {
-		return b.Available() && (allowOptIn || !b.Descriptor().RequiresOptIn)
-	}
 	for _, b := range backends {
-		if b.Descriptor().NonExportable && eligible(b) {
-			return b, nil
-		}
-	}
-	for _, b := range backends {
-		if eligible(b) {
+		if b.Available() && (allowOptIn || !b.Descriptor().RequiresOptIn) {
 			return b, nil
 		}
 	}

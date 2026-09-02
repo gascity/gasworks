@@ -11,37 +11,49 @@ import (
 // FileBackendID is the registry id of the plaintext-file backend.
 const FileBackendID = "file"
 
-// keyDirName is the subdirectory of the config dir the file backend owns. It is deliberately
-// NOT credentials.json: Auth Access v1 requires the opaque session and the private key it is
-// bound to never to be stored together, so a stolen credentials file carries no key and a
-// stolen key file carries no session.
-const keyDirName = "dpop-keys"
-
-// File stores each key as its own 0600 PKCS#8 PEM file inside a 0700 directory. One file per
-// handle means enrolment is a plain atomic create — no read-modify-write, so two concurrent
-// `gasworks getToken` runs cannot lose each other's key and no lock is needed.
+// File stores each key as its own PKCS#8 PEM file (0600 on POSIX, a user-only ACL on
+// Windows) inside a 0700 directory that is NOT the one holding credentials.json: Auth Access
+// v1 requires the opaque session and the private key it is bound to never to be stored
+// together, so a stolen credentials file carries no key and a stolen key file carries no
+// session. One file per handle means enrolment is a plain atomic create — no
+// read-modify-write, so two concurrent `gasworks getToken` runs cannot lose each other's key
+// and no lock is needed.
 //
-// It is registered on every platform and ALWAYS requires an explicit opt-in: this is the
-// plaintext dotfile the custody clause forbids falling back to silently.
-type File struct{ dir string }
+// Whether it must be asked for explicitly is the registry's call, not this type's: see the
+// package doc.
+type File struct {
+	dir   string
+	optIn bool
+}
 
-// NewFile returns the file backend rooted at the gasworks config dir.
-func NewFile(configDir string) *File { return &File{dir: filepath.Join(configDir, keyDirName)} }
+// NewFile returns the file backend rooted at dir. requireOptIn marks it "ask first", which
+// the registry sets on platforms where this build has a real keystore backend.
+func NewFile(dir string, requireOptIn bool) *File {
+	return &File{dir: dir, optIn: requireOptIn}
+}
 
 func (f *File) Descriptor() Descriptor {
+	summary := "plaintext PKCS#8 PEM files in " + f.dir
+	if f.optIn {
+		summary += " (opt-in)"
+	}
+	access := "0600 file in a 0700 directory; the OS never prompts and never re-locks"
+	if runtime.GOOS == "windows" {
+		access = "user-only ACL (icacls /inheritance:r) on the key file and its directory; " +
+			"NTFS ignores the POSIX bits, so the mode is not re-checked on read"
+	}
 	return Descriptor{
 		ID:            FileBackendID,
-		Summary:       "plaintext PKCS#8 PEM under the gasworks config dir (opt-in)",
-		NonExportable: false,
-		RequiresOptIn: true,
+		Summary:       summary,
+		RequiresOptIn: f.optIn,
 		Exportability: "fully exportable: the PEM is readable by the owning user and by root",
-		Backup:        "copied by anything that backs up the config dir (dotfile sync, disk image) — exclude " + keyDirName + "/",
-		AccessControl: "0600 file in a 0700 directory; the OS never prompts and never re-locks",
+		Backup:        "copied by anything that backs up " + f.dir + " — exclude it from dotfile sync and backups",
+		AccessControl: access,
 		Deletion:      "unlink on rotation and `gasworks logout`; no secure erase on a copy-on-write filesystem",
 	}
 }
 
-// Available reports true on every platform: the config dir is created on demand.
+// Available reports true on every platform: the key directory is created on demand.
 func (f *File) Available() bool { return true }
 
 func (f *File) Put(handle, pem string) error {
@@ -55,6 +67,9 @@ func (f *File) Put(handle, pem string) error {
 	if runtime.GOOS != "windows" {
 		// MkdirAll honours umask; re-assert 0700 like the credential store does.
 		_ = os.Chmod(f.dir, 0o700)
+	} else {
+		// NTFS ignores the POSIX mode, so the directory would inherit the parent's ACL.
+		lockdownPath(f.dir)
 	}
 	tmp, err := os.CreateTemp(f.dir, ".key-*.tmp")
 	if err != nil {
@@ -81,6 +96,11 @@ func (f *File) Put(handle, pem string) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("keystore: install key file: %w", err)
+	}
+	if runtime.GOOS == "windows" {
+		// Same trade as the credential store's Save: on Windows the chmod above is a
+		// no-op, so re-apply a user-only ACL to the key itself.
+		lockdownPath(path)
 	}
 	return nil
 }

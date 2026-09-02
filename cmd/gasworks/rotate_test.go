@@ -72,7 +72,7 @@ func TestRotateKeyReEnrollsWithAFreshKey(t *testing.T) {
 	if !strings.Contains(out, afterKey.Thumbprint()) {
 		t.Errorf("rotate-key did not report the new jkt:\n%s", out)
 	}
-	if !strings.Contains(errOut, "superseded session stays valid") {
+	if !strings.Contains(errOut, "superseded session and its key stay valid") {
 		t.Errorf("rotate-key did not warn that the old session is not revoked: %q", errOut)
 	}
 	// The rotated key stays out of the credentials file like any other.

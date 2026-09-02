@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/store"
 )
 
@@ -1256,5 +1257,36 @@ func TestCredentialProviderMigratesLegacyLoginGeneration(t *testing.T) {
 	}
 	if _, exists := persisted.EIACache["legacy"]; exists {
 		t.Fatal("legacy cache survived generation migration")
+	}
+}
+
+// The v1 protocol is the only non-interactive entry point and takes no flags, so a host with
+// nowhere to keep the DPoP key must be told what to set. The generic interaction_required
+// message ("run gasworks login") would send an unattended caller down a dead end.
+func TestCredentialProviderNamesTheKeystoreOptInWhenEnrolmentFailsClosed(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+	t.Setenv(config.AllowFileKeystoreEnv, "0")
+
+	request := `{
+		"version":"gascity.dev/credential-provider/v1",
+		"audience":"manifold",
+		"required_scopes":["manifold:proxy"]
+	}`
+	response, errOut, code := runCredentialProvider(t, request)
+	if code == 0 {
+		t.Fatalf("provider succeeded without a credential store (stderr %q)", errOut)
+	}
+	if response.Kind != "Error" || response.Code != credentialErrorInteraction {
+		t.Fatalf("response = %+v, want an interaction_required error", response)
+	}
+	if !strings.Contains(response.Message, config.AllowFileKeystoreEnv) {
+		t.Errorf("message %q does not name %s", response.Message, config.AllowFileKeystoreEnv)
+	}
+	if strings.Contains(response.Message, "gasworks login") {
+		t.Errorf("message %q sends an unattended caller to a login that cannot fix this", response.Message)
+	}
+	if logins := len(srv.reqs("/sts/v0/login")); logins != 0 {
+		t.Fatalf("established %d sessions while failing closed, want 0", logins)
 	}
 }

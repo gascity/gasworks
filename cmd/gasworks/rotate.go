@@ -11,14 +11,18 @@ import (
 	"github.com/gascity/gasworks/internal/sts"
 )
 
-// cmdRotateKey replaces an org's DPoP private key and re-enrolls at the STS.
+// cmdRotateKey replaces an org's DPoP private key with a fresh one and establishes a new
+// session pinned to it.
 //
-// Rotation is a fresh key plus a fresh /sts/v0/login: the new session is jkt-pinned to the
-// new key, so nothing minted afterwards can be proved with the old one. The order matters —
-// the credential store is chosen first (so an unenrollable host fails before touching the
-// STS), the new session is established next, and only once it exists is the stored key
-// replaced. A crash between those steps leaves a session token that no longer matches its
-// key, which the next getToken repairs by re-establishing the session on a 401.
+// It is NOT a remedy for a suspected key compromise: the STS has no route that revokes the
+// session family the old key proved, so the superseded session stays mintable until it
+// expires (up to 8h). Until that route exists this command is scheduled hygiene — it limits
+// how long ONE key is in use — and it says so on stderr every time.
+//
+// The order matters: the credential store is chosen first (so an unenrollable host fails
+// before touching the STS), the new session is established next, and only once it exists is
+// the stored key replaced. A crash between those steps leaves a session token that no longer
+// matches its key, which the next getToken repairs by re-establishing the session on a 401.
 func cmdRotateKey(cfg config.Config, argv []string) error {
 	fs := flag.NewFlagSet("rotate-key", flag.ContinueOnError)
 	fs.SetOutput(stderrWriter())
@@ -82,10 +86,7 @@ func cmdRotateKey(cfg config.Config, argv []string) error {
 
 	cacheKey := sessionCacheKey(origin, org, credential.Generation)
 	previous := data.Sessions[cacheKey]
-	ref, err := enrollSessionKey(backend, sessionKeyHandle(cacheKey), key)
-	if err != nil {
-		return err
-	}
+	var ref store.KeyRef
 	if err := store.Update(func(d *store.Data) error {
 		if d.CredentialGeneration != credential.Generation {
 			return errCredentialGenerationChanged
@@ -93,7 +94,13 @@ func cmdRotateKey(cfg config.Config, argv []string) error {
 		if d.Sessions == nil {
 			d.Sessions = map[string]store.Session{}
 		}
-		dropUnenrolledSessions(d.Sessions)
+		// Enrol under the store lock so a concurrent getToken cannot bind its session to
+		// this key (the handle is shared per session) or the other way round.
+		enrolled, keyErr := enrollSessionKey(backend, sessionKeyHandle(cacheKey), key)
+		if keyErr != nil {
+			return keyErr
+		}
+		ref = enrolled
 		d.Sessions[cacheKey] = store.Session{
 			SessionToken: session.SessionToken,
 			Key:          ref,
@@ -111,6 +118,10 @@ func cmdRotateKey(cfg config.Config, argv []string) error {
 		if errors.Is(err, errCredentialGenerationChanged) {
 			return credentialChangedError()
 		}
+		var commandErr *cmdError
+		if errors.As(err, &commandErr) {
+			return commandErr
+		}
 		return die("could not save the rotated session: %s", err)
 	}
 	// The handle is stable per session, so the replacement above already overwrote the old
@@ -122,10 +133,11 @@ func cmdRotateKey(cfg config.Config, argv []string) error {
 	stdoutf("Rotated the DPoP key for org %s at %s.", org, origin)
 	stdoutf("  keystore: %s (handle %s)", ref.Backend, ref.Handle)
 	stdoutf("  jkt:      %s", key.Thumbprint())
-	stdoutf("  session:  re-enrolled, expires %s", utcRFC3339(now()+int64(expiresIn)))
+	stdoutf("  session:  new, expires %s", utcRFC3339(now()+int64(expiresIn)))
 	if previous.SessionToken != "" {
-		eprintf("note: the superseded session stays valid at the STS until it expires — " +
-			"server-side revocation of the old session family is not available yet")
+		eprintf("note: the superseded session and its key stay valid at the STS until they expire — " +
+			"there is no route yet that revokes the old session family, so this does not " +
+			"contain a compromised key")
 	}
 	return nil
 }

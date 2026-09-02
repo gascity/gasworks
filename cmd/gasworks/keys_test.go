@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -33,7 +34,7 @@ func TestSessionKeyHandleIsStablePerSessionAndSafeToUse(t *testing.T) {
 }
 
 func TestEnrollmentKeystoreFailsClosedWithActionableAdvice(t *testing.T) {
-	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	useFileKeystore(t)
 	_, err := enrollmentKeystore(config.Config{AllowFileKeystore: false})
 	if err == nil {
 		t.Fatal("enrollmentKeystore selected a store without an opt-in")
@@ -48,6 +49,41 @@ func TestEnrollmentKeystoreFailsClosedWithActionableAdvice(t *testing.T) {
 	commandErr, ok := err.(*cmdError)
 	if !ok || commandErr.credentialErrCode != credentialErrorInteraction {
 		t.Fatalf("error = %#v, want an interaction_required credential error", err)
+	}
+	// The credential-provider protocol replaces the free-text error with one fixed sentence
+	// per code, and "run gasworks login" is the wrong advice here, so the failure carries
+	// its own machine-facing message.
+	if !strings.Contains(commandErr.credentialErrHint, config.AllowFileKeystoreEnv) {
+		t.Errorf("credential hint %q does not name %s", commandErr.credentialErrHint, config.AllowFileKeystoreEnv)
+	}
+}
+
+// On a platform this build has no keystore backend for, the file store is selected without
+// an opt-in — refusing would leave every non-interactive caller unable to mint — and the
+// enrolment says on stderr that a private key just landed in a file.
+func TestEnrollmentUsesTheFileStoreByDefaultWhereThereIsNoPlatformKeystore(t *testing.T) {
+	useFileKeystore(t)
+	keyDir := store.KeyDir()
+	useKeystore(t, keystore.NewFile(keyDir, false))
+
+	_, errOut, code := capture(t, func() int {
+		backend, err := enrollmentKeystore(config.Config{AllowFileKeystore: false})
+		if err != nil {
+			t.Errorf("enrollmentKeystore: %v", err)
+			return 1
+		}
+		if backend.Descriptor().ID != keystore.FileBackendID {
+			t.Errorf("selected %q, want the file store", backend.Descriptor().ID)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("enrolment failed (exit %d)", code)
+	}
+	for _, want := range []string{"no OS keystore backend", keyDir} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("stderr %q does not mention %q", errOut, want)
+		}
 	}
 }
 
@@ -80,3 +116,34 @@ func TestLoadSessionKeyRejectsAnUnenrolledReference(t *testing.T) {
 		t.Fatal("loadSessionKey accepted a backend that is not in the registry")
 	}
 }
+
+// The key is enrolled inside the locked store write, so a store that cannot hold it leaves
+// no session behind pointing at a key that does not exist.
+func TestAFailedEnrolmentPersistsNoSession(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT", "id_token": validIDToken()})
+	useKeystore(t, refusingKeystore{})
+
+	_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+	if code == 0 {
+		t.Fatal("getToken succeeded although the credential store refused the key")
+	}
+	if !strings.Contains(errOut, "could not store the session key") {
+		t.Errorf("stderr = %q, want the enrolment failure", errOut)
+	}
+	if sessions := loadStore(t).Sessions; len(sessions) != 0 {
+		t.Fatalf("persisted %d sessions for a key that was never stored", len(sessions))
+	}
+}
+
+// refusingKeystore is available and eligible but cannot hold a key.
+type refusingKeystore struct{}
+
+func (refusingKeystore) Descriptor() keystore.Descriptor {
+	return keystore.Descriptor{ID: "refusing", Summary: "a store that refuses every key"}
+}
+func (refusingKeystore) Available() bool            { return true }
+func (refusingKeystore) Put(string, string) error   { return errors.New("read-only store") }
+func (refusingKeystore) Get(string) (string, error) { return "", keystore.ErrNotFound }
+func (refusingKeystore) Delete(string) error        { return nil }
+func (refusingKeystore) Purge() error               { return nil }

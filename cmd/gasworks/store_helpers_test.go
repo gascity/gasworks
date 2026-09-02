@@ -46,13 +46,24 @@ func loadStore(t *testing.T) *store.Data {
 	return &fresh
 }
 
-// useFileKeystore points the credential stores at a fresh temp config dir and opts into the
-// plaintext-file backend. Every test that establishes a session needs it: on a host with no
-// platform keystore the SDK fails closed rather than write a key to a plain file.
+// useFileKeystore points the CLI at a fresh temp config dir, a fresh temp key dir, and a
+// scratch file keystore that must be opted into. Every test that establishes a session needs
+// it, on every platform: the real registry reaches the developer's macOS login keychain, and
+// a test may neither enrol a key there nor let `logout` purge items it did not create.
 func useFileKeystore(t *testing.T) {
 	t.Helper()
 	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	t.Setenv(store.KeyDirEnv, filepath.Join(t.TempDir(), "dpop-keys"))
 	t.Setenv(config.AllowFileKeystoreEnv, "1")
+	useKeystore(t, keystore.NewFile(store.KeyDir(), true))
+}
+
+// useKeystore substitutes the credential-store registry for the duration of the test.
+func useKeystore(t *testing.T, backends ...keystore.Backend) {
+	t.Helper()
+	previous := keystoreRegistry
+	keystoreRegistry = func() []keystore.Backend { return backends }
+	t.Cleanup(func() { keystoreRegistry = previous })
 }
 
 // enrollTestKey generates a DPoP key, enrolls it under handle, and returns the reference a

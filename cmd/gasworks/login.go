@@ -76,18 +76,21 @@ func cmdLogin(cfg config.Config, argv []string) error {
 		return die("could not create a login generation: %s", err)
 	}
 
+	var orphanedKeys []store.KeyRef
 	if err := store.Update(func(d *store.Data) error {
 		d.IDToken = idt
 		d.CredentialGeneration = generation
 		d.RefreshToken = tok.RefreshToken
 		d.DefaultOrg = *org
 		// A fresh login invalidates any prior STS sessions / cached EIAs.
-		d.Sessions = nil
-		d.EIACache = nil
+		orphanedKeys = dropSessions(d)
 		return nil
 	}); err != nil {
 		return die("could not save credentials: %s", err)
 	}
+	// Those sessions are off disk now, so nothing can reach their keys: delete them instead
+	// of accumulating one orphaned private key per login.
+	forgetSessionKeys(orphanedKeys)
 
 	who := claimString(claims, "email")
 	if who == "" {

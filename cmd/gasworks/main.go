@@ -87,9 +87,18 @@ type cmdError struct {
 	msg               string
 	code              int
 	credentialErrCode string
+	credentialErrHint string
 }
 
 func (e *cmdError) Error() string { return e.msg }
+
+// withCredentialHint attaches the message the credential-provider protocol should carry for
+// this error. That boundary otherwise reports one fixed sentence per code, which is the
+// wrong advice when the fix is a host configuration change rather than a login.
+func (e *cmdError) withCredentialHint(hint string) *cmdError {
+	e.credentialErrHint = hint
+	return e
+}
 
 // die builds a *cmdError with exit code 1, the only non-zero code the Python CLI uses for
 // command failures.

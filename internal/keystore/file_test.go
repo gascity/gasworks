@@ -12,7 +12,7 @@ import (
 const testPEM = "-----BEGIN PRIVATE KEY-----\nMIGH\n-----END PRIVATE KEY-----\n"
 
 func TestFileRoundTrip(t *testing.T) {
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -26,7 +26,7 @@ func TestFileRoundTrip(t *testing.T) {
 }
 
 func TestFilePutReplacesAnExistingKey(t *testing.T) {
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -47,14 +47,14 @@ func TestFilePutReplacesAnExistingKey(t *testing.T) {
 }
 
 func TestFileGetOnAMissingHandleIsErrNotFound(t *testing.T) {
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if _, err := backend.Get("dpop-missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get = %v, want ErrNotFound", err)
 	}
 }
 
 func TestFileDeleteIsIdempotent(t *testing.T) {
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestFileDeleteIsIdempotent(t *testing.T) {
 }
 
 func TestFilePurgeRemovesEveryKey(t *testing.T) {
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	for _, handle := range []string{"dpop-a", "dpop-b"} {
 		if err := backend.Put(handle, testPEM); err != nil {
 			t.Fatalf("Put %s: %v", handle, err)
@@ -90,7 +90,7 @@ func TestFilePurgeRemovesEveryKey(t *testing.T) {
 
 func TestFileRejectsAHostileHandle(t *testing.T) {
 	dir := t.TempDir()
-	backend := NewFile(dir)
+	backend := NewFile(dir, false)
 	for _, handle := range []string{"../escape", "dpop/abc", ""} {
 		if err := backend.Put(handle, testPEM); err == nil {
 			t.Errorf("Put(%q) was accepted", handle)
@@ -111,7 +111,7 @@ func TestFileKeysAre0600InA0700Dir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("NTFS ignores POSIX mode bits; the store relies on the config-dir ACL there")
 	}
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestFileRefusesAGroupReadableKey(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("NTFS ignores POSIX mode bits")
 	}
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestFileRefusesASymlinkedKey(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink creation needs elevation on Windows")
 	}
-	backend := NewFile(t.TempDir())
+	backend := NewFile(t.TempDir(), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -168,18 +168,24 @@ func TestFileRefusesASymlinkedKey(t *testing.T) {
 	}
 }
 
-// The key directory is a sibling of credentials.json, never a field inside it: Auth Access v1
-// forbids storing the opaque session and the key it is bound to together.
-func TestFileKeepsKeysOutOfTheCredentialsFile(t *testing.T) {
-	configDir := t.TempDir()
-	backend := NewFile(configDir)
+// A key never lands in the directory that holds credentials.json: Auth Access v1 forbids
+// storing the opaque session and the key it is bound to together. Where that directory is is
+// store.KeyDir's job; this asserts the backend stays inside the dir it was handed.
+func TestFileKeepsKeysOutOfTheCredentialsDir(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("mkdir config: %v", err)
+	}
+	backend := NewFile(filepath.Join(root, "keys"), false)
 	if err := backend.Put("dpop-a", testPEM); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if backend.Dir() == configDir {
-		t.Fatal("the key backend writes into the config dir root")
+	entries, err := os.ReadDir(configDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(configDir, "credentials.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("enrolling a key touched credentials.json (%v)", err)
+	if len(entries) != 0 {
+		t.Fatalf("enrolling a key wrote %d entries into the credentials dir", len(entries))
 	}
 }

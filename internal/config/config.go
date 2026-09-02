@@ -46,9 +46,11 @@ type Config struct {
 	ClientID     string
 	LoopbackPort int
 	// AllowFileKeystore opts the DPoP private key into the plaintext-file credential
-	// store. Auth Access v1 forbids falling back to a plain file silently, so the SDK
-	// fails closed unless this is set (GASWORKS_ALLOW_FILE_KEYSTORE, or the
-	// --allow-file-keystore flag on the commands that enrol a key).
+	// store (GASWORKS_ALLOW_FILE_KEYSTORE, or the --allow-file-keystore flag on the
+	// commands that enrol a key). Auth Access v1 forbids falling back to a plain file
+	// silently, so where this build has a platform keystore the SDK fails closed without
+	// it; where it has none (Linux, Windows) the file store is the only one there is and
+	// this only silences the notice. See internal/keystore.
 	AllowFileKeystore bool
 }
 

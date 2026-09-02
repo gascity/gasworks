@@ -325,24 +325,27 @@ func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCr
 	}
 
 	var credential humanCredentialSnapshot
+	var orphanedKeys []store.KeyRef
 	err = store.Update(func(d *store.Data) error {
 		// Re-check under the cross-process store lock. Another process may have refreshed and
 		// persisted a rotated refresh token after the optimistic read above.
 		if d.IDToken != "" && tokenExp(d.IDToken)-now() > idTokenSkewSecs {
-			generation, generationErr := ensureCredentialGeneration(d)
+			generation, orphaned, generationErr := ensureCredentialGeneration(d)
 			if generationErr != nil {
 				return generationErr
 			}
+			orphanedKeys = orphaned
 			credential = humanCredentialSnapshot{IDToken: d.IDToken, Generation: generation}
 			return nil
 		}
 		if d.RefreshToken == "" {
 			return dieCredential(credentialErrorInteraction, "not logged in — run `gasworks login`")
 		}
-		generation, generationErr := ensureCredentialGeneration(d)
+		generation, orphaned, generationErr := ensureCredentialGeneration(d)
 		if generationErr != nil {
 			return generationErr
 		}
+		orphanedKeys = orphaned
 
 		tok, refreshErr := oidc.Refresh(cfg, d.RefreshToken)
 		if refreshErr != nil {
@@ -365,6 +368,8 @@ func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCr
 		}
 		return humanCredentialSnapshot{}, die("could not persist refreshed token: %s", err)
 	}
+	// The write landed, so the sessions those keys belonged to are gone from disk.
+	forgetSessionKeys(orphanedKeys)
 	return credential, nil
 }
 
@@ -385,18 +390,34 @@ func validCredentialGeneration(generation string) bool {
 	return err == nil
 }
 
-func ensureCredentialGeneration(data *store.Data) (string, error) {
+// ensureCredentialGeneration stamps a generation on a document that has none. That fences
+// out every session written before it, so it also returns the DPoP keys those sessions held:
+// the caller deletes them once the write has landed, rather than leaving a private key on
+// the host for a session nothing can reach any more.
+func ensureCredentialGeneration(data *store.Data) (string, []store.KeyRef, error) {
 	if validCredentialGeneration(data.CredentialGeneration) {
-		return data.CredentialGeneration, nil
+		return data.CredentialGeneration, nil, nil
 	}
 	generation, err := newCredentialGeneration()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	data.CredentialGeneration = generation
+	return generation, dropSessions(data), nil
+}
+
+// dropSessions clears every stored session and the EIA cache minted from them, returning the
+// key references that are now unreachable.
+func dropSessions(data *store.Data) []store.KeyRef {
+	orphaned := make([]store.KeyRef, 0, len(data.Sessions))
+	for _, session := range data.Sessions {
+		if session.Key.Enrolled() {
+			orphaned = append(orphaned, session.Key)
+		}
+	}
 	data.Sessions = nil
 	data.EIACache = nil
-	return generation, nil
+	return orphaned
 }
 
 func credentialChangedError() *cmdError {
@@ -467,10 +488,7 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		origin = cfg.STSBase
 	}
 	cacheKey := sessionCacheKey(origin, org, generation)
-	ref, err := enrollSessionKey(backend, sessionKeyHandle(cacheKey), key)
-	if err != nil {
-		return "", nil, "", err
-	}
+	var ref store.KeyRef
 	if err := store.Update(func(d *store.Data) error {
 		if d.CredentialGeneration != generation {
 			return errCredentialGenerationChanged
@@ -478,7 +496,16 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		if d.Sessions == nil {
 			d.Sessions = map[string]store.Session{}
 		}
-		dropUnenrolledSessions(d.Sessions)
+		// Enrol INSIDE the locked read-modify-write. The handle is derived from the cache
+		// key, so two concurrent first-time getToken runs would otherwise race on the same
+		// handle and one could persist a session bound to the other's key. Replacing this
+		// entry is also what erases a pre-split-storage inline key: the entries this CLI
+		// did not write (bd-enterprise shares this document) are left alone.
+		enrolled, err := enrollSessionKey(backend, sessionKeyHandle(cacheKey), key)
+		if err != nil {
+			return err
+		}
+		ref = enrolled
 		d.Sessions[cacheKey] = store.Session{
 			SessionToken: sess.SessionToken,
 			Key:          ref,
@@ -491,20 +518,13 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		if errors.Is(err, errCredentialGenerationChanged) {
 			return "", nil, "", credentialChangedError()
 		}
+		var commandErr *cmdError
+		if errors.As(err, &commandErr) {
+			return "", nil, "", commandErr
+		}
 		return "", nil, "", die("could not save the session: %s", err)
 	}
 	return sess.SessionToken, key, origin, nil
-}
-
-// dropUnenrolledSessions deletes sessions with no credential-store reference. Those are the
-// documents written before split storage, which carried the DPoP key inline; they are
-// unusable now, and removing them takes the co-located key off disk with the next Save.
-func dropUnenrolledSessions(sessions map[string]store.Session) {
-	for key, session := range sessions {
-		if !session.Key.Enrolled() {
-			delete(sessions, key)
-		}
-	}
 }
 
 // ensureSession reuses the stored per-org session at the selected origin when it has >30s left

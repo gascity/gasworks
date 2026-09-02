@@ -75,7 +75,7 @@ jobs:
           # vendor mode automatically.
           "$(go env GOPATH)/bin/govulncheck" ./...
 
-  darwin-observer:
+  darwin-native:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -93,6 +93,12 @@ jobs:
           ./internal/observer/daemon
           ./cmd/gasworks-companion
           -count=1
+
+      # The macOS login keychain is the only platform credential store this build has, and
+      # /usr/bin/security is only here. The keychain tests run against a scratch keychain
+      # they create and delete, never the runner's login keychain.
+      - name: Exercise the macOS credential store
+        run: go test -mod=vendor ./internal/keystore ./cmd/gasworks -count=1
 
       - name: Build macOS Observer companion
         run: go build -mod=vendor -trimpath ./cmd/gasworks-companion

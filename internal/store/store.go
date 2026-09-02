@@ -2,10 +2,12 @@
 // atomic + cross-process locked.
 //
 // It holds the Keycloak refresh token, the per-org STS session, and an EIA cache. It does
-// NOT hold the session's DPoP private key: Auth Access v1 credential custody requires the
-// opaque session and the key it is bound to never to be stored together, so a Session
-// carries only a KeyRef naming the credential store (internal/keystore) that holds the key.
-// A stolen credentials file therefore yields no signing key.
+// NOT hold the DPoP private key of any session this CLI writes: Auth Access v1 credential
+// custody requires the opaque session and the key it is bound to never to be stored
+// together, so a Session carries only a KeyRef naming the credential store
+// (internal/keystore) that holds the key. A stolen credentials file therefore yields no
+// signing key of ours — entries written by an older CLI, or by another tool that shares this
+// document, are carried through untouched (see Session.InlineKeyPEM).
 //
 // A missing or corrupt-JSON file degrades to "logged out" (empty Data), never a crash. An
 // unreadable-but-present file (a transient IO/perms error) returns a real error instead, so
@@ -33,14 +35,18 @@ func (r KeyRef) Enrolled() bool { return r.Backend != "" && r.Handle != "" }
 
 // Session is a per-org STS session and a reference to the DPoP key it is jkt-pinned to.
 //
-// Sessions written before split credential storage carried the key inline as a "dpop_pem"
-// field. That field is deliberately absent from this struct: an old document decodes into a
-// Session with no KeyRef (unusable, so the CLI re-establishes the session) and the next Save
-// writes the document back WITHOUT the PEM, which erases the co-located key from disk.
+// Sessions written before split credential storage carry the key inline as "dpop_pem", and
+// so do the sessions of other tools that share this document — bd-enterprise vendors this
+// store and writes its key inline under its own cache key. The CLI never writes InlineKeyPEM
+// and never signs with it; it carries the field through a load/save cycle so that OUR write
+// does not silently strip SOMEONE ELSE'S credential. Replacing an entry (which is what
+// establishing a session does) drops the field, so the co-located key of the session being
+// replaced does leave the disk.
 type Session struct {
 	SessionToken string `json:"session_token"`
 	Key          KeyRef `json:"key"`
 	ExpiresAt    int64  `json:"expires_at"`
+	InlineKeyPEM string `json:"dpop_pem,omitempty"`
 }
 
 // EIACacheEntry is a cached Exchanged Identity Assertion with its expiry.
@@ -89,6 +95,48 @@ func ConfigDir() string {
 func CredsPath() string {
 	return filepath.Join(ConfigDir(), "credentials.json")
 }
+
+// KeyDirEnv overrides where the file credential store keeps DPoP private keys.
+const KeyDirEnv = "GASWORKS_KEY_DIR"
+
+// KeyDir resolves the directory the file credential store keeps DPoP private keys in:
+//
+//	$GASWORKS_KEY_DIR                                                (override, any platform)
+//	<config dir>/dpop-keys                                           when $GASWORKS_CONFIG_DIR pins a profile
+//	%LOCALAPPDATA%/gasworks/dpop-keys                                on Windows
+//	$XDG_STATE_HOME/gasworks/dpop-keys else ~/.local/state/gasworks/dpop-keys  elsewhere
+//
+// By default it is NOT under the config dir: Auth Access v1 requires the opaque session and
+// the key it is bound to never to be stored or backed up together, and the config dir is
+// what "sync my dotfiles" and "back up ~/.config" carry. A profile pinned with
+// GASWORKS_CONFIG_DIR (the canary runbook, a test) is meant to be self-contained and
+// disposable, so its keys stay inside it — set GASWORKS_KEY_DIR to split those too.
+func KeyDir() string {
+	if override := os.Getenv(KeyDirEnv); override != "" {
+		return override
+	}
+	if profile := os.Getenv("GASWORKS_CONFIG_DIR"); profile != "" {
+		return filepath.Join(profile, keyDirName)
+	}
+	if runtime.GOOS == "windows" {
+		// LocalAppData, not the roaming APPDATA the config dir uses: a roaming profile
+		// copies the key to every machine the user signs in to.
+		base := os.Getenv("LOCALAPPDATA")
+		if base == "" {
+			home, _ := os.UserHomeDir()
+			base = filepath.Join(home, "AppData", "Local")
+		}
+		return filepath.Join(base, "gasworks", keyDirName)
+	}
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "gasworks", keyDirName)
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "gasworks", keyDirName)
+}
+
+// keyDirName is the leaf directory the DPoP private keys live in.
+const keyDirName = "dpop-keys"
 
 func lockPath() string {
 	return filepath.Join(ConfigDir(), ".lock")
