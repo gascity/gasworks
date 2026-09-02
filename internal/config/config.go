@@ -21,9 +21,10 @@ const (
 type Config struct {
 	STSBase string
 	// STSCanonical is the preferred STS origin. STSBase remains the
-	// compatibility/legacy origin and is used as a fallback only for the
-	// non-provisioning (read-only) context discovery request. Provisioning
-	// context and all other state-changing STS requests are always single-origin.
+	// compatibility/legacy origin and is used as a fallback for the
+	// non-provisioning (read-only) context discovery request, and for a
+	// provisioning discovery request only when the canonical host's name does not
+	// resolve. All other STS requests are single-origin.
 	// An empty STSCanonical disables dual-origin behavior.
 	STSCanonical string
 	// STSTelemetry receives fixed-label events from the STS client. It must not

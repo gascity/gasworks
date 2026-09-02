@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -349,6 +350,8 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 		reason  string
 	}{
 		{name: "404", status: http.StatusNotFound, reason: "404"},
+		{name: "401", status: http.StatusUnauthorized, reason: "401"},
+		{name: "403", status: http.StatusForbidden, reason: "403"},
 		{name: "5xx", status: http.StatusServiceUnavailable, reason: "5xx"},
 		{name: "network", network: true, reason: "network"},
 	} {
@@ -403,6 +406,51 @@ func TestProvisioningContextDoesNotCrossOrigin(t *testing.T) {
 				t.Fatalf("telemetry = %+v", events)
 			}
 		})
+	}
+}
+
+func TestProvisioningContextFallsBackOnDNSResolutionError(t *testing.T) {
+	// A name-resolution failure is the one provisioning failure that is safe to re-issue
+	// elsewhere: nothing left the client, so the canonical origin cannot have created or
+	// linked identity/org state. httptest cannot produce one, so inject it at the seam.
+	const canonical = "https://api.gascity.com"
+	_, legacy := newStub(t)
+	live := getJSON
+	getJSON = func(u string, headers map[string]string) (int, any, error) {
+		if strings.HasPrefix(u, canonical) {
+			return 0, nil, &url.Error{Op: "Get", URL: u, Err: &net.DNSError{
+				Err: "no such host", Name: "api.gascity.com", IsNotFound: true,
+			}}
+		}
+		return live(u, headers)
+	}
+	t.Cleanup(func() { getJSON = live })
+
+	var events []Event
+	cfg := config.Config{
+		STSCanonical: canonical,
+		STSBase:      legacy.srv.URL,
+		STSTelemetry: func(op, origin, outcome, reason string) {
+			events = append(events, Event{op, origin, outcome, reason})
+		},
+	}
+	ctx, err := Context(cfg, "ID.TOK.EN", true)
+	if err != nil {
+		t.Fatalf("Context: %v", err)
+	}
+	if ctx.Origin != legacy.srv.URL {
+		t.Fatalf("context origin = %q, want %q", ctx.Origin, legacy.srv.URL)
+	}
+	got := legacy.reqs("/sts/v0/context?provision=true")
+	if len(got) != 1 {
+		t.Fatalf("legacy provisioning request count = %d, want 1", len(got))
+	}
+	if auth := got[0].headers.Get("Authorization"); auth != "Bearer ID.TOK.EN" {
+		t.Errorf("Authorization = %q, want Bearer ID.TOK.EN", auth)
+	}
+	if len(events) != 1 || events[0].Operation != "context" || events[0].Origin != "legacy" ||
+		events[0].Outcome != "fallback" || events[0].Reason != "success" {
+		t.Fatalf("telemetry = %+v", events)
 	}
 }
 

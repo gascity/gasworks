@@ -31,6 +31,10 @@ const defaultSessionExpiresIn = 28800
 
 var errNoSTSEndpoint = errors.New("sts: no endpoint configured")
 
+// getJSON is the discovery GET. It is indirected so tests can inject a DNS resolution
+// failure, which no stub server can produce.
+var getJSON = httpc.GetJSON
+
 // Product is a per-org mintable product: the EIA audience and the scopes the caller may
 // request for it.
 type Product struct {
@@ -96,27 +100,21 @@ type Telemetry func(Event)
 // Context fetches /sts/v0/context — the caller's orgs + per-org mintable scopes. It carries
 // the id_token as a Bearer and NO DPoP. A non-provisioning request is read-only and may fall
 // back to the next configured origin on a network/404/5xx failure. A provisioning request
-// (provision=true) may create or link identity/org state, so it makes exactly one attempt at
-// the selected origin and never crosses origins after an uncertain response. On a non-2xx it
-// returns the raw *httpc.HTTPError so the caller can branch on status.
+// (provision=true) may create or link identity/org state, so it crosses to the next origin
+// only when the current one's name did not resolve, and never after an uncertain response.
+// On a non-2xx it returns the raw *httpc.HTTPError so the caller can branch on status.
 func Context(cfg config.Config, idToken string, provision bool) (ContextResolution, error) {
 	var last error
 	endpoints := cfg.STSEndpoints()
 	if len(endpoints) == 0 {
 		return ContextResolution{}, errNoSTSEndpoint
 	}
-	if provision {
-		// Provisioning is state-changing even though it uses GET: the server may create
-		// or link an Accounts identity/org membership. Never replay it at another origin
-		// after a response/transport failure that could have committed the mutation.
-		endpoints = endpoints[:1]
-	}
 	for i, origin := range endpoints {
 		u := origin + "/sts/v0/context"
 		if provision {
 			u += "?provision=true"
 		}
-		_, body, err := httpc.GetJSON(u, map[string]string{"Authorization": "Bearer " + idToken})
+		_, body, err := getJSON(u, map[string]string{"Authorization": "Bearer " + idToken})
 		if err == nil {
 			var res ContextResolution
 			if err := remarshal(body, &res); err != nil {
@@ -127,7 +125,7 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 			return res, nil
 		}
 		last = err
-		if !retryable(err) || i == len(endpoints)-1 {
+		if !mayCrossOrigin(err, provision) || i == len(endpoints)-1 {
 			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: contextFailureOutcome(i), Reason: reason(err)})
 			return ContextResolution{}, err
 		}
@@ -261,6 +259,27 @@ func contextFailureOutcome(i int) string {
 		return "failure"
 	}
 	return "fallback"
+}
+
+// mayCrossOrigin reports whether a failed context attempt may be re-issued at the next
+// configured origin. Read-only discovery may cross on any retryable failure. A provisioning
+// request is state-changing even though it uses GET — the server may create or link an
+// Accounts identity/org membership — so it crosses only when the origin's name failed to
+// resolve. Every other failure, including a 4xx/5xx and a connection dropped mid-request,
+// leaves the outcome uncertain and must not be replayed elsewhere.
+func mayCrossOrigin(err error, provision bool) bool {
+	if provision {
+		return unresolvedHost(err)
+	}
+	return retryable(err)
+}
+
+// unresolvedHost reports whether err is a name-resolution failure (NXDOMAIN, SERVFAIL, or a
+// resolver timeout). Resolution precedes the dial, so no request ever left the client and no
+// state can have changed at that origin.
+func unresolvedHost(err error) bool {
+	var de *net.DNSError
+	return errors.As(err, &de)
 }
 
 // retryable reports whether a failed read-only context request may be attempted on the next
