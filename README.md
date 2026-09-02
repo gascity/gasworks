@@ -123,11 +123,15 @@ All narrowing happens **server-side**: the client only ever learns what it may m
 The Go STS client exposes optional fixed-label origin-selection events (`operation`, `origin`,
 `outcome`, `reason`) through `Config.STSTelemetry`. A non-provisioning (read-only)
 `/sts/v0/context` request may fall back from the canonical origin to the legacy origin on any
-retryable failure. Provisioning context (`?provision=true`) falls back only when the canonical
-host's name does not resolve — resolution precedes the dial, so no request reached the server and
-no identity/org state can have been created there. Every other provisioning failure, and every
-session/token POST (`/login`, `/machine`, `/token`), makes one attempt at the selected origin and
-never cross-origin retries after an uncertain response.
+retryable failure. Provisioning context (`?provision=true`) and session establishment
+(`/sts/v0/login`, `/sts/v0/machine`) fall back only when the canonical host's name does not
+resolve — resolution precedes the dial, so no request reached the server and no identity, org, or
+session state can have been created there. Every other failure makes one attempt at the selected
+origin and never cross-origin retries after an uncertain response; so does the token exchange
+(`/sts/v0/token`), which is only valid at the origin that issued the session. A canonical origin
+that is unreachable for a reason other than name resolution — an HTTP proxy answering `CONNECT`
+with an error, say — is not a resolution failure and does not fall back: set
+`GASWORKS_STS_URL=https://works.gascity.com` explicitly in that environment.
 The CLI does not enable an exporter or persist these events, so this hook is an integration seam
 rather than a production counter. Events never include URLs, tokens, subjects, or DPoP proofs.
 
@@ -152,7 +156,7 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 
 | Env | Default |
 |---|---|
-| `GASWORKS_STS_CANONICAL_URL` | `https://api.gascity.com` (preferred STS origin; non-provisioning context falls back to the legacy origin for network/404/5xx failures, provisioning context only when this host does not resolve) |
+| `GASWORKS_STS_CANONICAL_URL` | `https://api.gascity.com` (preferred STS origin; non-provisioning context falls back to the legacy origin for network/404/5xx failures, provisioning context and session establishment only when this host does not resolve) |
 | `GASWORKS_STS_URL` | `https://works.gascity.com` (legacy/compatibility origin; setting this explicitly disables the implicit canonical probe) |
 | `GASWORKS_OIDC_ISSUER` | `https://auth.gascity.com/realms/gasworks-customers` |
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
