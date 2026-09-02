@@ -1,7 +1,8 @@
 // Command gasworks is the SSO login + getToken (EIA) CLI for Gas City. It wires the
 // internal client packages (oidc, sts, store, dpop, jwtutil, config) into its subcommands.
 //
-// The token lifecycle has three layers, each cached with its own DISTINCT TTL threshold:
+// The token lifecycle has three layers, each cached with its own DISTINCT TTL threshold.
+// The SDK owns every renewal — a caller asks for a credential and never runs a refresh loop:
 //
 //	Keycloak refresh_token -> id_token   (refreshed when <60s left; rotation persisted)
 //	id_token               -> STS session per org (8h; DPoP-bound; reused when >30s left)
@@ -9,6 +10,10 @@
 //
 // Discovery (/sts/v0/context) supplies the concrete org + the exact mintable scopes so the
 // strict /login + /token gates can be satisfied without the user guessing.
+//
+// The session's DPoP private key never lands in credentials.json: it is enrolled in an
+// approved credential store (internal/keystore) and the session keeps only a reference to
+// it, so a stolen credentials file carries no signing key.
 package main
 
 import (
@@ -46,6 +51,10 @@ func run(argv []string) int {
 		err = cmdGetToken(cfg, rest)
 	case "credential-provider":
 		return cmdCredentialProvider(cfg, rest)
+	case "inspect":
+		err = cmdInspect(cfg, rest)
+	case "rotate-key":
+		err = cmdRotateKey(cfg, rest)
 	case "whoami":
 		err = cmdWhoami(cfg, rest)
 	case "logout":
@@ -78,9 +87,18 @@ type cmdError struct {
 	msg               string
 	code              int
 	credentialErrCode string
+	credentialErrHint string
 }
 
 func (e *cmdError) Error() string { return e.msg }
+
+// withCredentialHint attaches the message the credential-provider protocol should carry for
+// this error. That boundary otherwise reports one fixed sentence per code, which is the
+// wrong advice when the fix is a host configuration change rather than a login.
+func (e *cmdError) withCredentialHint(hint string) *cmdError {
+	e.credentialErrHint = hint
+	return e
+}
 
 // die builds a *cmdError with exit code 1, the only non-zero code the Python CLI uses for
 // command failures.
@@ -141,6 +159,8 @@ Usage:
   gasworks login [--device|--browser] [--staff] [--org <id|slug>]
   gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--json] [--refresh]
   gasworks credential-provider
+  gasworks inspect [--json]
+  gasworks rotate-key [--org <id|slug>]
   gasworks whoami
   gasworks logout
   gasworks version`

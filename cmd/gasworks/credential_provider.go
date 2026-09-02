@@ -48,11 +48,11 @@ type credentialProviderResponse struct {
 func cmdCredentialProvider(cfg config.Config, argv []string) int {
 	servicePrincipal, machineMode, err := parseServicePrincipalFlags(argv)
 	if err != nil {
-		return emitCredentialProviderError(credentialErrorInvalid)
+		return emitCredentialProviderError(credentialErrorInvalid, "")
 	}
 	request, err := decodeCredentialProviderRequest()
 	if err != nil {
-		return emitCredentialProviderError(credentialErrorInvalid)
+		return emitCredentialProviderError(credentialErrorInvalid, "")
 	}
 
 	var result mintResult
@@ -71,11 +71,15 @@ func cmdCredentialProvider(cfg config.Config, argv []string) int {
 	}
 	if err != nil {
 		code := credentialErrorUnavailable
+		hint := ""
 		var commandErr *cmdError
-		if errors.As(err, &commandErr) && commandErr.credentialErrCode != "" {
-			code = commandErr.credentialErrCode
+		if errors.As(err, &commandErr) {
+			if commandErr.credentialErrCode != "" {
+				code = commandErr.credentialErrCode
+			}
+			hint = commandErr.credentialErrHint
 		}
-		return emitCredentialProviderError(code)
+		return emitCredentialProviderError(code, hint)
 	}
 
 	response := credentialProviderResponse{
@@ -185,7 +189,11 @@ func validCredentialValue(value string) bool {
 	return true
 }
 
-func emitCredentialProviderError(code string) int {
+// emitCredentialProviderError writes the one typed error the v1 protocol allows. The message
+// is a fixed sentence per code so nothing from a server response can leak into it; hint is
+// the exception — a caller-safe literal set at the failure site when the fixed sentence would
+// be wrong advice (a host with no credential store cannot fix it by logging in).
+func emitCredentialProviderError(code, hint string) int {
 	message := "The credential provider could not mint a credential."
 	switch code {
 	case credentialErrorInvalid:
@@ -194,6 +202,9 @@ func emitCredentialProviderError(code string) int {
 		message = "Run `gasworks login` as the service user."
 	case credentialErrorDenied:
 		message = "The requested credential is not permitted."
+	}
+	if hint != "" {
+		message = hint
 	}
 	response := credentialProviderResponse{
 		Version: credentialProviderProtocol,

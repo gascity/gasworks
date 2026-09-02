@@ -53,6 +53,7 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 	scopeFlag := fs.String("scope", "", "override the discovered scopes (space-separated)")
 	asJSON := fs.Bool("json", false, "emit a JSON envelope instead of the raw EIA")
 	refresh := fs.Bool("refresh", false, "bypass the local EIA cache")
+	allowFileKeystore := fs.Bool("allow-file-keystore", false, "permit storing the DPoP key in a 0600 file when no platform keystore is available")
 
 	// argparse interleaves flags and the positional <product>; stdlib flag stops at the first
 	// bareword. Hoist the product out so `getToken manifold --json` and `getToken --json
@@ -64,6 +65,8 @@ func cmdGetToken(cfg config.Config, argv []string) error {
 	if product == "" {
 		return die("usage: gasworks getToken <product> [--org ...] [--scope ...] [--json] [--refresh]")
 	}
+
+	cfg.AllowFileKeystore = cfg.AllowFileKeystore || *allowFileKeystore
 
 	scope := *scopeFlag
 	result, err := mintEIA(cfg, product, "", *orgFlag, scope, *refresh, false)
@@ -322,24 +325,27 @@ func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCr
 	}
 
 	var credential humanCredentialSnapshot
+	var orphanedKeys []store.KeyRef
 	err = store.Update(func(d *store.Data) error {
 		// Re-check under the cross-process store lock. Another process may have refreshed and
 		// persisted a rotated refresh token after the optimistic read above.
 		if d.IDToken != "" && tokenExp(d.IDToken)-now() > idTokenSkewSecs {
-			generation, generationErr := ensureCredentialGeneration(d)
+			generation, orphaned, generationErr := ensureCredentialGeneration(d)
 			if generationErr != nil {
 				return generationErr
 			}
+			orphanedKeys = orphaned
 			credential = humanCredentialSnapshot{IDToken: d.IDToken, Generation: generation}
 			return nil
 		}
 		if d.RefreshToken == "" {
 			return dieCredential(credentialErrorInteraction, "not logged in — run `gasworks login`")
 		}
-		generation, generationErr := ensureCredentialGeneration(d)
+		generation, orphaned, generationErr := ensureCredentialGeneration(d)
 		if generationErr != nil {
 			return generationErr
 		}
+		orphanedKeys = orphaned
 
 		tok, refreshErr := oidc.Refresh(cfg, d.RefreshToken)
 		if refreshErr != nil {
@@ -362,6 +368,8 @@ func ensureHumanCredential(cfg config.Config, beforeTransaction func()) (humanCr
 		}
 		return humanCredentialSnapshot{}, die("could not persist refreshed token: %s", err)
 	}
+	// The write landed, so the sessions those keys belonged to are gone from disk.
+	forgetSessionKeys(orphanedKeys)
 	return credential, nil
 }
 
@@ -382,18 +390,34 @@ func validCredentialGeneration(generation string) bool {
 	return err == nil
 }
 
-func ensureCredentialGeneration(data *store.Data) (string, error) {
+// ensureCredentialGeneration stamps a generation on a document that has none. That fences
+// out every session written before it, so it also returns the DPoP keys those sessions held:
+// the caller deletes them once the write has landed, rather than leaving a private key on
+// the host for a session nothing can reach any more.
+func ensureCredentialGeneration(data *store.Data) (string, []store.KeyRef, error) {
 	if validCredentialGeneration(data.CredentialGeneration) {
-		return data.CredentialGeneration, nil
+		return data.CredentialGeneration, nil, nil
 	}
 	generation, err := newCredentialGeneration()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	data.CredentialGeneration = generation
+	return generation, dropSessions(data), nil
+}
+
+// dropSessions clears every stored session and the EIA cache minted from them, returning the
+// key references that are now unreachable.
+func dropSessions(data *store.Data) []store.KeyRef {
+	orphaned := make([]store.KeyRef, 0, len(data.Sessions))
+	for _, session := range data.Sessions {
+		if session.Key.Enrolled() {
+			orphaned = append(orphaned, session.Key)
+		}
+	}
 	data.Sessions = nil
 	data.EIACache = nil
-	return generation, nil
+	return orphaned
 }
 
 func credentialChangedError() *cmdError {
@@ -435,9 +459,18 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 	return "", dieCredential(credentialErrorInvalid, "you belong to multiple orgs — pass --org. Your orgs: %s", orgList(orgs))
 }
 
-// newSession generates a FRESH DPoP key, establishes a new STS session, and persists it
-// (locked). A fresh key per new session matches the server's per-session jkt-pin.
+// newSession generates a FRESH DPoP key, establishes a new STS session, and persists the
+// session (locked) with a reference to the credential store the key went into. A fresh key
+// per new session matches the server's per-session jkt-pin.
+//
+// The credential store is selected BEFORE the STS round-trip: a host with no approved store
+// must fail closed on the enrolment error rather than mint a session whose key it cannot
+// keep.
 func newSession(cfg config.Config, org, idToken, generation string) (string, *dpop.Key, string, error) {
+	backend, err := enrollmentKeystore(cfg)
+	if err != nil {
+		return "", nil, "", err
+	}
 	key, err := dpop.NewKey()
 	if err != nil {
 		return "", nil, "", die("could not generate a session key: %s", err)
@@ -450,10 +483,12 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		}
 		return "", nil, "", die("login to org %s failed: %s", org, err)
 	}
-	pem, err := key.ToPEM()
-	if err != nil {
-		return "", nil, "", die("could not serialize the session key: %s", err)
+	origin := sess.Origin
+	if origin == "" {
+		origin = cfg.STSBase
 	}
+	cacheKey := sessionCacheKey(origin, org, generation)
+	var ref store.KeyRef
 	if err := store.Update(func(d *store.Data) error {
 		if d.CredentialGeneration != generation {
 			return errCredentialGenerationChanged
@@ -461,31 +496,40 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		if d.Sessions == nil {
 			d.Sessions = map[string]store.Session{}
 		}
-		origin := sess.Origin
-		if origin == "" {
-			origin = cfg.STSBase
+		// Enrol INSIDE the locked read-modify-write. The handle is derived from the cache
+		// key, so two concurrent first-time getToken runs would otherwise race on the same
+		// handle and one could persist a session bound to the other's key. Replacing this
+		// entry is also what erases a pre-split-storage inline key: the entries this CLI
+		// did not write (bd-enterprise shares this document) are left alone.
+		enrolled, err := enrollSessionKey(backend, sessionKeyHandle(cacheKey), key)
+		if err != nil {
+			return err
 		}
-		d.Sessions[sessionCacheKey(origin, org, generation)] = store.Session{
+		ref = enrolled
+		d.Sessions[cacheKey] = store.Session{
 			SessionToken: sess.SessionToken,
-			DPoPPEM:      pem,
+			Key:          ref,
 			ExpiresAt:    now() + int64(sess.ExpiresIn),
 		}
 		return nil
 	}); err != nil {
+		// The session was not persisted, so nothing references the key we just enrolled.
+		forgetSessionKey(ref)
 		if errors.Is(err, errCredentialGenerationChanged) {
 			return "", nil, "", credentialChangedError()
 		}
+		var commandErr *cmdError
+		if errors.As(err, &commandErr) {
+			return "", nil, "", commandErr
+		}
 		return "", nil, "", die("could not save the session: %s", err)
-	}
-	origin := sess.Origin
-	if origin == "" {
-		origin = cfg.STSBase
 	}
 	return sess.SessionToken, key, origin, nil
 }
 
 // ensureSession reuses the stored per-org session at the selected origin when it has >30s left
-// (loading its DPoP key from PEM), otherwise establishes a fresh one at that same origin. A
+// (loading its DPoP key from the credential store it was enrolled in), otherwise establishes
+// a fresh one at that same origin. A
 // session cached for another origin is deliberately not a fallback: the origin is part of the
 // session's security binding and switching hosts could replay a state-changing request.
 func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation, preferredOrigin string) (string, *dpop.Key, string, error) {
@@ -498,29 +542,47 @@ func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation
 	}
 	if origin != "" {
 		if sess, ok := data.Sessions[sessionCacheKey(origin, org, generation)]; ok && sess.ExpiresAt-now() > sessionSkewSecs {
-			key, err := dpop.FromPEM(sess.DPoPPEM)
+			key, err := loadSessionKey(sess.Key)
 			if err == nil {
 				return sess.SessionToken, key, origin, nil
 			}
-			// A corrupt stored key falls through to a fresh session rather than crashing.
+			// A missing, unreadable, or pre-split-storage key falls through to a fresh
+			// session rather than crashing.
 		}
 	}
 	return newSession(cfg.WithSTSBase(origin), org, idToken, generation)
 }
 
+// sessionIdentity is what a session cache key encodes. `gasworks inspect` decodes the key
+// back through this type, so the writer and the reader cannot drift.
+type sessionIdentity struct {
+	CredentialKind string `json:"credential_kind"`
+	Generation     string `json:"generation"`
+	STSAuthority   string `json:"sts_authority"`
+	Org            string `json:"org"`
+}
+
 func sessionCacheKey(stsAuthority, org, generation string) string {
-	payload, _ := json.Marshal(struct {
-		CredentialKind string `json:"credential_kind"`
-		Generation     string `json:"generation"`
-		STSAuthority   string `json:"sts_authority"`
-		Org            string `json:"org"`
-	}{
+	payload, _ := json.Marshal(sessionIdentity{
 		CredentialKind: humanCredentialKind,
 		Generation:     generation,
 		STSAuthority:   strings.TrimRight(stsAuthority, "/"),
 		Org:            org,
 	})
 	return sessionKeyVersion + ":" + string(payload)
+}
+
+// parseSessionCacheKey reverses sessionCacheKey. An unrecognized key yields ok=false.
+func parseSessionCacheKey(key string) (sessionIdentity, bool) {
+	raw, ok := strings.CutPrefix(key, sessionKeyVersion+":")
+	if !ok {
+		return sessionIdentity{}, false
+	}
+	var id sessionIdentity
+	if err := json.Unmarshal([]byte(raw), &id); err != nil {
+		return sessionIdentity{}, false
+	}
+	return id, true
 }
 
 // hoistPositional pulls the single bareword product out of argv (in any position, like
@@ -674,17 +736,20 @@ func validOpaqueToken(token string) bool {
 	return token != "" && token == strings.TrimSpace(token) && !strings.ContainsAny(token, " \t\r\n")
 }
 
+// eiaIdentity is what an EIA cache key encodes; `gasworks inspect` decodes it back.
+type eiaIdentity struct {
+	CredentialKind string   `json:"credential_kind"`
+	Generation     string   `json:"generation"`
+	STSAuthority   string   `json:"sts_authority"`
+	Org            string   `json:"org"`
+	Audience       string   `json:"audience"`
+	Scopes         []string `json:"scopes"`
+}
+
 func eiaCacheKey(stsAuthority, org, audience, generation string, scopes []string) string {
 	canonicalScopes := append([]string(nil), scopes...)
 	sort.Strings(canonicalScopes)
-	payload, _ := json.Marshal(struct {
-		CredentialKind string   `json:"credential_kind"`
-		Generation     string   `json:"generation"`
-		STSAuthority   string   `json:"sts_authority"`
-		Org            string   `json:"org"`
-		Audience       string   `json:"audience"`
-		Scopes         []string `json:"scopes"`
-	}{
+	payload, _ := json.Marshal(eiaIdentity{
 		CredentialKind: humanCredentialKind,
 		Generation:     generation,
 		STSAuthority:   strings.TrimRight(stsAuthority, "/"),
@@ -693,4 +758,17 @@ func eiaCacheKey(stsAuthority, org, audience, generation string, scopes []string
 		Scopes:         canonicalScopes,
 	})
 	return eiaCacheKeyVersion + ":" + string(payload)
+}
+
+// parseEIACacheKey reverses eiaCacheKey. An unrecognized key yields ok=false.
+func parseEIACacheKey(key string) (eiaIdentity, bool) {
+	raw, ok := strings.CutPrefix(key, eiaCacheKeyVersion+":")
+	if !ok {
+		return eiaIdentity{}, false
+	}
+	var id eiaIdentity
+	if err := json.Unmarshal([]byte(raw), &id); err != nil {
+		return eiaIdentity{}, false
+	}
+	return id, true
 }

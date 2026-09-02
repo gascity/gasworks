@@ -173,7 +173,7 @@ func newStub(t *testing.T) *stubServer {
 func seed(t *testing.T, srv *stubServer, creds map[string]any) {
 	t.Helper()
 	base := srv.srv.URL
-	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	useFileKeystore(t)
 	t.Setenv("GASWORKS_STS_URL", base)
 	t.Setenv("GASWORKS_OIDC_ISSUER", base+"/realms/g")
 	t.Setenv("GASWORKS_CLIENT_ID", "gasworks-cli")

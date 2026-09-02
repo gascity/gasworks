@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,7 +24,7 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 		RefreshToken:         "rt",
 		CredentialGeneration: "g1:00000000000000000000000000000001",
 		Sessions: map[string]Session{
-			"org_a": {SessionToken: "t", DPoPPEM: "...", ExpiresAt: 42},
+			"org_a": {SessionToken: "t", Key: KeyRef{Backend: "file", Handle: "dpop-abc"}, ExpiresAt: 42},
 		},
 		EIACache: map[string]EIACacheEntry{
 			"k": {EIA: "eia", ExpiresAt: 99},
@@ -331,3 +333,80 @@ var errSentinel = sentinelError("sentinel")
 type sentinelError string
 
 func (e sentinelError) Error() string { return string(e) }
+
+// The DPoP key directory must not sit inside the directory a "back up my dotfiles" job
+// copies: the session and the key it is bound to may not be stored or backed up together.
+func TestKeyDirIsOutsideTheConfigDirByDefault(t *testing.T) {
+	t.Setenv("GASWORKS_CONFIG_DIR", "")
+	t.Setenv(KeyDirEnv, "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows split is LOCALAPPDATA vs APPDATA, covered by the resolution above")
+	}
+	if keyDir := KeyDir(); strings.HasPrefix(keyDir, ConfigDir()+string(os.PathSeparator)) || keyDir == ConfigDir() {
+		t.Fatalf("KeyDir %q is inside the config dir %q", keyDir, ConfigDir())
+	}
+}
+
+func TestKeyDirHonoursItsOverrideAndPinnedProfiles(t *testing.T) {
+	t.Setenv(KeyDirEnv, "/tmp/explicit-keys")
+	t.Setenv("GASWORKS_CONFIG_DIR", "/tmp/profile")
+	if got := KeyDir(); got != "/tmp/explicit-keys" {
+		t.Fatalf("KeyDir = %q, want the explicit override", got)
+	}
+	t.Setenv(KeyDirEnv, "")
+	// A pinned profile is self-contained: its keys stay inside it so a disposable canary or
+	// test profile does not scatter key material into the user's state dir.
+	if got, want := KeyDir(), filepath.Join("/tmp/profile", keyDirName); got != want {
+		t.Fatalf("KeyDir = %q, want %q for a pinned profile", got, want)
+	}
+}
+
+// bd-enterprise vendors this store and writes its DPoP key inline in the SAME
+// credentials.json. Our Save must not strip its sessions, or every bd command re-logs in at
+// the STS (and re-writes a plaintext key) after every gasworks command.
+func TestSaveDoesNotStripAForeignInlineKeySession(t *testing.T) {
+	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	raw := `{
+	  "refresh_token": "rt",
+	  "sessions": {
+	    "gasworks.dev/sts-session/v3:{\"credential_kind\":\"human\",\"sts_authority\":\"https://works.gascity.com\"}": {
+	      "session_token": "BD-SESSION",
+	      "dpop_pem": "-----BEGIN PRIVATE KEY-----\nbd\n-----END PRIVATE KEY-----\n",
+	      "expires_at": 42
+	    }
+	  }
+	}`
+	if err := os.MkdirAll(ConfigDir(), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(CredsPath(), []byte(raw), 0o600); err != nil {
+		t.Fatalf("seed credentials: %v", err)
+	}
+
+	// A gasworks write that has nothing to do with that entry.
+	if err := Update(func(d *Data) error {
+		d.DefaultOrg = "org_a"
+		return nil
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	after, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(after.Sessions) != 1 {
+		t.Fatalf("stored %d sessions, want the foreign one preserved", len(after.Sessions))
+	}
+	for _, session := range after.Sessions {
+		if session.SessionToken != "BD-SESSION" {
+			t.Errorf("session token = %q, want the foreign session", session.SessionToken)
+		}
+		if !strings.Contains(session.InlineKeyPEM, "BEGIN PRIVATE KEY") {
+			t.Errorf("the foreign inline key did not survive our write: %q", session.InlineKeyPEM)
+		}
+	}
+}

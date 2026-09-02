@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gascity/gasworks/internal/config"
+	"github.com/gascity/gasworks/internal/dpop"
+	"github.com/gascity/gasworks/internal/keystore"
 	"github.com/gascity/gasworks/internal/store"
 )
 
@@ -41,4 +44,43 @@ func loadStore(t *testing.T) *store.Data {
 	}
 	_ = d
 	return &fresh
+}
+
+// useFileKeystore points the CLI at a fresh temp config dir, a fresh temp key dir, and a
+// scratch file keystore that must be opted into. Every test that establishes a session needs
+// it, on every platform: the real registry reaches the developer's macOS login keychain, and
+// a test may neither enrol a key there nor let `logout` purge items it did not create.
+func useFileKeystore(t *testing.T) {
+	t.Helper()
+	t.Setenv("GASWORKS_CONFIG_DIR", t.TempDir())
+	t.Setenv(store.KeyDirEnv, filepath.Join(t.TempDir(), "dpop-keys"))
+	t.Setenv(config.AllowFileKeystoreEnv, "1")
+	useKeystore(t, keystore.NewFile(store.KeyDir(), true))
+}
+
+// useKeystore substitutes the credential-store registry for the duration of the test.
+func useKeystore(t *testing.T, backends ...keystore.Backend) {
+	t.Helper()
+	previous := keystoreRegistry
+	keystoreRegistry = func() []keystore.Backend { return backends }
+	t.Cleanup(func() { keystoreRegistry = previous })
+}
+
+// enrollTestKey generates a DPoP key, enrolls it under handle, and returns the reference a
+// stored session would carry.
+func enrollTestKey(t *testing.T, handle string) store.KeyRef {
+	t.Helper()
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatalf("dpop.NewKey: %v", err)
+	}
+	backend, err := keystore.Select(keystoreRegistry(), true)
+	if err != nil {
+		t.Fatalf("keystore.Select: %v", err)
+	}
+	ref, err := enrollSessionKey(backend, handle, key)
+	if err != nil {
+		t.Fatalf("enrollSessionKey: %v", err)
+	}
+	return ref
 }

@@ -40,6 +40,11 @@ MANIFOLD_TOKEN=$(gasworks getToken manifold) # capture for a tool
 
 gasworks credential-provider < request.json  # versioned noninteractive JSON protocol
 
+gasworks inspect               # what the SDK is holding: sessions, keys, EIA claims
+gasworks inspect --json        # the same, machine-readable
+gasworks rotate-key            # new DPoP key + a new session pinned to it
+gasworks rotate-key --org acme # rotate one org's session key
+
 gasworks whoami                # who you are + the orgs you can mint for
 gasworks logout                # revoke the refresh token + wipe local credentials
 gasworks version               # print the build version
@@ -48,8 +53,10 @@ gasworks version               # print the build version
 | Command | Description |
 |---|---|
 | `gasworks login [--device\|--browser] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--org` remembers a default org. |
-| `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
+| `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh] [--allow-file-keystore]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
 | `gasworks credential-provider` | Read a v1 credential request from stdin and emit one typed JSON response for automation. |
+| `gasworks inspect [--json]` | Decode what is cached locally — login, sessions and where their DPoP keys live, and each cached EIA's Auth Access v1 claims (`authn_class`, `auth_time`, `acr`, `amr`, `session_id`, delegation). Offline; prints claims, never credentials. |
+| `gasworks rotate-key [--org <id\|slug>] [--allow-file-keystore]` | Generate a fresh DPoP key and establish a new session pinned to it. Drops the cached EIAs minted from the superseded session, which itself stays valid at the STS until it expires. |
 | `gasworks whoami` | Print your subject/email and the orgs (with roles + products) you can mint for. |
 | `gasworks logout` | Revoke the refresh token at the IdP and wipe local credentials. |
 | `gasworks version` | Print the build version (`--version` also works). |
@@ -137,13 +144,51 @@ rather than a production counter. Events never include URLs, tokens, subjects, o
 
 ## Storage & security
 
-Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. The file holds the refresh token, the per-org session, and the session's DPoP key. A **stolen credentials file is co-located-key vulnerable** (DPoP binds the key, not the file) — keep it as private as an SSH key. `logout` revokes the refresh token at the IdP before clearing.
+Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. It does **not** hold the DPoP private key of any session this CLI writes: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key of ours. (Entries written by another tool that shares the file are carried through as found — see the limitations below.) `logout` revokes the refresh token at the IdP, purges every enrolled key, and then clears the file.
+
+### Credential custody: where the DPoP key lives
+
+The key that proves a session is held in an approved credential store, chosen from a closed per-platform registry (`gasworks.dev/keystore-registry/v1`). `gasworks inspect` prints the registry for the host you are on, with each store's exportability, backup, access-control and deletion semantics.
+
+| Store | Platform | Default |
+|---|---|---|
+| `keychain` — macOS login keychain (generic password, per-profile service `com.gascity.gasworks.dpop.<digest>`) | macOS | selected automatically |
+| `file` — one PKCS#8 PEM per session in the key dir (`0600` in a `0700` dir; user-only ACL on Windows) | all | selected where there is no platform store; **opt-in** on macOS |
+
+The registry is ordered by preference and `Select` takes the first eligible store, so a platform keystore always wins over a plain file. Linux (Secret Service, TPM2/PKCS#11) and Windows (CNG, Credential Manager) are registry slots this build does not fill yet — **on those hosts the key is a plain file**, and the enrolment says so:
+
+```
+gasworks: no OS keystore backend for linux in this build — the session's DPoP private key is kept as plaintext PKCS#8 PEM files in /home/you/.local/state/gasworks/dpop-keys
+```
+
+That is the honest state of custody on Linux today: the key is split out of `credentials.json` and out of the config dir, but it is still exportable by anyone running as you. Fail-closed enrolment (below) is what happens once a platform has a real store to fail closed *to*; that is where Linux goes when a Secret Service / TPM2 backend lands, and it is already how macOS behaves when `/usr/bin/security` is missing:
+
+```
+gasworks: keystore: no approved credential store is available (registry gasworks.dev/keystore-registry/v1: keychain unavailable on this host; file registered but requires an explicit opt-in).
+The DPoP private key is never written to a plain file unless you ask for it: re-run with --allow-file-keystore, or set GASWORKS_ALLOW_FILE_KEYSTORE=1, to keep it in a 0600 file under /Users/you/.local/state/gasworks/dpop-keys.
+```
+
+Opt in with `--allow-file-keystore` on `getToken` / `rotate-key`, or `GASWORKS_ALLOW_FILE_KEYSTORE=1` for every command (including `credential-provider`, which takes no such flag; its error names the variable). Reading back a key you already enrolled never needs the opt-in — the gate is on choosing where a *new* key goes.
+
+The key dir is deliberately not the config dir, so a "back up my dotfiles" job does not carry both halves: `$GASWORKS_KEY_DIR` if set, else `~/.local/state/gasworks/dpop-keys` (`%LOCALAPPDATA%\gasworks\dpop-keys` on Windows). A profile pinned with `GASWORKS_CONFIG_DIR` is self-contained — its keys stay inside it, and `logout` in that profile purges only that profile's keys.
+
+`gasworks rotate-key` generates a fresh key and establishes a new session pinned to it, dropping the cached EIAs minted from the superseded one. It is **not** a remedy for a suspected key compromise: the superseded session stays mintable at the STS until it expires (≤8h) because no route revokes the old session family yet. `rotate-key` says so every time.
+
+Headless automation does not persist a key at all: `credential-provider --service-principal-credential-file …` mints with an **ephemeral** DPoP key held only in memory, so the managed secret and a signing key are never on disk together.
+
+### Who refreshes
+
+The SDK does, at every layer, before expiry — a caller holds a credential and never writes a refresh loop. `gasworks inspect` prints the thresholds in force (`id_token` at 60s remaining, the STS session at 30s, the EIA at 15s). `--refresh` / `force_refresh` exist to *discard* a cached credential, not to drive renewal.
 
 ### Security limitations
 
 These are acknowledged, documented limitations of the current design — not bugs. They are listed so operators can reason about the trust model:
 
-- **Co-located-key / stolen credentials file.** The credentials file holds the DPoP private key next to the session it's bound to. DPoP binds the key to the request, *not* the file to a machine, so anyone who can read the file can mint EIAs until the session/refresh token expires. Protect it like an SSH private key (it's `0600` / user-only-ACL, but that's only as strong as the host). OS-keyring storage is a documented follow-up.
+- **Co-located key theft on the host.** DPoP protects against token-only exfiltration, not against an attacker who is already running as you. Splitting the key out of `credentials.json`, and out of the config dir, means one stolen file (or one dotfile backup) is not enough — but a same-uid attacker can still read both halves. Exclude the key dir from backups, and prefer a platform keystore where one exists.
+- **No store registered today is non-exportable.** The macOS keychain releases the key to this process once unlocked, and the `file` store is a plain PEM. Hardware-held keys that sign in-place (Secure Enclave, TPM) are a registry slot, not a shipped backend.
+- **Linux and Windows have no platform keystore in this build.** The key is a plain file there. That is a smaller change than it sounds — it is where the key already was, minus co-location with the session — but it is not the custody the design asks for, and it is why the fail-closed default is not on for those platforms yet.
+- **Rotation does not revoke the old session.** `rotate-key` establishes a new session with a new key, but the superseded session remains usable at the STS until its own expiry (≤8h); there is no re-enrollment route that revokes the old session family yet. Treat `rotate-key` as scheduled hygiene, not incident response.
+- **`credentials.json` is a shared document.** `bd` (bd-enterprise) vendors this store and writes its own sessions — with its key inline — into the same file. The CLI replaces only the entry it is writing and carries every other entry through untouched, so the two binaries do not sign each other out; the reverse is not true until bd adopts split storage, and a `bd` write drops the `key` reference from a gasworks session (which then re-establishes itself).
 - **Recall forwarder default filter is a blocklist (not an allowlist).** See the forwarder section above: secret-bearing JSON under a provider root with an unanticipated name is forwarded unless `RECALL_FORWARDER_STRICT_ALLOWLIST=1` is set.
 - **Hardlinks inside a transcript dir.** A hardlink in a scanned directory pointing at a sensitive inode is read and forwarded if its content isn't PEM-shaped (the PEM sniff still catches key files). Exploiting this requires a same-uid local writer who can already read the target. A possible future guard is to drop in-scope files with `st_nlink > 1`; it is not implemented today.
 - **Env-token `/proc` exposure.** `RECALL_FORWARDER_TOKEN` (the dev-only env path) is visible in `/proc/<pid>/environ` to the same user. It is popped from the environment at start and flagged with a warning; the production path (`RECALL_FORWARDER_TOKEN_FILE`, mode `0600`, re-read each cycle) avoids this.
@@ -162,6 +207,8 @@ CLI endpoint + client overrides (`GASWORKS_*`). Defaults target production; over
 | `GASWORKS_CLIENT_ID` | `gasworks-cli` |
 | `GASWORKS_LOOPBACK_PORT` | OS-assigned ephemeral port on `127.0.0.1` (set a numeric fixed-port override for tests/dev) |
 | `GASWORKS_CONFIG_DIR` | the platform config dir |
+| `GASWORKS_ALLOW_FILE_KEYSTORE` | unset. Set to `1` to permit storing the DPoP private key as a `0600` PEM where a platform keystore would otherwise be required (macOS), and to silence the "no OS keystore backend" notice where the file store is the only one (Linux, Windows). |
+| `GASWORKS_KEY_DIR` | `~/.local/state/gasworks/dpop-keys` (`%LOCALAPPDATA%\gasworks\dpop-keys` on Windows; `<config dir>/dpop-keys` when `GASWORKS_CONFIG_DIR` pins a profile) |
 
 ### Forwarder (`gasworks-forwarder`)
 

@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+// AllowFileKeystoreEnv opts the DPoP private key into the plaintext-file credential store.
+// It is named here (rather than inline) because the fail-closed enrolment error quotes it.
+const AllowFileKeystoreEnv = "GASWORKS_ALLOW_FILE_KEYSTORE"
+
 const (
 	defaultSTSBase      = "https://works.gascity.com"
 	defaultCanonicalSTS = "https://api.gascity.com"
@@ -41,6 +45,13 @@ type Config struct {
 	OIDCIssuer   string
 	ClientID     string
 	LoopbackPort int
+	// AllowFileKeystore opts the DPoP private key into the plaintext-file credential
+	// store (GASWORKS_ALLOW_FILE_KEYSTORE, or the --allow-file-keystore flag on the
+	// commands that enrol a key). Auth Access v1 forbids falling back to a plain file
+	// silently, so where this build has a platform keystore the SDK fails closed without
+	// it; where it has none (Linux, Windows) the file store is the only one there is and
+	// this only silences the notice. See internal/keystore.
+	AllowFileKeystore bool
 }
 
 // FromEnv builds a Config from defaults plus GASWORKS_* env overrides. Trailing slashes on
@@ -63,12 +74,20 @@ func FromEnv() Config {
 		canonical = defaultCanonicalSTS
 	}
 	return Config{
-		STSBase:      legacy,
-		STSCanonical: canonical,
-		OIDCIssuer:   strings.TrimRight(env("GASWORKS_OIDC_ISSUER", defaultOIDCIssuer), "/"),
-		ClientID:     env("GASWORKS_CLIENT_ID", defaultClientID),
-		LoopbackPort: port,
+		STSBase:           legacy,
+		STSCanonical:      canonical,
+		OIDCIssuer:        strings.TrimRight(env("GASWORKS_OIDC_ISSUER", defaultOIDCIssuer), "/"),
+		ClientID:          env("GASWORKS_CLIENT_ID", defaultClientID),
+		LoopbackPort:      port,
+		AllowFileKeystore: boolEnv(AllowFileKeystoreEnv),
 	}
+}
+
+// boolEnv reads a boolean env override. An unset or unparseable value is false: a typo must
+// never look like an opt-in to a weaker credential store.
+func boolEnv(key string) bool {
+	on, err := strconv.ParseBool(os.Getenv(key))
+	return err == nil && on
 }
 
 // STSEndpoints returns the deterministic canonical-first origin set. Duplicate
