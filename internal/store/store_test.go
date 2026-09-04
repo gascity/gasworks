@@ -350,6 +350,80 @@ func TestKeyDirIsOutsideTheConfigDirByDefault(t *testing.T) {
 	}
 }
 
+// A minted credential is a bearer secret: it belongs in the state namespace beside the DPoP
+// keys, not in the config dir a dotfiles sync carries.
+func TestMintedKeyDirIsOutsideTheConfigDirByDefault(t *testing.T) {
+	t.Setenv(ConfigDirEnv, "")
+	t.Setenv(MintedKeyDirEnv, "")
+	t.Setenv(KeyDirEnv, "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows split is LOCALAPPDATA vs APPDATA, covered by the resolution above")
+	}
+	minted := MintedKeyDir()
+	if strings.HasPrefix(minted, ConfigDir()+string(os.PathSeparator)) || minted == ConfigDir() {
+		t.Fatalf("MintedKeyDir %q is inside the config dir %q", minted, ConfigDir())
+	}
+	if got, want := filepath.Dir(minted), filepath.Dir(KeyDir()); got != want {
+		t.Fatalf("MintedKeyDir parent = %q, want the DPoP key dir's state namespace %q", got, want)
+	}
+	if minted == KeyDir() {
+		t.Fatalf("MintedKeyDir and KeyDir are the same directory %q", minted)
+	}
+}
+
+func TestStateDirResolution(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX XDG resolution; the Windows branch is LOCALAPPDATA")
+	}
+	home := t.TempDir()
+	cases := []struct {
+		name     string
+		profile  string
+		xdgState string
+		want     string
+	}{
+		{"xdg state home", "", "/tmp/state", filepath.Join("/tmp/state", "gasworks")},
+		{"home fallback", "", "", filepath.Join(home, ".local", "state", "gasworks")},
+		// A pinned profile is self-contained: its state stays inside it so a disposable
+		// canary or test profile does not scatter key material into the user's state dir.
+		{"pinned profile", "/tmp/profile", "/tmp/state", "/tmp/profile"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", home)
+			t.Setenv(ConfigDirEnv, tc.profile)
+			t.Setenv("XDG_STATE_HOME", tc.xdgState)
+			if got := StateDir(); got != tc.want {
+				t.Fatalf("StateDir = %q, want %q", got, tc.want)
+			}
+			if got, want := KeyDir(), filepath.Join(tc.want, keyDirName); got != want {
+				t.Fatalf("KeyDir = %q, want %q", got, want)
+			}
+			if got, want := MintedKeyDir(), filepath.Join(tc.want, mintedKeyDirName); got != want {
+				t.Fatalf("MintedKeyDir = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestMintedKeyDirHonoursItsOverride(t *testing.T) {
+	t.Setenv(MintedKeyDirEnv, "/tmp/explicit-minted")
+	t.Setenv(KeyDirEnv, "/tmp/explicit-keys")
+	t.Setenv(ConfigDirEnv, "/tmp/profile")
+	if got := MintedKeyDir(); got != "/tmp/explicit-minted" {
+		t.Fatalf("MintedKeyDir = %q, want the explicit override", got)
+	}
+	// The two overrides are independent: splitting the DPoP keys out of a pinned profile
+	// must not move the minted credentials with them.
+	t.Setenv(MintedKeyDirEnv, "")
+	if got, want := MintedKeyDir(), filepath.Join("/tmp/profile", mintedKeyDirName); got != want {
+		t.Fatalf("MintedKeyDir = %q, want %q for a pinned profile", got, want)
+	}
+}
+
 func TestKeyDirHonoursItsOverrideAndPinnedProfiles(t *testing.T) {
 	t.Setenv(KeyDirEnv, "/tmp/explicit-keys")
 	t.Setenv("GASWORKS_CONFIG_DIR", "/tmp/profile")

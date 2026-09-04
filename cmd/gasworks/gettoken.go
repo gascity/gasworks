@@ -197,10 +197,12 @@ func mintEIA(
 			// outcome. Re-establish once with a fresh key and retry the exchange on the SAME
 			// pinned origin — stsCfg is already narrowed to it, and Login/Exchange never
 			// replay an uncertain response at another host.
-			sessionToken, key, sessionOrigin, err = newSession(stsCfg, org, idToken, generation)
+			var established establishedSession
+			established, err = newSession(stsCfg, org, idToken, generation)
 			if err != nil {
 				return mintResult{}, err
 			}
+			sessionToken, key, sessionOrigin = established.Token, established.Key, established.Origin
 			exchangeStartedAt = now()
 			res, err = sts.Exchange(cfg.WithSTSBase(sessionOrigin), sessionToken, canonicalAudience, strings.Join(requestedScopes, " "), key)
 		}
@@ -459,6 +461,17 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 	return "", dieCredential(credentialErrorInvalid, "you belong to multiple orgs — pass --org. Your orgs: %s", orgList(orgs))
 }
 
+// establishedSession is one session establishment's result: the token to present, the key it
+// is JKT-bound to, the origin it is pinned to, and when it expires. The expiry is carried out
+// rather than left on disk because a caller that holds one session across several requests
+// (the mint ceremony does) has to know how long it may keep holding it.
+type establishedSession struct {
+	Token     string
+	Key       *dpop.Key
+	Origin    string
+	ExpiresAt int64
+}
+
 // newSession generates a FRESH DPoP key, establishes a new STS session, and persists the
 // session (locked) with a reference to the credential store the key went into. A fresh key
 // per new session matches the server's per-session jkt-pin.
@@ -466,27 +479,28 @@ func pickOrg(ctx sts.ContextResolution, requested string, data *store.Data) (str
 // The credential store is selected BEFORE the STS round-trip: a host with no approved store
 // must fail closed on the enrolment error rather than mint a session whose key it cannot
 // keep.
-func newSession(cfg config.Config, org, idToken, generation string) (string, *dpop.Key, string, error) {
+func newSession(cfg config.Config, org, idToken, generation string) (establishedSession, error) {
 	backend, err := enrollmentKeystore(cfg)
 	if err != nil {
-		return "", nil, "", err
+		return establishedSession{}, err
 	}
 	key, err := dpop.NewKey()
 	if err != nil {
-		return "", nil, "", die("could not generate a session key: %s", err)
+		return establishedSession{}, die("could not generate a session key: %s", err)
 	}
 	sess, err := sts.Login(cfg, idToken, org, key)
 	if err != nil {
 		var he *httpc.HTTPError
 		if errors.As(err, &he) && he.Status == 403 {
-			return "", nil, "", dieCredential(credentialErrorDenied, "not a member of org %s (%s)", org, he.OAuthError())
+			return establishedSession{}, dieCredential(credentialErrorDenied, "not a member of org %s (%s)", org, he.OAuthError())
 		}
-		return "", nil, "", die("login to org %s failed: %s", org, err)
+		return establishedSession{}, die("login to org %s failed: %s", org, err)
 	}
 	origin := sess.Origin
 	if origin == "" {
 		origin = cfg.STSBase
 	}
+	expiresAt := now() + int64(sess.ExpiresIn)
 	cacheKey := sessionCacheKey(origin, org, generation)
 	var ref store.KeyRef
 	if err := store.Update(func(d *store.Data) error {
@@ -509,22 +523,22 @@ func newSession(cfg config.Config, org, idToken, generation string) (string, *dp
 		d.Sessions[cacheKey] = store.Session{
 			SessionToken: sess.SessionToken,
 			Key:          ref,
-			ExpiresAt:    now() + int64(sess.ExpiresIn),
+			ExpiresAt:    expiresAt,
 		}
 		return nil
 	}); err != nil {
 		// The session was not persisted, so nothing references the key we just enrolled.
 		forgetSessionKey(ref)
 		if errors.Is(err, errCredentialGenerationChanged) {
-			return "", nil, "", credentialChangedError()
+			return establishedSession{}, credentialChangedError()
 		}
 		var commandErr *cmdError
 		if errors.As(err, &commandErr) {
-			return "", nil, "", commandErr
+			return establishedSession{}, commandErr
 		}
-		return "", nil, "", die("could not save the session: %s", err)
+		return establishedSession{}, die("could not save the session: %s", err)
 	}
-	return sess.SessionToken, key, origin, nil
+	return establishedSession{Token: sess.SessionToken, Key: key, Origin: origin, ExpiresAt: expiresAt}, nil
 }
 
 // ensureSession reuses the stored per-org session at the selected origin when it has >30s left
@@ -550,7 +564,8 @@ func ensureSession(cfg config.Config, data *store.Data, org, idToken, generation
 			// session rather than crashing.
 		}
 	}
-	return newSession(cfg.WithSTSBase(origin), org, idToken, generation)
+	established, err := newSession(cfg.WithSTSBase(origin), org, idToken, generation)
+	return established.Token, established.Key, established.Origin, err
 }
 
 // sessionIdentity is what a session cache key encodes. `gasworks inspect` decodes the key
