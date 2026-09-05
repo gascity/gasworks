@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/gascity/gasworks/internal/lockdown"
 )
 
 // KeyRef locates the DPoP private key a session is jkt-pinned to: the registry id of the
@@ -67,13 +69,17 @@ type Data struct {
 	EIACache             map[string]EIACacheEntry `json:"eia_cache,omitempty"`
 }
 
+// ConfigDirEnv pins the config directory to one self-contained profile (the canary runbook,
+// a test). It also pins the state directory — see StateDir.
+const ConfigDirEnv = "GASWORKS_CONFIG_DIR"
+
 // ConfigDir resolves the gasworks config directory:
 //
 //	$GASWORKS_CONFIG_DIR                              (override, any platform)
 //	%APPDATA%/gasworks      (or ~/AppData/Roaming)   on Windows
 //	$XDG_CONFIG_HOME/gasworks  else  ~/.config/gasworks  elsewhere
 func ConfigDir() string {
-	if override := os.Getenv("GASWORKS_CONFIG_DIR"); override != "" {
+	if override := os.Getenv(ConfigDirEnv); override != "" {
 		return override
 	}
 	if runtime.GOOS == "windows" {
@@ -96,47 +102,75 @@ func CredsPath() string {
 	return filepath.Join(ConfigDir(), "credentials.json")
 }
 
-// KeyDirEnv overrides where the file credential store keeps DPoP private keys.
-const KeyDirEnv = "GASWORKS_KEY_DIR"
-
-// KeyDir resolves the directory the file credential store keeps DPoP private keys in:
+// StateDir resolves the gasworks state directory — where secrets the user never edits and
+// never syncs live:
 //
-//	$GASWORKS_KEY_DIR                                                (override, any platform)
-//	<config dir>/dpop-keys                                           when $GASWORKS_CONFIG_DIR pins a profile
-//	%LOCALAPPDATA%/gasworks/dpop-keys                                on Windows
-//	$XDG_STATE_HOME/gasworks/dpop-keys else ~/.local/state/gasworks/dpop-keys  elsewhere
+//	<config dir>              when $GASWORKS_CONFIG_DIR pins a profile
+//	%LOCALAPPDATA%/gasworks   on Windows
+//	$XDG_STATE_HOME/gasworks  else  ~/.local/state/gasworks  elsewhere
 //
-// By default it is NOT under the config dir: Auth Access v1 requires the opaque session and
-// the key it is bound to never to be stored or backed up together, and the config dir is
-// what "sync my dotfiles" and "back up ~/.config" carry. A profile pinned with
-// GASWORKS_CONFIG_DIR (the canary runbook, a test) is meant to be self-contained and
-// disposable, so its keys stay inside it — set GASWORKS_KEY_DIR to split those too.
-func KeyDir() string {
-	if override := os.Getenv(KeyDirEnv); override != "" {
-		return override
-	}
-	if profile := os.Getenv("GASWORKS_CONFIG_DIR"); profile != "" {
-		return filepath.Join(profile, keyDirName)
+// It is deliberately NOT the config dir: Auth Access v1 requires the opaque session and the
+// key it is bound to never to be stored or backed up together, and the config dir is what
+// "sync my dotfiles" and "back up ~/.config" carry. On Windows that means LocalAppData, not
+// the roaming APPDATA the config dir uses — a roaming profile copies the key to every
+// machine the user signs in to. A profile pinned with GASWORKS_CONFIG_DIR is meant to be
+// self-contained and disposable, so its state stays inside it; the per-directory overrides
+// below split those back out.
+func StateDir() string {
+	if profile := os.Getenv(ConfigDirEnv); profile != "" {
+		return profile
 	}
 	if runtime.GOOS == "windows" {
-		// LocalAppData, not the roaming APPDATA the config dir uses: a roaming profile
-		// copies the key to every machine the user signs in to.
 		base := os.Getenv("LOCALAPPDATA")
 		if base == "" {
 			home, _ := os.UserHomeDir()
 			base = filepath.Join(home, "AppData", "Local")
 		}
-		return filepath.Join(base, "gasworks", keyDirName)
+		return filepath.Join(base, "gasworks")
 	}
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
-		return filepath.Join(xdg, "gasworks", keyDirName)
+		return filepath.Join(xdg, "gasworks")
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".local", "state", "gasworks", keyDirName)
+	return filepath.Join(home, ".local", "state", "gasworks")
 }
 
-// keyDirName is the leaf directory the DPoP private keys live in.
-const keyDirName = "dpop-keys"
+// KeyDirEnv overrides where the file credential store keeps DPoP private keys.
+const KeyDirEnv = "GASWORKS_KEY_DIR"
+
+// KeyDir resolves the directory the file credential store keeps DPoP private keys in:
+// $GASWORKS_KEY_DIR, else <state dir>/dpop-keys.
+func KeyDir() string {
+	if override := os.Getenv(KeyDirEnv); override != "" {
+		return override
+	}
+	return filepath.Join(StateDir(), keyDirName)
+}
+
+// MintedKeyDirEnv overrides where the CLI keeps the credentials it mints.
+const MintedKeyDirEnv = "GASWORKS_MINTED_KEY_DIR"
+
+// MintedKeyDir resolves the directory a minted credential is written to:
+// $GASWORKS_MINTED_KEY_DIR, else <state dir>/minted-keys.
+//
+// It sits in the state namespace beside the DPoP keys, for the same reason they do: a minted
+// credential is a bearer secret, and the config dir is the one that gets synced and backed
+// up. The one exception is the one StateDir already makes — a profile pinned with
+// $GASWORKS_CONFIG_DIR IS the state dir, so there the minted keys do land under the config
+// dir, which is what "self-contained and disposable" means. Set $GASWORKS_MINTED_KEY_DIR to
+// split them back out.
+func MintedKeyDir() string {
+	if override := os.Getenv(MintedKeyDirEnv); override != "" {
+		return override
+	}
+	return filepath.Join(StateDir(), mintedKeyDirName)
+}
+
+// The leaf directories under the state dir.
+const (
+	keyDirName       = "dpop-keys"
+	mintedKeyDirName = "minted-keys"
+)
 
 func lockPath() string {
 	return filepath.Join(ConfigDir(), ".lock")
@@ -237,7 +271,7 @@ func Save(d *Data) error {
 	// would inherit the parent dir's ACL — potentially readable by other users. Re-apply a
 	// user-only ACL like the Python store's icacls call. Best-effort: a failure is logged,
 	// not fatal (the credentials are already written; failing here would lose the login).
-	lockdownFile(CredsPath())
+	lockdown.Apply(CredsPath())
 	return nil
 }
 

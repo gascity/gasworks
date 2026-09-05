@@ -12,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gascity/gasworks/internal/climint"
+	"github.com/gascity/gasworks/internal/config"
 )
 
 // --- test harness ------------------------------------------------------------------------
@@ -42,21 +45,47 @@ type stubServer struct {
 	contextErrorBody map[string]any
 	// contextResponse overrides the successful context response when non-nil.
 	contextResponse map[string]any
+
+	// mint is the climint mint plane, started on demand by startMint. It is its OWN https
+	// origin, not a route on the stub above: climint is served at auth.gascity.com, and the
+	// config layer refuses a plain-http one because the URL is signed into the DPoP proof.
+	mint *httptest.Server
+	// mintChallengeHandler overrides leg A (POST /v0/cli/mint/challenges) when non-nil.
+	// attempt is 0-based across the run.
+	mintChallengeHandler func(w http.ResponseWriter, r *http.Request, attempt int)
+	// mintCompleteHandler overrides leg C (POST .../challenges/{id}/complete) when non-nil,
+	// so a test can answer 425 twice and then 201, or fail terminally.
+	mintCompleteHandler func(w http.ResponseWriter, r *http.Request, attempt int)
+	// mintChallenge is the default leg A 201 body; mintCredential the default leg C one.
+	mintChallenge  map[string]any
+	mintCredential map[string]any
 }
 
 type recordedReq struct {
 	path string
 	form url.Values
+	// body is the raw request body — the mint legs post JSON, which does not survive form
+	// parsing. auth and dpop are the two headers the ceremony's invariants are about.
+	body string
+	auth string
+	dpop string
 }
 
 func (s *stubServer) record(r *http.Request) url.Values {
 	form := url.Values{}
+	var raw []byte
 	if r.Method == http.MethodPost {
-		body, _ := io.ReadAll(r.Body)
-		form, _ = url.ParseQuery(string(body))
+		raw, _ = io.ReadAll(r.Body)
+		form, _ = url.ParseQuery(string(raw))
 	}
 	s.mu.Lock()
-	s.requests = append(s.requests, recordedReq{path: r.URL.RequestURI(), form: form})
+	s.requests = append(s.requests, recordedReq{
+		path: r.URL.RequestURI(),
+		form: form,
+		body: string(raw),
+		auth: r.Header.Get("Authorization"),
+		dpop: r.Header.Get("DPoP"),
+	})
 	s.mu.Unlock()
 	return form
 }
@@ -83,6 +112,16 @@ func newStub(t *testing.T) *stubServer {
 	t.Helper()
 	s := &stubServer{
 		refreshTok: map[string]any{"id_token": "ID2", "refresh_token": "RT2"},
+		// approve_url is filled in by startMint: the CLI checks it against the configured
+		// mint origin, which is not known until that server has a port.
+		mintChallenge: map[string]any{
+			"challenge_id": "chal_1", "confirm_code": "WXYZ-4242", "expires_in": 180,
+		},
+		mintCredential: map[string]any{
+			"key_id": "spk_1", "secret": "gck_sp_secret_value", "prefix": "gck_sp",
+			"org_id": "org_a", "scopes": []string{"forge:city.create", "forge:city.delete"},
+			"expires_at": "2026-09-10T00:00:00Z",
+		},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -112,8 +151,10 @@ func newStub(t *testing.T) *stubServer {
 				s.loginHandler(w, r, form)
 				return
 			}
+			// The prefix is what the real STS returns for a human login, and the mint legs
+			// accept nothing else (see climint.UserSessionPrefix).
 			writeJSON(w, http.StatusCreated, map[string]any{
-				"session_token": "SESS", "session_id": "ses_1",
+				"session_token": "gcs_user_SESS", "session_id": "ses_1",
 				"org_id": form.Get("org"), "token_type": "DPoP", "expires_in": 28800,
 			})
 		case strings.HasSuffix(path, "/sts/v0/token"):
@@ -166,6 +207,62 @@ func newStub(t *testing.T) *stubServer {
 	s.srv = httptest.NewServer(mux)
 	t.Cleanup(s.srv.Close)
 	return s
+}
+
+// startMint brings up the climint mint plane and points the CLI at it. It is separate from
+// newStub because it is a separate ORIGIN in production too: https only (the config layer
+// refuses anything else, since the URL is signed into the DPoP proof as htu), which means the
+// ceremony's client has to be swapped for one that trusts this server's CA.
+//
+// Requests land in the same recorder as the STS stub's, so reqs() sees the whole run in order.
+func (s *stubServer) startMint(t *testing.T) {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v0/cli/mint/challenges", func(w http.ResponseWriter, r *http.Request) {
+		s.record(r)
+		if s.mintChallengeHandler != nil {
+			s.mintChallengeHandler(w, r, len(s.reqs("/v0/cli/mint/challenges"))-1)
+			return
+		}
+		writeJSON(w, http.StatusCreated, s.mintChallenge)
+	})
+	mux.HandleFunc("/v0/cli/mint/challenges/", func(w http.ResponseWriter, r *http.Request) {
+		s.record(r)
+		attempt := len(s.reqs("/complete")) - 1
+		if s.mintCompleteHandler != nil {
+			s.mintCompleteHandler(w, r, attempt)
+			return
+		}
+		writeJSON(w, http.StatusCreated, s.mintCredential)
+	})
+	s.mint = httptest.NewTLSServer(mux)
+	t.Cleanup(s.mint.Close)
+	t.Setenv(config.ClimintBaseEnv, s.mint.URL)
+	// The approval page is served by the mint plane itself, which is what the CLI checks the
+	// URL against before it hands it to a browser.
+	s.mintChallenge["approve_url"] = s.mint.URL + "/cli/approve?c=chal_1"
+
+	transport := s.mint.Client().Transport.(*http.Transport).Clone()
+	// As in production (httpc.NewNoKeepAliveClient): a single-use proof is never replayed on a
+	// pooled connection, and the transport never decompresses — the bytes the ceremony saves
+	// have to be the bytes on the wire.
+	transport.DisableKeepAlives = true
+	transport.DisableCompression = true
+	previous := mintClient
+	mintClient = &climint.Client{HTTP: &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}}
+	t.Cleanup(func() { mintClient = previous })
+}
+
+// mintPending is the climint 425: not RFC 8628, no OAuth error field — a status discriminator
+// and the interval to wait.
+func mintPending(w http.ResponseWriter, status string, interval int) {
+	writeJSON(w, http.StatusTooEarly, map[string]any{"status": status, "interval": interval})
 }
 
 // seed points the CLI at the stub + a fresh temp config dir and writes initial credentials.

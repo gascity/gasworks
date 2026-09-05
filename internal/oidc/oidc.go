@@ -501,6 +501,11 @@ func Revoke(cfg config.Config, refreshToken string) {
 	}, nil)
 }
 
+// OpenBrowser best-effort opens url in the user's browser, for a flow that sends the human to
+// a page this package does not itself serve — the climint approval page. It calls through the
+// same package var the login flows use, so a test that swaps that var still sees every launch.
+func OpenBrowser(url string) { openBrowser(url) }
+
 // openBrowser best-effort opens url in the user's browser. It is a package var so tests can
 // drive the loopback callback in place of a real browser. Failure is ignored — the URL was
 // already printed.

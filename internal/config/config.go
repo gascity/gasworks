@@ -3,6 +3,9 @@
 package config
 
 import (
+	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +14,11 @@ import (
 // AllowFileKeystoreEnv opts the DPoP private key into the plaintext-file credential store.
 // It is named here (rather than inline) because the fail-closed enrolment error quotes it.
 const AllowFileKeystoreEnv = "GASWORKS_ALLOW_FILE_KEYSTORE"
+
+// ClimintBaseEnv overrides the climint external-mint origin. It is named here because the
+// fail-closed origin error quotes it: a dev pointing the CLI at a local, non-https Keycloak
+// has to set this explicitly rather than have the CLI guess an origin.
+const ClimintBaseEnv = "GASWORKS_CLIMINT_URL"
 
 const (
 	defaultSTSBase      = "https://works.gascity.com"
@@ -43,6 +51,12 @@ type Config struct {
 	// canonical-vs-legacy classification.
 	preferredSTS string
 	OIDCIssuer   string
+	// ClimintBase is the origin serving the climint external-mint ceremony. It is a
+	// DIFFERENT origin from the STS (auth.gascity.com, not works/api.gascity.com) and must
+	// never be routed through the STS client: the mint legs are signed with single-use DPoP
+	// proofs, and the STS client's cross-origin retry would burn one. It defaults to the
+	// origin of OIDCIssuer; the URL accessors validate it before it can be signed as an htu.
+	ClimintBase  string
 	ClientID     string
 	LoopbackPort int
 	// AllowFileKeystore opts the DPoP private key into the plaintext-file credential
@@ -73,14 +87,33 @@ func FromEnv() Config {
 	if canonical == "" && os.Getenv("GASWORKS_STS_URL") == "" {
 		canonical = defaultCanonicalSTS
 	}
+	issuer := strings.TrimRight(env("GASWORKS_OIDC_ISSUER", defaultOIDCIssuer), "/")
+	climint := strings.TrimRight(os.Getenv(ClimintBaseEnv), "/")
+	if climint == "" {
+		climint = originOf(issuer)
+	}
 	return Config{
 		STSBase:           legacy,
 		STSCanonical:      canonical,
-		OIDCIssuer:        strings.TrimRight(env("GASWORKS_OIDC_ISSUER", defaultOIDCIssuer), "/"),
+		OIDCIssuer:        issuer,
+		ClimintBase:       climint,
 		ClientID:          env("GASWORKS_CLIENT_ID", defaultClientID),
 		LoopbackPort:      port,
 		AllowFileKeystore: boolEnv(AllowFileKeystoreEnv),
 	}
+}
+
+// originOf reduces a URL to its scheme://host origin, or "" if it has neither. climint is
+// served by the same host as the OIDC issuer, so the issuer override carries the CLI to a
+// staging deployment without a second env var — but only its origin: the issuer's realm path
+// is not part of the mint API. An origin that is not canonical (a plain-http dev issuer, say)
+// is returned as-is and rejected later, by the accessor that would have signed it as an htu.
+func originOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // boolEnv reads a boolean env override. An unset or unparseable value is false: a typo must
@@ -189,3 +222,100 @@ func (c Config) OIDCTokenURL() string { return c.OIDCIssuer + "/protocol/openid-
 
 // RevokeURL is the Keycloak token-revocation endpoint.
 func (c Config) RevokeURL() string { return c.OIDCIssuer + "/protocol/openid-connect/revoke" }
+
+// --- climint external mint (auth.gascity.com) ---
+
+// MintChallengesURL is leg A of the external-mint ceremony: it opens a challenge and returns
+// the confirm code the user types into the browser.
+func (c Config) MintChallengesURL() (string, error) {
+	origin, err := c.ClimintOrigin()
+	if err != nil {
+		return "", err
+	}
+	return origin + "/v0/cli/mint/challenges", nil
+}
+
+// MintCompleteURL is leg C: the poll that redeems an approved challenge for the credential.
+// The challenge id is a path segment, so the URL — and therefore the DPoP htu signed over it
+// — differs per challenge and a fresh proof is required per request.
+func (c Config) MintCompleteURL(challengeID string) (string, error) {
+	origin, err := c.ClimintOrigin()
+	if err != nil {
+		return "", err
+	}
+	if err := checkPathSegment(challengeID); err != nil {
+		return "", fmt.Errorf("challenge id: %w", err)
+	}
+	return origin + "/v0/cli/mint/challenges/" + challengeID + "/complete", nil
+}
+
+// ClimintOrigin is the validated scheme://host the mint plane is served at, quoting the
+// override that fixes a bad one. It is exported because it is the only origin the ceremony
+// may talk to: the CLI checks the server-supplied approval URL against it before handing that
+// URL to a browser, so nothing the mint plane returns can send the human to another host.
+func (c Config) ClimintOrigin() (string, error) {
+	origin, err := canonicalOrigin(c.ClimintBase)
+	if err != nil {
+		return "", fmt.Errorf("climint base URL: %w (set %s to a canonical https origin)", err, ClimintBaseEnv)
+	}
+	return origin, nil
+}
+
+// canonicalOrigin accepts only the origin form the climint server itself canonicalises to
+// before it compares a DPoP htu byte for byte: https, lowercase scheme and host, no spelled
+// out :443, and no userinfo, path, query, fragment or percent-escape. Anything else is
+// REJECTED rather than normalised — a client that quietly rewrote the operator's origin
+// would sign an htu against a host the operator did not name, and every proof the server
+// then rejects has already spent its single-use jti.
+func canonicalOrigin(raw string) (string, error) {
+	if raw == "" {
+		return "", errors.New("is not configured")
+	}
+	if !strings.HasPrefix(raw, "https://") {
+		return "", fmt.Errorf("%q must start with a lowercase https:// scheme", raw)
+	}
+	if strings.Contains(raw, "%") {
+		return "", fmt.Errorf("%q must not contain a percent-escape", raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("%q is not a valid URL: %w", raw, err)
+	}
+	switch {
+	case u.User != nil:
+		return "", fmt.Errorf("%q must not carry userinfo", raw)
+	case u.Host == "":
+		return "", fmt.Errorf("%q has no host", raw)
+	case u.Host != strings.ToLower(u.Host):
+		return "", fmt.Errorf("%q must use a lowercase host", raw)
+	case strings.HasSuffix(u.Host, ":"):
+		return "", fmt.Errorf("%q has an empty port", raw)
+	case u.Port() == "443":
+		return "", fmt.Errorf("%q must not spell out the default port :443", raw)
+	case u.Path != "":
+		return "", fmt.Errorf("%q must be a bare origin, with no path", raw)
+	case u.RawQuery != "" || u.ForceQuery:
+		return "", fmt.Errorf("%q must not carry a query", raw)
+	case u.Fragment != "":
+		return "", fmt.Errorf("%q must not carry a fragment", raw)
+	}
+	return raw, nil
+}
+
+// checkPathSegment rejects an id that could not appear verbatim in a URL path. A percent
+// escape or a stray slash would make the request URL differ from the htu the server
+// reconstructs — or address a different endpoint entirely.
+func checkPathSegment(s string) error {
+	if s == "" {
+		return errors.New("is empty")
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.', r == '_', r == '~':
+		default:
+			return fmt.Errorf("contains %q, which does not survive a URL path unescaped", r)
+		}
+	}
+	return nil
+}

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/gascity/gasworks/internal/lockdown"
 )
 
 // FileBackendID is the registry id of the plaintext-file backend.
@@ -69,7 +71,7 @@ func (f *File) Put(handle, pem string) error {
 		_ = os.Chmod(f.dir, 0o700)
 	} else {
 		// NTFS ignores the POSIX mode, so the directory would inherit the parent's ACL.
-		lockdownPath(f.dir)
+		lockdown.Apply(f.dir)
 	}
 	tmp, err := os.CreateTemp(f.dir, ".key-*.tmp")
 	if err != nil {
@@ -100,7 +102,7 @@ func (f *File) Put(handle, pem string) error {
 	if runtime.GOOS == "windows" {
 		// Same trade as the credential store's Save: on Windows the chmod above is a
 		// no-op, so re-apply a user-only ACL to the key itself.
-		lockdownPath(path)
+		lockdown.Apply(path)
 	}
 	return nil
 }

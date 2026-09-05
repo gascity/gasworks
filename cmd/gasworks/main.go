@@ -55,6 +55,8 @@ func run(argv []string) int {
 		err = cmdInspect(cfg, rest)
 	case "rotate-key":
 		err = cmdRotateKey(cfg, rest)
+	case "sp":
+		err = cmdSP(cfg, rest)
 	case "whoami":
 		err = cmdWhoami(cfg, rest)
 	case "logout":
@@ -161,6 +163,7 @@ Usage:
   gasworks credential-provider
   gasworks inspect [--json]
   gasworks rotate-key [--org <id|slug>]
+  gasworks sp mint-key --sp <id> --scope <scope> [--org <id|slug>] [--out <path>] [--dry-run]
   gasworks whoami
   gasworks logout
   gasworks version`
