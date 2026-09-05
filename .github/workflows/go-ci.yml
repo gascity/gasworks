@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -119,7 +119,7 @@ jobs:
   # for all targets keeps working — catches a broken .goreleaser.yaml or a non-portable
   # dependency before a real `v*` tag is cut. No signing/publishing happens in --snapshot.
   goreleaser-snapshot:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
