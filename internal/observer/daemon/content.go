@@ -493,7 +493,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		if st != nil {
 			u.persistMarker(id, marker)
 		}
-		u.logf("content upload: 409 content mismatch for session %s; advancing", native)
+		u.logf("content upload: 409 content mismatch for session %s%s; advancing", native, serverMessage(res))
 	case res.StatusCode == 429:
 		// Shed: honor Retry-After, but cap it so an absurd value cannot disable upload for the run.
 		hold := res.RetryAfter
@@ -512,7 +512,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// than retry every transcript forever. A restart re-probes.
 		u.disabled = true
 		u.mu.Unlock()
-		u.logf("content upload: status %d; disabling content upload for this run", res.StatusCode)
+		u.logf("content upload: status %d%s; disabling content upload for this run", res.StatusCode, serverMessage(res))
 	case res.StatusCode == 400 || res.StatusCode == 413 || res.StatusCode == 422:
 		// Permanent for THESE bytes (malformed / too large / contract violation the client guard
 		// missed): record the hash in memory so identical bytes are not re-POSTed, advance eval so the
@@ -525,7 +525,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
 			st.evalSize, st.evalMod, st.evalSet, st.evalGCSessionID = rsize, rmod, true, gcSessionID
 			if !st.permanentLogged {
-				u.logf("content upload: permanent status %d for session %s; not retrying identical bytes", res.StatusCode, native)
+				u.logf("content upload: permanent status %d for session %s%s; not retrying identical bytes", res.StatusCode, native, serverMessage(res))
 				st.permanentLogged = true
 			}
 		}
@@ -537,7 +537,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 			gaveUp = st.recordPostFailureLocked(rsize, rmod)
 		}
 		u.mu.Unlock()
-		u.logf("content upload: unexpected status %d for session %s", res.StatusCode, native)
+		u.logf("content upload: unexpected status %d for session %s%s", res.StatusCode, native, serverMessage(res))
 		if gaveUp {
 			u.logf("content upload: giving up on %s after %d failed attempts on this snapshot; will retry when it changes", locator, maxContentPostAttempts)
 		}
@@ -751,6 +751,17 @@ func (u *contentUploader) recordGuardRefusalLocked(st *contentState, locator str
 	}
 	u.guardRefusals[reason]++
 	u.logf("content upload: refusing %s: %s guard", locator, reason)
+}
+
+// serverMessage renders the collector's typed error message as a log suffix, or "" when the
+// response carried no decodable message. PostContent already decodes it into ContentResult.Message;
+// without this the operator sees only a bare status code and has to replay the request by hand to
+// learn which contract the upload violated.
+func serverMessage(res *upload.ContentResult) string {
+	if res == nil || res.Message == "" {
+		return ""
+	}
+	return " (server: " + res.Message + ")"
 }
 
 func (u *contentUploader) logf(format string, args ...any) {
