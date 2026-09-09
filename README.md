@@ -24,6 +24,10 @@ Download the archive for your OS/arch from the [GitHub Releases](https://github.
 
 `gasworks-forwarder` is **not** installed with `brew`. It runs unattended holding ingest credentials, so its integrity check must never be bypassed by a tap fast-path. Install it through the [gasworks pack](https://github.com/gascity/gasworks-pack), whose install stub performs the cosign verification before placing the binary.
 
+### Companion daemon
+
+`gasworks-companion` is the endpoint daemon that watches approved transcript roots and ships them to a collector. Install it with [`gasworks-pack/observer/install.sh`](./gasworks-pack/observer/install.sh); to move an already-running host to a newer build, follow **[docs/observer-daemon-release.md](./docs/observer-daemon-release.md)**, which covers build provenance, the canary order, spool state-dir migration, verification, and rollback.
+
 ## Usage
 
 ```sh
