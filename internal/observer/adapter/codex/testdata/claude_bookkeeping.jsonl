@@ -1,0 +1,6 @@
+{"parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"<trimmed>"},"uuid":"7d0c1c7e-1c1a-4d4a-9f5b-1c2b3a4d5e6f","timestamp":"2026-09-08T22:10:00.000Z","userType":"external","cwd":"/work","sessionId":"f026a680-2725-42f7-bd35-6ba287300d1a","version":"2.1.263"}
+{"type":"file-history-snapshot","messageId":"7d0c1c7e-1c1a-4d4a-9f5b-1c2b3a4d5e6f","snapshot":{"messageId":"7d0c1c7e-1c1a-4d4a-9f5b-1c2b3a4d5e6f","trackedFileBackups":{},"timestamp":"2026-09-08T22:10:00.100Z"},"isSnapshotUpdate":false}
+{"parentUuid":"7d0c1c7e-1c1a-4d4a-9f5b-1c2b3a4d5e6f","isSidechain":false,"type":"assistant","message":{"id":"msg_01","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"<trimmed>"}],"usage":{"input_tokens":12,"output_tokens":7,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"uuid":"a1b2c3d4-0000-4000-8000-000000000001","timestamp":"2026-09-08T22:10:05.000Z","sessionId":"f026a680-2725-42f7-bd35-6ba287300d1a","version":"2.1.263"}
+{"type":"file-history-delta","messageId":"a1b2c3d4-0000-4000-8000-000000000001","delta":{"trackedFileBackups":{}},"timestamp":"2026-09-08T22:10:05.100Z"}
+{"type":"summary","summary":"<trimmed>","leafUuid":"a1b2c3d4-0000-4000-8000-000000000001"}
+{"type":"reasoning","text":"a record shape this adapter does not recognize","timestamp":"2026-09-08T22:10:06.000Z"}

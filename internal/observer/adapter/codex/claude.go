@@ -24,6 +24,20 @@ import (
 // a co-resident Codex session.
 const claudeProvider = "claude"
 
+// isClaudeBookkeepingType reports whether a top-level type names a Claude Code record that carries
+// neither the session envelope nor a message: the file-history checkpoint records and the
+// compaction summary. They are part of the format, hold no evidence this adapter projects, and
+// are the only Claude records without a "sessionId" — so without this they would each degrade to
+// an UNSUPPORTED_FORMAT diagnostic and mark every Claude session a partial capture.
+func isClaudeBookkeepingType(t string) bool {
+	switch t {
+	case "file-history-snapshot", "file-history-delta", "summary":
+		return true
+	default:
+		return false
+	}
+}
+
 // peekClaudeModel scans the WHOLE buffer for the first assistant record's message.model — not just
 // the first line — so the synthesized SESSION_LIFECYCLE (emitted at the first sessionId-bearing
 // envelope, which may be a non-assistant record like a user turn) carries the model without a second

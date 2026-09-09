@@ -221,6 +221,26 @@ func TestParseUnknownRecordIsUnsupportedFormat(t *testing.T) {
 	}
 }
 
+// Claude Code writes file-history checkpoints and compaction summaries without a sessionId.
+// They are part of the format, not an unknown one: they must parse to nothing, while a record
+// shape the adapter genuinely does not know still degrades to the diagnostic.
+func TestParseClaudeBookkeepingRecordsAreNotDiagnostics(t *testing.T) {
+	res := Parse(readFixture(t, "claude_bookkeeping.jsonl"), defaultRefConfig())
+	got := kindCounts(res.Candidates)
+	if got[KindSessionLifecycle] != 1 || got[KindUsage] != 1 {
+		t.Fatalf("the session envelope and assistant usage must still parse, got %v", got)
+	}
+	if got[KindDiagnostic] != 1 {
+		t.Fatalf("only the unrecognized record may yield a diagnostic, got %v", got)
+	}
+	for _, c := range res.Diagnostics() {
+		if c.LineNumber != 6 {
+			t.Errorf("diagnostic on line %d, want the unrecognized record on line 6", c.LineNumber)
+		}
+		canonicalBytes(t, c)
+	}
+}
+
 func TestParsePartialTrailingLineNotConsumed(t *testing.T) {
 	data := readFixture(t, "partial_trailing_line.jsonl")
 	res := Parse(data, defaultRefConfig())
