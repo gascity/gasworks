@@ -284,6 +284,8 @@ func (st *parseState) parseLine(line []byte, lineNo int, cfg ReferenceConfig) []
 		return st.parseRolloutLine(probe, lineNo, cfg)
 	case probe.SessionIDCamel != "" || len(probe.Message) > 0:
 		return st.parseClaudeLine(probe, lineNo, cfg)
+	case isClaudeBookkeepingType(probe.Type):
+		return nil
 	default:
 		return []*Candidate{diagnosticCandidate(probe.probeTime(), lineNo, "unsupported transcript record type")}
 	}
