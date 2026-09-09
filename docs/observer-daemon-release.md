@@ -280,8 +280,11 @@ Read the refusals on day one.
 printf 'ack=%d\n' "$(( 16#$(xxd -s 4 -l 8 -p "$STATE/ack") ))"   # run twice, minutes apart
 ```
 
-`gasworks-pack/observer/doctor.sh --state-dir "$STATE" --expect-wal` asserts a non-empty WAL
-survived the upgrade along with the owner-only permission invariants.
+[`gasworks-pack/observer/doctor.sh`](../gasworks-pack/observer/doctor.sh) `--expect-wal`
+turns "a non-empty WAL survived the upgrade" into a hard check, alongside the owner-only
+permission invariants. It assumes the pack's install layout, so on a hand-managed unit pass
+`--prefix`, `--config-dir`, and `--state-dir` to match — the binary and config-dir mode
+checks are hard failures, not warnings, if they point at paths you do not use.
 
 **Replay one content upload by hand.** This isolates the collector from the daemon: same
 route, same headers, same bytes. A 200/201 proves the credential, route, and header contract
