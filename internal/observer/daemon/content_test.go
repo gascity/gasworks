@@ -16,6 +16,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/contentguard"
 	"github.com/gascity/gasworks/internal/observer/upload"
+	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // Valid transcript paths for the always-on content-lane allowlist (contentguard): a codex
@@ -1127,5 +1128,140 @@ func TestContentUploadGuardsRefuseSecretsBeforeAnyRequest(t *testing.T) {
 	h.u.mu.Unlock()
 	if total != 4 {
 		t.Fatalf("guard refusals re-counted on a second tick: total = %d, want 4", total)
+	}
+}
+
+// TestContentUploadGiveUpHoldsForGCBoundTranscript is the mc-jgsk1 regression. A transcript that
+// carries a GC session id and keeps drawing a status the uploader treats as transient must still be
+// given up on after maxContentPostAttempts. Before the fix the give-up advanced only (size,mod) and
+// left evalGCSessionID empty, so tick's skip predicate never matched a GC-bound transcript and the
+// daemon re-read, re-hashed and re-POSTed the same doomed snapshot every tick forever — the 502 wall
+// the maintainer-city codex unit sat in for 14 hours.
+func TestContentUploadGiveUpHoldsForGCBoundTranscript(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 502, Message: "content sink rejected the upload"}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 909, 910
+	h.reader.set(dev, ino, "codex-body", 1)
+	h.sessions.set(dev, ino, "019fbaaf-fdeb-76c0-9829-77f33a28b363", "codex")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, 10, 1, "gcs-session-004fec7bc575d199017dc0d299c875b0")
+
+	for i := 0; i < 20; i++ {
+		h.clock.advance(31 * time.Second) // past the transient hold each time
+		h.u.tick(context.Background())
+	}
+	if got := sender.count(); got > maxContentPostAttempts {
+		t.Fatalf("kept re-POSTing a doomed GC-bound snapshot: %d posts, want <= %d", got, maxContentPostAttempts)
+	}
+	if got := h.reader.readCount(); got > maxContentPostAttempts {
+		t.Fatalf("kept re-reading a doomed GC-bound snapshot: %d reads, want <= %d", got, maxContentPostAttempts)
+	}
+}
+
+// TestContentUploadAdoptsStoreBindingOnSourceBindingConflict is the mc-jgsk1 recovery acceptance.
+// The content store binds a transcript's GC session id write-once; when the collector reports that
+// the offered binding conflicts with the one already held for that source path, the bytes still
+// belong to the bound transcript. The daemon re-sends the SAME snapshot under the provider-native
+// identity alone, that upload is accepted, and the refusal is latched so the binding is offered
+// exactly once — no loop, and the transcript content is recovered.
+func TestContentUploadAdoptsStoreBindingOnSourceBindingConflict(t *testing.T) {
+	sender := &fakeContentSender{respond: func(_ int, r upload.ContentRequest) (*upload.ContentResult, error) {
+		if r.GCSessionID != "" {
+			return &upload.ContentResult{
+				StatusCode: 409,
+				Code:       wire.ObserverErrorBodyCodeSOURCEBINDINGCONFLICT,
+				Message:    "transcript identity conflicts with the binding held for this source path",
+			}, nil
+		}
+		return &upload.ContentResult{StatusCode: 201, ReceiptID: "r", Status: "DURABLY_RECORDED"}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 911, 912
+	h.reader.set(dev, ino, "codex-body", 1)
+	h.sessions.set(dev, ino, "019fbaaf-fdeb-76c0-9829-77f33a28b363", "codex")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, 10, 1, "gcs-session-004fec7bc575d199017dc0d299c875b0")
+
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+
+	if sender.count() != 2 {
+		t.Fatalf("posts = %d, want 2 (offered binding, then adopted the store's)", sender.count())
+	}
+	if sender.at(0).GCSessionID == "" {
+		t.Fatal("first post did not offer the sidecar GC session id")
+	}
+	if got := sender.at(1).GCSessionID; got != "" {
+		t.Fatalf("retry still carried a GC session id: %q", got)
+	}
+	if got := string(sender.at(1).Body); got != "codex-body" {
+		t.Fatalf("retry sent different bytes: %q", got)
+	}
+
+	// The refusal is latched and persisted: further ticks never re-offer the binding, and the
+	// accepted snapshot dedups against the OBSERVED gc session id so it is not re-sent at all.
+	for i := 0; i < 5; i++ {
+		h.clock.advance(31 * time.Second)
+		h.u.tick(context.Background())
+	}
+	if sender.count() != 2 {
+		t.Fatalf("posts = %d after further ticks, want 2", sender.count())
+	}
+	m, ok := h.u.loadMarker(transcriptIdentity{device: dev, inode: ino})
+	if !ok {
+		t.Fatal("no marker persisted for the recovered transcript")
+	}
+	if !m.GCBindingRefused {
+		t.Fatal("marker did not persist the refused GC binding")
+	}
+	if m.GCSessionID != "gcs-session-004fec7bc575d199017dc0d299c875b0" {
+		t.Fatalf("marker gc session id = %q, want the observed sidecar value", m.GCSessionID)
+	}
+
+	// A grown transcript is re-sent without re-offering the refused binding.
+	h.reader.set(dev, ino, "codex-body-grown", 2)
+	h.observeWithGCSessionID(dev, ino, testCodexPath, 16, 2, "gcs-session-004fec7bc575d199017dc0d299c875b0")
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if sender.count() != 3 {
+		t.Fatalf("posts = %d after a content change, want 3", sender.count())
+	}
+	if got := sender.at(2).GCSessionID; got != "" {
+		t.Fatalf("re-offered a refused GC binding after a content change: %q", got)
+	}
+
+	n := 0
+	for _, l := range h.logLines() {
+		if strings.Contains(l, "refused the gc session binding") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("binding refusal logged %d times, want exactly 1", n)
+	}
+}
+
+// TestContentUploadKeepsIdempotencyConflictDistinct holds the two 409s apart: an idempotency-key
+// content mismatch carries no SOURCE_BINDING_CONFLICT code, so it keeps its advance-and-move-on
+// behaviour and must not trigger a binding-dropping retry.
+func TestContentUploadKeepsIdempotencyConflictDistinct(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{StatusCode: 409, Message: "content conflicts with a durable snapshot"}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 913, 914
+	h.reader.set(dev, ino, "codex-body", 1)
+	h.sessions.set(dev, ino, "s", "codex")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, 10, 1, "gcs-session-abc")
+
+	for i := 0; i < 4; i++ {
+		h.clock.advance(31 * time.Second)
+		h.u.tick(context.Background())
+	}
+	if sender.count() != 1 {
+		t.Fatalf("posts = %d, want 1 (advance, no retry, no loop)", sender.count())
+	}
+	if got := sender.at(0).GCSessionID; got != "gcs-session-abc" {
+		t.Fatalf("first post gc session id = %q", got)
 	}
 }
