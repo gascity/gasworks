@@ -448,8 +448,8 @@ func TestRecoverInterruptedCreateTrailingEmptySegment(t *testing.T) {
 	if rec.HighestDurableSequence != 3 || rec.NextSequence != 4 {
 		t.Fatalf("highest=%d next=%d, want 3/4 (durable frames intact)", rec.HighestDurableSequence, rec.NextSequence)
 	}
-	if want := filepath.Join(walOf(dir), segmentFilename(4)); rec.InterruptedCreateSegment != want {
-		t.Fatalf("InterruptedCreateSegment = %q, want %q", rec.InterruptedCreateSegment, want)
+	if want := filepath.Join(walOf(dir), segmentFilename(4)); rec.EmptyTrailingSegment != want {
+		t.Fatalf("EmptyTrailingSegment = %q, want %q", rec.EmptyTrailingSegment, want)
 	}
 }
 
@@ -485,7 +485,7 @@ func TestRecoverInterruptedCreateReclaimable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recover: %v", err)
 	}
-	if err := os.Remove(rec.InterruptedCreateSegment); err != nil {
+	if err := os.Remove(rec.EmptyTrailingSegment); err != nil {
 		t.Fatalf("reclaim remove: %v", err)
 	}
 	seg, err := CreateSegment(walOf(dir), SegmentOptions{FormatVersion: 1, SourceID: testSourceID, FirstSequence: rec.NextSequence})
@@ -495,6 +495,173 @@ func TestRecoverInterruptedCreateReclaimable(t *testing.T) {
 	defer seg.Close()
 	if err := seg.Append(frameN(rec.NextSequence)); err != nil {
 		t.Fatalf("Append after reclaim: %v", err)
+	}
+}
+
+// ---- header-only trailing segment (a source that stayed quiet across a restart) ----
+
+// TestRecoverTrailingHeaderOnlySegmentIsReclaimable covers the segment a start creates and
+// never appends to. Its header is valid, so it is not an interrupted create, but it still holds
+// no durable frame and still owns the name NextSequence resolves to — CreateSegment's O_EXCL
+// collides with it on the next start unless recovery reports it for reclaim.
+func TestRecoverTrailingHeaderOnlySegmentIsReclaimable(t *testing.T) {
+	dir := recoverDir(t)
+	if err := writeIdentity(dir, testSourceID, 1); err != nil {
+		t.Fatalf("writeIdentity: %v", err)
+	}
+	buildSegment(t, walOf(dir), 1, 3) // durable frames 1..3
+	// The real writer path: create the next segment, append nothing, close.
+	empty, err := CreateSegment(walOf(dir), SegmentOptions{FormatVersion: 1, SourceID: testSourceID, FirstSequence: 4})
+	if err != nil {
+		t.Fatalf("CreateSegment(4): %v", err)
+	}
+	if err := empty.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rec := mustRecover(t, dir)
+	if rec.HighestDurableSequence != 3 || rec.NextSequence != 4 {
+		t.Fatalf("highest=%d next=%d, want 3/4 (durable frames intact)", rec.HighestDurableSequence, rec.NextSequence)
+	}
+	if rec.Outcome != OutcomeClean {
+		t.Fatalf("outcome = %v, want clean — a never-appended-to segment is not damage", rec.Outcome)
+	}
+	if want := filepath.Join(walOf(dir), segmentFilename(4)); rec.EmptyTrailingSegment != want {
+		t.Fatalf("EmptyTrailingSegment = %q, want %q", rec.EmptyTrailingSegment, want)
+	}
+
+	// Recovery must not touch the file itself; reclaim is rotation's call.
+	if _, err := os.Stat(rec.EmptyTrailingSegment); err != nil {
+		t.Fatalf("recovery removed the empty trailing segment: %v", err)
+	}
+}
+
+// TestRecoverHeaderOnlySoleSegmentRecoversIdentityAndAck is the shape the live crash-loop hit:
+// every acknowledged segment was compacted away and the only file left is the header-only
+// segment the previous start created at acknowledged_through+1.
+func TestRecoverHeaderOnlySoleSegmentRecoversIdentityAndAck(t *testing.T) {
+	dir := recoverDir(t)
+	if err := writeAck(dir, 481700); err != nil {
+		t.Fatalf("writeAck: %v", err)
+	}
+	seg, err := CreateSegment(walOf(dir), SegmentOptions{FormatVersion: 1, SourceID: testSourceID, FirstSequence: 481701})
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rec := mustRecover(t, dir)
+	if rec.NextSequence != 481701 || rec.AcknowledgedThrough != 481700 {
+		t.Fatalf("next=%d ack=%d, want 481701/481700", rec.NextSequence, rec.AcknowledgedThrough)
+	}
+	// The header is the last copy of the source id when the identity sidecar is absent; recovery
+	// must still read it rather than treating the file as opaque.
+	if rec.SourceID != testSourceID || rec.FormatVersion != 1 {
+		t.Fatalf("source=%q format=%d, want %q/1", rec.SourceID, rec.FormatVersion, testSourceID)
+	}
+	if rec.EmptyTrailingSegment == "" {
+		t.Fatalf("EmptyTrailingSegment empty; the sole header-only segment owns NextSequence")
+	}
+}
+
+// TestRecoverBoundRejectsHeaderOnlySegmentOfAnotherSource proves the reclaim never runs ahead of
+// the binding check: a header-only segment still names a source, and rebinding it to a different
+// one must fail before recovery reports anything reclaimable.
+func TestRecoverBoundRejectsHeaderOnlySegmentOfAnotherSource(t *testing.T) {
+	dir := recoverDir(t)
+	seg, err := CreateSegment(walOf(dir), SegmentOptions{FormatVersion: 1, SourceID: testSourceID, FirstSequence: 1})
+	if err != nil {
+		t.Fatalf("CreateSegment: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rec, err := RecoverBound(dir, "src_someone_else", 1)
+	if !errors.Is(err, ErrIdentityMismatch) {
+		t.Fatalf("RecoverBound err = %v, want ErrIdentityMismatch", err)
+	}
+	if rec != nil {
+		t.Fatalf("recovery = %+v, want nil on a binding mismatch", rec)
+	}
+}
+
+// TestRecoverTornTailTruncatedToHeaderOnlyIsReclaimable covers the second way a bare header
+// appears: a crash between a frame's write and its fsync leaves a torn tail, and truncating it
+// takes the segment back to header-only. The truncation outcome must not hide the slot
+// collision that follows.
+func TestRecoverTornTailTruncatedToHeaderOnlyIsReclaimable(t *testing.T) {
+	dir := recoverDir(t)
+	if err := writeIdentity(dir, testSourceID, 1); err != nil {
+		t.Fatalf("writeIdentity: %v", err)
+	}
+	hdr := SegmentHeader{FormatVersion: 1, SourceID: testSourceID, FirstSequence: 7, CreationTime: time.Unix(1000, 0).UTC()}
+	full := rawSegmentBytes(t, hdr, frameN(7))
+	hdrLen := len(rawSegmentBytes(t, hdr))
+	path := writeRawSegment(t, walOf(dir), 7, full[:len(full)-3]) // frame 7 torn mid-write
+	if err := writeAck(dir, 6); err != nil {
+		t.Fatalf("writeAck: %v", err)
+	}
+
+	rec := mustRecover(t, dir)
+	if rec.Outcome != OutcomeTruncatedTail {
+		t.Fatalf("outcome = %v, want OutcomeTruncatedTail", rec.Outcome)
+	}
+	if rec.NextSequence != 7 {
+		t.Fatalf("next = %d, want 7 (the torn frame was never durable)", rec.NextSequence)
+	}
+	if got := fileSize(t, path); got != int64(hdrLen) {
+		t.Fatalf("truncated size = %d, want the bare header %d", got, hdrLen)
+	}
+	if rec.EmptyTrailingSegment != path {
+		t.Fatalf("EmptyTrailingSegment = %q, want %q", rec.EmptyTrailingSegment, path)
+	}
+	// The torn bytes are still preserved for forensics before the slot is reclaimed.
+	if rec.DiagnosticPath == "" {
+		t.Fatalf("no torn-tail diagnostic recorded")
+	}
+
+	reclaimed, err := ReclaimEmptyTrailingSegment(dir, rec)
+	if err != nil {
+		t.Fatalf("ReclaimEmptyTrailingSegment: %v", err)
+	}
+	if !reclaimed {
+		t.Fatalf("reclaimed = false, want true")
+	}
+	seg, err := CreateSegment(walOf(dir), SegmentOptions{FormatVersion: 1, SourceID: testSourceID, FirstSequence: rec.NextSequence})
+	if err != nil {
+		t.Fatalf("CreateSegment after reclaim: %v", err)
+	}
+	if err := seg.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestRecoverHeaderOnlyNonTrailingSegmentIsCorruption pins the bound: only the TRAILING segment
+// may be reclaimed. A header-only segment with a later segment after it breaks contiguity —
+// both would claim the same first_sequence — and must surface as corruption, not a free slot.
+func TestRecoverHeaderOnlyNonTrailingSegmentIsCorruption(t *testing.T) {
+	dir := recoverDir(t)
+	if err := writeIdentity(dir, testSourceID, 1); err != nil {
+		t.Fatalf("writeIdentity: %v", err)
+	}
+	buildSegment(t, walOf(dir), 1, 3)
+	hdr := SegmentHeader{FormatVersion: 1, SourceID: testSourceID, FirstSequence: 4, CreationTime: time.Unix(1000, 0).UTC()}
+	path := writeRawSegment(t, walOf(dir), 4, rawSegmentBytes(t, hdr)) // header-only, not trailing
+	buildSegment(t, walOf(dir), 9, 2)
+
+	rec, err := Recover(dir)
+	var cerr *CorruptionError
+	if !errors.As(err, &cerr) {
+		t.Fatalf("header-only non-trailing err = %v, want *CorruptionError", err)
+	}
+	if rec != nil {
+		t.Fatalf("recovery = %+v, want nil on corruption", rec)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("corrupt-state segment was removed: %v", err)
 	}
 }
 

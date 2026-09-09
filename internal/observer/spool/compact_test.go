@@ -156,7 +156,7 @@ func TestCompactCrashMidCompactionRecoversAndResumes(t *testing.T) {
 	}
 }
 
-func TestReclaimInterruptedCreateFreesTheSlot(t *testing.T) {
+func TestReclaimEmptyTrailingSegmentFreesAnInterruptedCreateSlot(t *testing.T) {
 	dir := recoverDir(t)
 	if err := writeIdentity(dir, testSourceID, 1); err != nil {
 		t.Fatalf("writeIdentity: %v", err)
@@ -173,17 +173,17 @@ func TestReclaimInterruptedCreateFreesTheSlot(t *testing.T) {
 	if rec.Outcome != OutcomeInterruptedCreate {
 		t.Fatalf("outcome = %v, want OutcomeInterruptedCreate", rec.Outcome)
 	}
-	if rec.InterruptedCreateSegment != slot {
-		t.Fatalf("InterruptedCreateSegment = %q, want %q", rec.InterruptedCreateSegment, slot)
+	if rec.EmptyTrailingSegment != slot {
+		t.Fatalf("EmptyTrailingSegment = %q, want %q", rec.EmptyTrailingSegment, slot)
 	}
 	if rec.NextSequence != 6 {
 		t.Fatalf("NextSequence = %d, want 6", rec.NextSequence)
 	}
 
 	// Rotation reclaims the slot before allocating the next segment.
-	reclaimed, err := ReclaimInterruptedCreate(dir, rec)
+	reclaimed, err := ReclaimEmptyTrailingSegment(dir, rec)
 	if err != nil {
-		t.Fatalf("ReclaimInterruptedCreate: %v", err)
+		t.Fatalf("ReclaimEmptyTrailingSegment: %v", err)
 	}
 	if !reclaimed {
 		t.Fatalf("reclaimed = false, want true")
@@ -202,25 +202,25 @@ func TestReclaimInterruptedCreateFreesTheSlot(t *testing.T) {
 	}
 
 	// Reclaim is idempotent (a crash between remove and dir-fsync retries cleanly).
-	again, err := ReclaimInterruptedCreate(dir, rec)
+	again, err := ReclaimEmptyTrailingSegment(dir, rec)
 	if err != nil {
-		t.Fatalf("idempotent ReclaimInterruptedCreate: %v", err)
+		t.Fatalf("idempotent ReclaimEmptyTrailingSegment: %v", err)
 	}
 	if !again {
 		t.Fatalf("idempotent reclaim = false, want true")
 	}
 }
 
-func TestReclaimInterruptedCreateNoopOnCleanRecovery(t *testing.T) {
+func TestReclaimEmptyTrailingSegmentNoopOnCleanRecovery(t *testing.T) {
 	dir := recoverDir(t)
 	buildSegment(t, walOf(dir), 1, 5)
 	rec := mustRecover(t, dir)
 	if rec.Outcome != OutcomeClean {
 		t.Fatalf("outcome = %v, want clean", rec.Outcome)
 	}
-	reclaimed, err := ReclaimInterruptedCreate(dir, rec)
+	reclaimed, err := ReclaimEmptyTrailingSegment(dir, rec)
 	if err != nil {
-		t.Fatalf("ReclaimInterruptedCreate on clean: %v", err)
+		t.Fatalf("ReclaimEmptyTrailingSegment on clean: %v", err)
 	}
 	if reclaimed {
 		t.Fatalf("reclaimed = true on a clean recovery, want false")

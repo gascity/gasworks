@@ -1,6 +1,6 @@
 package spool
 
-// compact.go (E1.3) owns whole-segment compaction and the interrupted-create slot reclaim
+// compact.go (E1.3) owns whole-segment compaction and the empty-trailing-segment slot reclaim
 // that rotation performs before allocating a new segment.
 //
 // Compaction unit: a whole segment, removed ONLY when every frame it holds is at or below
@@ -92,29 +92,31 @@ func Compact(dir string, acknowledgedThrough int64) (CompactionResult, error) {
 	return res, nil
 }
 
-// ReclaimInterruptedCreate removes the trailing headerless segment left by a crash during
-// CreateSegment, per the E1.2 reclaim contract on Recover. Rotation MUST call this before
-// allocating the next segment: CreateSegment uses O_EXCL, and the interrupted file's name is
-// the intended first_sequence, which collides with NextSequence. The interrupted-create
-// segment holds no durable or acknowledged evidence (Recover proved it too small to hold a
-// frame), so removing it never drops evidence, and NextSequence was already reconstructed
-// without it. Returns false with no error when there is nothing to reclaim (idempotent, so a
-// crash between the remove and the directory fsync is safe to retry).
-func ReclaimInterruptedCreate(dir string, rec *Recovery) (bool, error) {
-	if rec == nil || rec.Outcome != OutcomeInterruptedCreate || rec.InterruptedCreateSegment == "" {
+// ReclaimEmptyTrailingSegment removes the trailing segment Recover proved holds no durable
+// frame, per the reclaim contract on Recover. Rotation MUST call this before allocating the
+// next segment: CreateSegment uses O_EXCL, and that file's name is the intended
+// first_sequence, which collides with NextSequence. The segment holds no durable or
+// acknowledged evidence — Recover proved it either too small to hold a frame or empty past a
+// valid header — so removing it never drops evidence, and NextSequence was already
+// reconstructed without it. It keys off Recovery.EmptyTrailingSegment rather than Outcome
+// because a truncated torn tail can leave a bare header behind under OutcomeTruncatedTail.
+// Returns false with no error when there is nothing to reclaim (idempotent, so a crash between
+// the remove and the directory fsync is safe to retry).
+func ReclaimEmptyTrailingSegment(dir string, rec *Recovery) (bool, error) {
+	if rec == nil || rec.EmptyTrailingSegment == "" {
 		return false, nil
 	}
 	walDir := filepath.Join(dir, walDirName)
-	path := rec.InterruptedCreateSegment
+	path := rec.EmptyTrailingSegment
 	// Defend against reclaiming anything outside this WAL directory.
 	if filepath.Dir(path) != walDir {
-		return false, fmt.Errorf("observer spool: interrupted-create segment %s is not under %s", path, walDir)
+		return false, fmt.Errorf("observer spool: empty trailing segment %s is not under %s", path, walDir)
 	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
 			return true, nil // already reclaimed on a prior interrupted attempt.
 		}
-		return false, fmt.Errorf("observer spool: reclaim interrupted-create segment %s: %w", filepath.Base(path), err)
+		return false, fmt.Errorf("observer spool: reclaim empty trailing segment %s: %w", filepath.Base(path), err)
 	}
 	if err := fsyncDir(walDir); err != nil {
 		return false, err

@@ -1099,6 +1099,87 @@ func TestBootRecoveryTruncatesTornTail(t *testing.T) {
 	}
 }
 
+// Boot recovery: a daemon whose source stayed quiet across a restart left a header-only,
+// zero-frame segment behind, and the next start must adopt or reclaim that slot instead of
+// colliding with it. Without the reclaim the second NewSpoolWriter fails with
+// "observer spool: create segment: open .../wal/<ack+1>.seg: file exists" and systemd
+// restart-loops the unit forever, because next_sequence is reconstructed as the empty
+// segment's own first_sequence and CreateSegment uses O_EXCL.
+func TestBootRecoveryReclaimsHeaderOnlySegmentLeftByAQuietStart(t *testing.T) {
+	dir := t.TempDir()
+
+	// The post-compaction state a long-lived daemon reaches: an acknowledged watermark and an
+	// empty wal/ (every fully acknowledged segment has been compacted away).
+	if err := spool.BindIdentity(dir, "src_test", spool.CurrentFormatVersion); err != nil {
+		t.Fatalf("BindIdentity: %v", err)
+	}
+	ack, err := spool.LoadAckState(dir, 2, spool.AckOptions{})
+	if err != nil {
+		t.Fatalf("LoadAckState: %v", err)
+	}
+	if err := ack.SetInFlight(wire.SequenceRange{FirstSequence: 1, LastSequence: 2}); err != nil {
+		t.Fatalf("SetInFlight: %v", err)
+	}
+	if err := ack.Acknowledge(2); err != nil {
+		t.Fatalf("Acknowledge: %v", err)
+	}
+
+	// A start that observes nothing: it creates wal/00000000000000000003.seg and never appends.
+	quiet, err := NewSpoolWriter(SpoolConfig{
+		Dir:      dir,
+		SourceID: "src_test",
+		Capacity: permissiveCapacity(),
+	})
+	if err != nil {
+		t.Fatalf("NewSpoolWriter (quiet start): %v", err)
+	}
+	if err := quiet.Close(); err != nil {
+		t.Fatalf("Close quiet writer: %v", err)
+	}
+	if got := len(segmentNames(t, dir)); got != 1 {
+		t.Fatalf("quiet start left %d segments, want 1 header-only segment", got)
+	}
+
+	restarted, err := NewSpoolWriter(SpoolConfig{
+		Dir:      dir,
+		SourceID: "src_test",
+		Capacity: permissiveCapacity(),
+	})
+	if err != nil {
+		t.Fatalf("restart over a header-only segment: %v", err)
+	}
+	defer restarted.Close()
+
+	appended, err := restarted.AppendObservation(sealMessage(t, 1, "obs_after_quiet_restart"))
+	if err != nil {
+		t.Fatalf("AppendObservation after restart: %v", err)
+	}
+	if appended.Sequence != 3 {
+		t.Fatalf("post-restart sequence = %d, want 3 (acknowledged_through 2 + 1)", appended.Sequence)
+	}
+	frames := readFrames(t, dir)
+	if len(frames) != 1 || frames[0].Sequence != 3 {
+		t.Fatalf("durable frames = %+v, want exactly sequence 3", frames)
+	}
+}
+
+// segmentNames lists the wal/*.seg basenames in ascending order.
+func segmentNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(dir, "wal"))
+	if err != nil {
+		t.Fatalf("read wal dir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".seg" {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 func TestBootRecoveryRejectsRebindingBeforeTornTailMutation(t *testing.T) {
 	for _, identitySidecar := range []bool{true, false} {
 		t.Run("identity-sidecar-"+strconv.FormatBool(identitySidecar), func(t *testing.T) {

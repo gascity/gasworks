@@ -239,6 +239,43 @@ id should match the unit.
 If the state dir has no identity sidecar **and** a format-0 segment, do 4b before 4a — the
 segment is the only place the source id can be read from.
 
+### 4c. `create segment: open <state>/wal/<N+1>.seg: file exists`
+
+```
+observer daemon: open spool: observer spool: create segment:
+open <state>/wal/00000000000000481701.seg: file exists
+```
+
+**Fixed** in builds carrying the empty-trailing-segment reclaim; this section is for rolling
+back to, or diagnosing, an older one.
+
+Every start creates `wal/<next_sequence>.seg` with a header and no frames. A source that
+observes nothing before the next restart leaves that file header-only, and older recovery only
+reclaimed a *headerless* interrupted create — a complete header with zero frames was neither
+reclaimed nor recognised, so `next_sequence` resolved to the segment's own `first_sequence` and
+`CreateSegment`'s `O_EXCL` collided with it. The daemon then restart-loops every `RestartSec`
+and can never start again while the source stays quiet. It bites hardest right after §4a, which
+deliberately leaves `wal/` empty.
+
+On a current build there is nothing to do: recovery records the empty trailing segment, removes
+it, and re-creates at the same sequence. On an older build, apply §4a's move to the header-only
+segment — it holds zero frames, so nothing is owed and nothing is lost:
+
+```sh
+systemctl --user stop <unit>.service
+
+# The offending segment is header-only: its size equals 26 + len(source_id) + 4 bytes.
+mkdir -p "$STATE-emptyheader-segment"
+mv "$STATE"/wal/<N+1>.seg "$STATE-emptyheader-segment/"   # do NOT touch ack or identity
+
+systemctl --user reset-failed <unit>.service
+systemctl --user start <unit>.service
+```
+
+Recovery then finds an empty `wal/`, reads `acknowledged_through` from the surviving `ack`, and
+resumes at `ack + 1` — the same sequence, in a freshly created segment. It recurs on the next
+restart until the fixed binary is in place.
+
 ## 5. Verification
 
 **Journal.** Watch the unit for 60 seconds after restart:

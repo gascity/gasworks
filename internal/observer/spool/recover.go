@@ -52,7 +52,7 @@ const (
 	// header and no frames — a crash during CreateSegment left a zero-length or
 	// partial/CRC-failed header. This is a benign interrupted create (it holds no durable
 	// or acknowledged evidence), NOT interior corruption. Recovery leaves the file in place
-	// and records it in InterruptedCreateSegment; E1.3's rotation reclaims the slot (see the
+	// and records it in EmptyTrailingSegment; E1.3's rotation reclaims the slot (see the
 	// reclaim contract on Recover).
 	OutcomeInterruptedCreate
 )
@@ -83,11 +83,14 @@ type Recovery struct {
 	DiscardedBytes int
 	// DiagnosticPath is the preserved torn-tail forensic file (empty when clean).
 	DiagnosticPath string
-	// InterruptedCreateSegment is the full path of a trailing headerless segment left by an
-	// interrupted CreateSegment (empty unless Outcome is OutcomeInterruptedCreate). E1.3's
-	// rotation must reclaim this slot before allocating the next segment (reclaim contract
-	// on Recover).
-	InterruptedCreateSegment string
+	// EmptyTrailingSegment is the full path of a trailing segment that holds no durable frame,
+	// so its name (the intended first_sequence) collides with NextSequence. E1.3's rotation
+	// must reclaim this slot before allocating the next segment (reclaim contract on Recover).
+	// It is independent of Outcome: a segment holds no durable frame whether its header never
+	// landed (OutcomeInterruptedCreate), it was created and never appended to (OutcomeClean —
+	// a source that stayed quiet across a restart), or its only frame was a torn tail this
+	// recovery truncated away (OutcomeTruncatedTail).
+	EmptyTrailingSegment string
 }
 
 // CorruptionError is a typed hard error: corruption inside a complete frame, a bad segment
@@ -112,15 +115,21 @@ func (e *CorruptionError) Error() string {
 // next_sequence. Interior corruption of a complete frame is returned as a *CorruptionError
 // without modifying the WAL.
 //
-// Reclaim contract for E1.3 (interrupted create): if the trailing segment is a headerless
-// interrupted CreateSegment, Recover returns Outcome OutcomeInterruptedCreate with the file
-// path in InterruptedCreateSegment and no error. That file holds no durable/acknowledged
-// evidence, so recovery leaves it in place rather than treating it as corruption. Before
-// allocating the next segment, E1.3's rotation MUST reclaim that slot — remove the recorded
-// file — because its name (the intended first_sequence) collides with the next segment and
-// CreateSegment uses O_EXCL. next_sequence is already reconstructed correctly (the
-// interrupted-create segment contributes no durable frame), so reclaiming and re-creating at
-// NextSequence never reuses a sequence.
+// Reclaim contract for E1.3: if the trailing segment holds no durable frame, Recover records
+// its path in EmptyTrailingSegment and returns no error. Such a file holds no durable or
+// acknowledged evidence, so recovery leaves it in place rather than treating it as corruption.
+// Before allocating the next segment, E1.3's rotation MUST reclaim that slot — see
+// ReclaimEmptyTrailingSegment — because its name (the intended first_sequence) collides with
+// the next segment and CreateSegment uses O_EXCL. next_sequence is already reconstructed
+// correctly (a segment with no durable frame contributes nothing to it), so reclaiming and
+// re-creating at NextSequence never reuses a sequence.
+//
+// "Holds no durable frame" is the whole test, and it has three shapes. The header may never
+// have landed (a crash during CreateSegment: Outcome OutcomeInterruptedCreate); the header may
+// be intact with nothing appended after it, which is the steady state of any source that stays
+// quiet from one start to the next (Outcome OutcomeClean); or the segment's only frame may be
+// the torn tail this recovery just truncated away (Outcome OutcomeTruncatedTail). All three
+// leave a file squatting on NextSequence, so all three set EmptyTrailingSegment.
 func Recover(dir string) (*Recovery, error) {
 	return recover(dir, nil)
 }
@@ -231,7 +240,7 @@ func recoverSegment(
 		// header-corrupted segment that may still hold a durable frame).
 		if isLast && len(data) <= interruptedCreateBound(identityPresent, identitySource) {
 			rec.Outcome = OutcomeInterruptedCreate
-			rec.InterruptedCreateSegment = path
+			rec.EmptyTrailingSegment = path
 			return nil
 		}
 		return &CorruptionError{Segment: base, Offset: 0, Detail: err.Error()}
@@ -257,6 +266,15 @@ func recoverSegment(
 			Detail: fmt.Sprintf("segment first_sequence %d breaks contiguity (want %d)", hdr.FirstSequence, *expected)}
 	}
 
+	if isLast && hdrLen == len(data) {
+		// A complete header with nothing after it: the segment was created and never appended
+		// to. That is the ordinary state of a source that observed nothing between two starts,
+		// not damage — but the file still owns the name recovery is about to allocate, so it
+		// must be reclaimed (reclaim contract on Recover). Outcome stays clean.
+		rec.EmptyTrailingSegment = path
+		return nil
+	}
+
 	off := hdrLen
 	for off < len(data) {
 		fr, n, status := DecodeFrame(data[off:])
@@ -277,7 +295,15 @@ func recoverSegment(
 				return &CorruptionError{Segment: base, Offset: int64(off),
 					Detail: "short read inside a non-final (immutable) segment is not a torn tail"}
 			}
-			return truncateTornTail(dir, path, data, off, rec)
+			if err := truncateTornTail(dir, path, data, off, rec); err != nil {
+				return err
+			}
+			if off == hdrLen {
+				// Truncation took the segment back to a bare header, so it now holds no durable
+				// frame and squats on NextSequence exactly like a never-appended-to segment.
+				rec.EmptyTrailingSegment = path
+			}
+			return nil
 		case FrameCorrupt:
 			return &CorruptionError{Segment: base, Offset: int64(off),
 				Detail: "corruption inside a complete frame (CRC/SHA/format)"}
