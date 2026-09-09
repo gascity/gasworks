@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // contentPath is the Phase 1a raw-transcript content route on the observer collector. It is
@@ -51,6 +53,11 @@ type ContentResult struct {
 	RetryAfter  time.Duration
 	// Message is the server's content-free error message when a typed error body decoded.
 	Message string
+	// Code is the server's machine-readable error code from the same typed body, empty when none
+	// decoded. A status alone cannot separate the two conflicts the content route returns — an
+	// idempotency-key content mismatch from a transcript-identity binding conflict — so the caller
+	// classifies on this, not on 409 by itself.
+	Code wire.ObserverErrorBodyCode
 }
 
 // contentAck is the decoded 2xx body of a content upload.
@@ -104,6 +111,7 @@ func (c *Client) PostContent(ctx context.Context, r ContentRequest) (*ContentRes
 	}
 	if eb, ok := decodeError(body); ok {
 		res.Message = messageOf(eb)
+		res.Code = codeOf(eb)
 	}
 	return res, nil
 }

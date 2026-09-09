@@ -19,6 +19,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
 	"github.com/gascity/gasworks/internal/observer/contentguard"
 	"github.com/gascity/gasworks/internal/observer/upload"
+	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // Content-upload side-channel defaults and bounds.
@@ -172,14 +173,24 @@ type contentState struct {
 	markerGCSessionID string
 	gcSessionID       string
 
-	// eval* is the (size,modNanos) of the snapshot last EVALUATED to a non-upload-needed outcome
-	// (uploaded, unchanged, oversize, invalid, or permanently-rejected). A file whose current stat
-	// equals eval* is skipped without a re-read. It is seeded from the marker on load so an unchanged
-	// file is not re-read after restart.
+	// eval* is the (size,modNanos,gcSessionID) of the snapshot last EVALUATED to a non-upload-needed
+	// outcome (uploaded, unchanged, oversize, invalid, or permanently-rejected). A file whose current
+	// stat AND gc session id equal eval* is skipped without a re-read. It is seeded from the marker on
+	// load so an unchanged file is not re-read after restart. Always advance it through
+	// markEvaluated — the skip predicate compares all three fields, so a site that records the stat
+	// but not the gc session id leaves the snapshot permanently re-armed.
 	evalSize        int64
 	evalMod         int64
 	evalSet         bool
 	evalGCSessionID string
+
+	// gcBindingRefused latches that the collector rejected this transcript's GC session binding as
+	// conflicting with one the content store already holds for the same path. The GC binding is
+	// write-once upstream, so re-sending it can only ever conflict again; the bytes still belong to
+	// the bound transcript, so subsequent uploads carry the provider-native identity alone.
+	gcBindingRefused bool
+	// gcRefusedLogged latches the once-per-transcript log of that refusal.
+	gcRefusedLogged bool
 
 	// uploaded records whether markerHash came from a real acceptance (2xx / 409) rather than a
 	// permanent-4xx rejection. Only a real acceptance may be durably persisted; a rejected hash is kept
@@ -321,7 +332,7 @@ func (u *contentUploader) tick(ctx context.Context) {
 				u.logf("content upload: skipping %s: invalid provenance (session=%q provider=%q path-bytes=%d)", st.locator, native, provider, len(st.path))
 				st.invalidLogged = true
 			}
-			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
+			st.markEvaluated(st.size, st.modNanos, st.gcSessionID)
 			continue
 		}
 		// Always-on content-lane filename guards: the secrets/config denylist and the strict
@@ -331,7 +342,7 @@ func (u *contentUploader) tick(ctx context.Context) {
 		// is logged + counted once, never silent.
 		if reason, refused := contentguard.ScreenName(provider, st.path); refused {
 			u.recordGuardRefusalLocked(st, st.locator, reason)
-			st.evalSize, st.evalMod, st.evalSet = st.size, st.modNanos, true
+			st.markEvaluated(st.size, st.modNanos, st.gcSessionID)
 			continue
 		}
 		jobs = append(jobs, job{id: id, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID})
@@ -380,7 +391,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 				u.logf("content upload: skipping oversize transcript (%d bytes): %s", rsize, locator)
 				st.oversizeLogged = true
 			}
-			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+			st.markEvaluated(rsize, rmod, gcSessionID)
 		}
 		u.mu.Unlock()
 		return
@@ -410,7 +421,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.mu.Lock()
 		if st := u.files[id]; st != nil {
 			u.recordGuardRefusalLocked(st, locator, reason)
-			st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+			st.markEvaluated(rsize, rmod, gcSessionID)
 		}
 		u.mu.Unlock()
 		return
@@ -431,7 +442,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// Advance eval so future ticks skip the re-read and do not re-POST. Only refresh + persist the
 		// durable marker when the hash came from a REAL acceptance; a hash recorded from a permanent-4xx
 		// rejection stays in-memory-only so a restart still re-probes it (the 400/413/422 intent).
-		st.evalSize, st.evalMod, st.evalSet, st.evalGCSessionID = rsize, rmod, true, gcSessionID
+		st.markEvaluated(rsize, rmod, gcSessionID)
 		if st.uploaded {
 			st.markerSize, st.markerMod = rsize, rmod
 			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
@@ -443,24 +454,39 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.mu.Unlock()
 		return
 	}
+	// A GC binding already refused for this transcript is never re-offered: the content store binds a
+	// transcript's GC session once, so a second, different value can only conflict again.
+	sendGC := gcSessionID
+	if st.gcBindingRefused {
+		sendGC = ""
+	}
 	u.mu.Unlock()
 
+	u.postSnapshot(ctx, id, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, sendGC)
+}
+
+// postSnapshot POSTs one already-read, already-hashed snapshot and records the outcome. observedGC is
+// the binding the watcher read from the transcript's sidecar and is what all dedup bookkeeping is
+// keyed by; sendGC is what actually goes on the wire, which is "" once the collector has refused the
+// binding. Called with u.mu released.
+func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentity, locator, path string, content []byte, hash string, rsize, rmod int64, native, provider, observedGC, sendGC string) {
 	res, err := u.sender.PostContent(ctx, upload.ContentRequest{
 		NativeSessionID: native,
-		GCSessionID:     gcSessionID,
+		GCSessionID:     sendGC,
 		Provider:        provider,
 		SourcePath:      path,
 		Body:            content,
 	})
 
+	gcSessionID := observedGC
 	now := u.now()
 	u.mu.Lock()
-	st = u.files[id]
+	st := u.files[id]
 	if err != nil {
 		u.holdUntil = now.Add(contentTransientHold)
 		gaveUp := false
 		if st != nil {
-			gaveUp = st.recordPostFailureLocked(rsize, rmod)
+			gaveUp = st.recordPostFailureLocked(rsize, rmod, gcSessionID)
 		}
 		u.mu.Unlock()
 		u.logf("content upload: POST %s: %v", locator, err)
@@ -481,6 +507,24 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 			u.persistMarker(id, marker)
 		}
 		u.logf("content upload: sent %s for session %s (%d bytes, gc_session_id=%s)", locator, native, len(content), res.GCSessionID)
+	case res.StatusCode == 409 && res.Code == wire.ObserverErrorBodyCodeSOURCEBINDINGCONFLICT && sendGC != "":
+		// The content store already binds this transcript's source path to a DIFFERENT GC session id,
+		// and that binding is write-once upstream — re-offering ours can only conflict again. The bytes
+		// still belong to the bound transcript, so adopt the store's binding: drop the GC session id and
+		// re-send the same snapshot under the provider-native identity alone, which is the store's
+		// primary key for the path. Latched (and persisted) so it is offered exactly once per transcript.
+		if st != nil {
+			st.gcBindingRefused = true
+		}
+		logIt := st == nil || !st.gcRefusedLogged
+		if st != nil {
+			st.gcRefusedLogged = true
+		}
+		u.mu.Unlock()
+		if logIt {
+			u.logf("content upload: collector refused the gc session binding for %s (session %s)%s; re-sending without it", locator, native, serverMessage(res))
+		}
+		u.postSnapshot(ctx, id, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, "")
 	case res.StatusCode == 409:
 		// Idempotency content mismatch: the server already holds different bytes for this
 		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.
@@ -523,7 +567,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 			st.markerHash = hash
 			st.uploaded = false // in-memory dedup only; a restart re-probes (do not persist)
 			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
-			st.evalSize, st.evalMod, st.evalSet, st.evalGCSessionID = rsize, rmod, true, gcSessionID
+			st.markEvaluated(rsize, rmod, gcSessionID)
 			if !st.permanentLogged {
 				u.logf("content upload: permanent status %d for session %s%s; not retrying identical bytes", res.StatusCode, native, serverMessage(res))
 				st.permanentLogged = true
@@ -534,7 +578,7 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		u.holdUntil = now.Add(contentTransientHold)
 		gaveUp := false
 		if st != nil {
-			gaveUp = st.recordPostFailureLocked(rsize, rmod)
+			gaveUp = st.recordPostFailureLocked(rsize, rmod, gcSessionID)
 		}
 		u.mu.Unlock()
 		u.logf("content upload: unexpected status %d for session %s%s", res.StatusCode, native, serverMessage(res))
@@ -544,17 +588,25 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	}
 }
 
+// markEvaluated records the snapshot last evaluated to a non-upload-needed outcome. Every
+// eval-advance site goes through here because tick's skip predicate compares the gc session id
+// alongside the stat: a site that advanced only (size,mod) would leave a transcript that carries a
+// gc session id re-armed on every tick, re-reading, re-hashing and re-POSTing it forever.
+func (st *contentState) markEvaluated(size, mod int64, gcSessionID string) {
+	st.evalSize, st.evalMod, st.evalGCSessionID, st.evalSet = size, mod, gcSessionID, true
+}
+
 // recordPostFailureLocked bumps the consecutive-failure counter for the current (size,mod) snapshot
 // and reports whether the uploader should give up on it. Once a single snapshot has failed
 // maxContentPostAttempts times it advances eval so the file is not re-read/re-hashed/re-POSTed until
 // its content changes (a new stat resets the counter and re-arms retries). Called under u.mu.
-func (st *contentState) recordPostFailureLocked(rsize, rmod int64) (gaveUp bool) {
+func (st *contentState) recordPostFailureLocked(rsize, rmod int64, gcSessionID string) (gaveUp bool) {
 	if st.postFailSize != rsize || st.postFailMod != rmod {
 		st.postFailSize, st.postFailMod, st.postFailCount, st.giveUpLogged = rsize, rmod, 0, false
 	}
 	st.postFailCount++
 	if st.postFailCount >= maxContentPostAttempts && !st.giveUpLogged {
-		st.evalSize, st.evalMod, st.evalSet = rsize, rmod, true
+		st.markEvaluated(rsize, rmod, gcSessionID)
 		st.giveUpLogged = true
 		return true
 	}
@@ -572,10 +624,7 @@ func (st *contentState) setUploaded(hash string, size, mod int64, native, provid
 	st.markerGCSessionID = gcSessionID
 	st.markerLoaded = true
 	st.uploaded = true
-	st.evalSize = size
-	st.evalMod = mod
-	st.evalSet = true
-	st.evalGCSessionID = gcSessionID
+	st.markEvaluated(size, mod, gcSessionID)
 	st.postFailCount, st.giveUpLogged = 0, false
 }
 
@@ -597,13 +646,11 @@ func (u *contentUploader) ensureMarkerLoadedLocked(id transcriptIdentity, st *co
 	st.markerNative = m.NativeSessionID
 	st.markerProvider = m.Provider
 	st.markerGCSessionID = m.GCSessionID
+	st.gcBindingRefused = m.GCBindingRefused
 	// A persisted marker is only ever written for a real acceptance (2xx / 409); permanent-4xx
 	// rejections are never persisted, so a loaded marker is always a real upload.
 	st.uploaded = true
-	st.evalSize = m.Size
-	st.evalMod = m.ModNanos
-	st.evalSet = true
-	st.evalGCSessionID = m.GCSessionID
+	st.markEvaluated(m.Size, m.ModNanos, m.GCSessionID)
 }
 
 // contentMarker is the atomic on-disk record of the last content snapshot uploaded for a transcript
@@ -618,22 +665,27 @@ type contentMarker struct {
 	NativeSessionID string `json:"native_session_id,omitempty"`
 	Provider        string `json:"provider,omitempty"`
 	GCSessionID     string `json:"gc_session_id,omitempty"`
-	UploadedAt      string `json:"uploaded_at"`
+	// GCBindingRefused records that the collector refused this transcript's GC session binding as
+	// conflicting with the one the content store already holds. It survives a restart so the daemon
+	// does not re-offer a binding that can only conflict again.
+	GCBindingRefused bool   `json:"gc_binding_refused,omitempty"`
+	UploadedAt       string `json:"uploaded_at"`
 }
 
 // markerRecord projects the in-memory upload state into a persistable marker.
 func (st *contentState) markerRecord(id transcriptIdentity, now time.Time) contentMarker {
 	return contentMarker{
-		Version:         contentMarkerVersion,
-		Device:          id.device,
-		Inode:           id.inode,
-		ContentSHA256:   st.markerHash,
-		Size:            st.markerSize,
-		ModNanos:        st.markerMod,
-		NativeSessionID: st.markerNative,
-		Provider:        st.markerProvider,
-		GCSessionID:     st.markerGCSessionID,
-		UploadedAt:      now.UTC().Format(time.RFC3339Nano),
+		Version:          contentMarkerVersion,
+		Device:           id.device,
+		Inode:            id.inode,
+		ContentSHA256:    st.markerHash,
+		Size:             st.markerSize,
+		ModNanos:         st.markerMod,
+		NativeSessionID:  st.markerNative,
+		Provider:         st.markerProvider,
+		GCSessionID:      st.markerGCSessionID,
+		GCBindingRefused: st.gcBindingRefused,
+		UploadedAt:       now.UTC().Format(time.RFC3339Nano),
 	}
 }
 
