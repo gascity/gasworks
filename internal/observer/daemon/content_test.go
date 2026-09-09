@@ -769,6 +769,49 @@ func TestContentUploadPermanentStatusAdvancesNoLoop(t *testing.T) {
 	}
 }
 
+// Theme B: every content rejection carries the collector's typed message into the log. PostContent
+// already decodes it into ContentResult.Message; logging a bare status code leaves the operator to
+// replay the request by hand to find out which contract the upload violated.
+func TestContentUploadRejectionLogsServerMessage(t *testing.T) {
+	const msg = "X-Observer-Native-Session-Id is required"
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{"permanent", 422, "permanent status 422"},
+		{"mismatch", 409, "409 content mismatch"},
+		{"disabling", 501, "disabling content upload"},
+		{"unexpected", 502, "unexpected status 502"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+				return &upload.ContentResult{StatusCode: tc.status, Message: msg}, nil
+			}}
+			h := newContentHarness(t, contentUploaderConfig{sender: sender})
+			const dev, ino = 71, 72
+			h.reader.set(dev, ino, "body", 1)
+			h.sessions.set(dev, ino, "s", "codex")
+			h.observe(dev, ino, testCodexPath, 4, 1)
+			h.clock.advance(31 * time.Second)
+			h.u.tick(context.Background())
+
+			var line string
+			for _, l := range h.logLines() {
+				if strings.Contains(l, tc.want) {
+					line = l
+				}
+			}
+			if line == "" {
+				t.Fatalf("no %q log line; logs=%v", tc.want, h.logLines())
+			}
+			if !strings.Contains(line, msg) {
+				t.Errorf("rejection log dropped the server message: %q", line)
+			}
+		})
+	}
+}
+
 // Theme C: a structurally invalid native session id is skipped client-side (never POSTed, never
 // read), so the server's 422 loop cannot arise.
 func TestContentUploadInvalidSessionSkipped(t *testing.T) {
