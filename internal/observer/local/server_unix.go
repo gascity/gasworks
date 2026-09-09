@@ -582,8 +582,8 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 	}
 	walDir := filepath.Join(cfg.Dir, walSubdirName)
 	// Boot recovery runs before any append: it validates the sidecars, truncates a partial
-	// final frame (so OpenSegment sees a clean tail rather than bricking), reclaims an
-	// interrupted CreateSegment slot, and reconstructs the authoritative next sequence for the
+	// final frame (so OpenSegment sees a clean tail rather than bricking), records an empty
+	// trailing segment for reclaim, and reconstructs the authoritative next sequence for the
 	// empty and fully-compacted-WAL cases. Interior corruption surfaces as a typed error and
 	// refuses to start (the E1.4 quarantine path owns it), never a silent reset.
 	rec, err := spool.RecoverBound(cfg.Dir, cfg.SourceID, formatVersion)
@@ -606,10 +606,11 @@ func NewSpoolWriter(cfg SpoolConfig) (*SpoolWriter, error) {
 	if err := os.Chmod(walDir, stateDirMode); err != nil {
 		return nil, fmt.Errorf("observer local: chmod wal dir: %w", err)
 	}
-	if rec.Outcome == spool.OutcomeInterruptedCreate {
-		if _, err := spool.ReclaimInterruptedCreate(cfg.Dir, rec); err != nil {
-			return nil, err
-		}
+	// Free the slot NextSequence is about to be allocated at when the trailing segment holds no
+	// durable frame — an interrupted CreateSegment, a segment a quiet source never appended to,
+	// or one truncated back to a bare header. A no-op otherwise.
+	if _, err := spool.ReclaimEmptyTrailingSegment(cfg.Dir, rec); err != nil {
+		return nil, err
 	}
 	seg, err := openOrCreateSegment(walDir, cfg, rec.NextSequence, now)
 	if err != nil {
