@@ -75,8 +75,20 @@ different: the durable cursor carries them with its offset and persists them
 (`rollout_record_mode`, `rollout_legacy_total`). If a poll or a restart falls
 between a record and its `token_count`, each response is still counted exactly
 once, with its id. A cursor that is reset or sealed at a baseline forgets the
-mode. So does a cursor state file from before this change. Such a cursor
-switches back to record mode at the next record.
+mode, and switches back to record mode at the next record.
+
+A cursor state file written before this change holds only an offset. Every
+state saved since sets `rollout_carry`, so such a file is recognized on load.
+On the first drain after the upgrade, the watcher re-reads the bytes that the
+cursor already consumed. It starts at byte zero, or at the forward-only floor,
+so no pre-consent byte is read. From those bytes it derives the mode and the
+repeat total that a current daemon would hold at that offset. It also derives
+one more thing. The old daemon counted each response from the `token_count`
+that follows its record. If it stopped between a record and that
+`token_count`, the response was never counted. That record is kept as
+`rollout_pending` and emitted once, with its response id, when parsing
+resumes. So an upgrade neither re-counts a response the old daemon counted
+(for example from a rate-limit repeat) nor drops one it had not counted.
 
 ## Claude transcripts (`internal/observer/adapter/codex/claude.go`)
 

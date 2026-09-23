@@ -1347,6 +1347,14 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 
+	// A cursor resumed from a pre-#91 state has an offset but no usage carry: derive it from the
+	// consented bytes it already consumed before parsing past them.
+	if tf.cursor.NeedsCarryDerivation() {
+		if err := w.deriveUpgradeCarry(f, tf); err != nil {
+			return err
+		}
+	}
+
 	// The file is open and its identity is corroborated: size/mod are the current stat. Notify the
 	// optional content side channel before touching the tail. This is a cheap, fire-and-forget hook
 	// (it must not block); it never affects the tail read or cursor advancement below.
@@ -1400,6 +1408,36 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 	return derr
+}
+
+// deriveUpgradeCarry reads the bytes a pre-#91 cursor already consumed and derives its rollout
+// usage carry (Cursor.DeriveCarry). It runs once per such file, on the first drain after the
+// upgrade, after the offset is corroborated. A forward-only cursor is folded from its committed
+// floor only, so no pre-consent byte is ever read; without a committed floor it keeps the zero
+// carry, exactly what a #91+ daemon sealing that file would have started from.
+func (w *Watcher) deriveUpgradeCarry(f *os.File, tf *trackedFile) error {
+	start := int64(0)
+	if tf.forwardBaseline {
+		if tf.policy == nil {
+			tf.cursor.MarkCarryKnown()
+			return nil
+		}
+		base, sealed := tf.policy.baseline(tf.dev, tf.ino)
+		if !sealed {
+			tf.cursor.MarkCarryKnown()
+			return nil
+		}
+		start = base.Floor
+	}
+	end := tf.cursor.Consumed()
+	if start >= end {
+		tf.cursor.MarkCarryKnown()
+		return nil
+	}
+	if err := tf.cursor.DeriveCarry(io.NewSectionReader(f, start, end-start)); err != nil {
+		return fmt.Errorf("upgrading transcript cursor %s: %w", tf.locator, err)
+	}
+	return nil
 }
 
 // observeContent fires the optional content side channel for one tracked file with its current

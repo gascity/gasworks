@@ -54,6 +54,19 @@ jobs:
       - name: go build
         run: go build -mod=vendor ./...
 
+      # Every package must also compile for the other shipped OSes. The goreleaser dry-run
+      # only builds the released binaries' import graphs, and the native macOS/Windows jobs
+      # only touch selected packages, so a Unix-only symbol in an otherwise portable package
+      # (e.g. internal/observer/runwrap) could otherwise land unnoticed.
+      - name: go build (cross-compile windows + darwin)
+        run: |
+          set -euo pipefail
+          for goos in windows darwin; do
+            echo "::group::GOOS=$goos"
+            GOOS="$goos" GOARCH=amd64 go build -mod=vendor ./...
+            echo "::endgroup::"
+          done
+
       - name: go vet
         run: go vet -mod=vendor ./...
 
