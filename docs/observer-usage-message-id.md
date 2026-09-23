@@ -23,23 +23,60 @@ or run membership. An absent id means that atom can only use the heuristic
   `prompt_cache_key`.
 - `message_id` = the Responses API **response** id (`resp_…`). Manifold takes
   it from `response.id` in the response body.
-  - Codex 0.153.0 and later writes a `token_usage_record` line for every
-    completed response. The line's `payload.response_id` is the response id.
-    Codex writes it immediately before the `token_count` event that reports the
-    same response's `last_token_usage`. The adapter latches the id and attaches
-    it to that next `token_count` USAGE, then clears it. A later rate-limit-only
-    `token_count` that repeats the previous usage therefore carries no id.
+  - Codex 0.153.0 and later writes exactly one `token_usage_record` line per
+    completed response that reported usage, turns and compactions alike. Its
+    `payload.response_id` is the response id.
   - The assistant `response_item` id is the output **item** id (`msg_…`). It is
     never used as `message_id` because it never equals the metered response id.
     No other consumer reads it.
   - A rollout from before Codex 0.153 has no `token_usage_record`. Its atoms
     carry no `message_id` and use the heuristic lane only.
-  - A record without a usable `response_id` clears the latch. An id is unusable
-    when it is missing, longer than 128 bytes, or contains non-ASCII,
-    whitespace or control characters. Dropping the id keeps the tokens.
-  - Parse state is per poll buffer. If a poll lands between a record and its
-    `token_count`, that one atom carries no `message_id`. Its tokens are still
-    counted exactly once.
+  - An id is unusable when it is missing, not a string, longer than 128 bytes,
+    or contains non-ASCII, whitespace or control characters. The atom then has
+    no `message_id`. Its tokens are kept.
+
+## Codex USAGE token source
+
+A rollout's usage comes from one source only, chosen per file:
+
+- **Record mode** (Codex 0.153.0 and later). Each `token_usage_record`
+  becomes one USAGE atom. Its tokens come from `payload.usage` and its
+  `message_id` is the response id. `token_count` events never become atoms in
+  this mode. They only repeat usage a record already reported:
+  - After each response, Codex writes a `token_count` with the same usage.
+  - On each rate-limit refresh, Codex writes the previous usage again.
+  - After a context reset (compaction), Codex writes zero input/output with an
+    estimated `total_tokens`. The compaction response's real usage is in its
+    record.
+
+  A file enters record mode when its first `session_meta` names
+  `cli_version` 0.153.0 or later, or at its first `token_usage_record`. A
+  forked rollout copies its parent's `session_meta` after its own, so only the
+  first one counts. A legacy rollout resumed by a newer Codex keeps its legacy
+  atoms, and only records count after that.
+- **Legacy mode** (before 0.153). Each `token_count` becomes an atom from
+  `info.last_token_usage`. A `token_count` whose cumulative
+  `info.total_token_usage` equals the previous one's is dropped. Only a
+  completed response moves the total, so an unchanged total is a rate-limit
+  refresh or a reset recount. A `token_count` with no cumulative total is kept.
+
+Both modes map fields the same way:
+
+- `input_tokens` becomes `input_tokens`. It includes cached input.
+- `cached_input_tokens` becomes `cache_read_tokens`.
+- `output_tokens` becomes `output_tokens`. It already includes
+  `reasoning_output_tokens`, so reasoning is not added again.
+
+A usage with zero input and output is dropped. `total_tokens` is used only when
+both are absent.
+
+Parse state is per poll buffer. The usage mode and the legacy repeat total are
+different: the durable cursor carries them with its offset and persists them
+(`rollout_record_mode`, `rollout_legacy_total`). If a poll or a restart falls
+between a record and its `token_count`, each response is still counted exactly
+once, with its id. A cursor that is reset or sealed at a baseline forgets the
+mode. So does a cursor state file from before this change. Such a cursor
+switches back to record mode at the next record.
 
 ## Claude transcripts (`internal/observer/adapter/codex/claude.go`)
 
