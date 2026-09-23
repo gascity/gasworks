@@ -180,6 +180,12 @@ func parseWithCarry(data []byte, cfg ReferenceConfig, carry rolloutCarry) ParseR
 		if len(trimmed) == 0 {
 			continue
 		}
+		if pending := st.rolloutCarry.Pending; pending != nil {
+			// The pre-#91 cursor upgrade's uncounted response (see foldRolloutCarry), emitted
+			// exactly once on the first line after the resumed offset and committed with it.
+			st.rolloutCarry.Pending = nil
+			cands = append(cands, pending.candidates(lineNo)...)
+		}
 		cands = append(cands, st.parseLine(trimmed, lineNo, cfg)...)
 	}
 	return ParseResult{Candidates: cands, Consumed: consumed, carry: st.rolloutCarry}

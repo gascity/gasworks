@@ -1,8 +1,11 @@
 package codex
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"path"
 	"strconv"
 	"strings"
@@ -70,6 +73,135 @@ type rolloutCarry struct {
 	// rolloutTokenUsage.signature. A legacy token_count whose cumulative total equals it reported
 	// no new response (a rate-limit-only refresh, or a context-reset recount) and is dropped.
 	LegacyTotal string
+	// Pending is set only by the pre-#91 cursor upgrade (foldRolloutCarry): a token_usage_record
+	// the old daemon consumed without counting, because it counted usage from the token_count that
+	// follows each record and stopped before that token_count. The next parse emits it once, as the
+	// record's own usage and response id, ahead of its first line.
+	Pending *rolloutPending
+}
+
+// rolloutPending is one uncounted response carried across the pre-#91 cursor upgrade. It holds
+// counts, the provider response id and the record's time — never transcript content — and is
+// persisted with the cursor until the parse that emits it is committed.
+type rolloutPending struct {
+	ResponseID string            `json:"response_id,omitempty"`
+	Usage      rolloutTokenUsage `json:"usage"`
+	OccurredAt time.Time         `json:"occurred_at"`
+}
+
+// candidates projects the pending response to its USAGE atom, anchored on the line the resumed
+// parse emits it with.
+func (p *rolloutPending) candidates(lineNo int) []*Candidate {
+	return p.Usage.candidates(p.OccurredAt, lineNo, p.ResponseID)
+}
+
+// foldRolloutCarry reconstructs, from the already-consumed bytes of one file, the rolloutCarry a
+// #91+ daemon would have committed at the end of them. It exists for the upgrade from a cursor
+// persisted before #91, which carries only an offset: resuming such a file in the zero (legacy)
+// state is inexact — a record-bearing rollout's next rate-limit token_count would re-count the
+// response the old daemon already counted, and a legacy rollout's next repeat would pass the
+// empty repeat signature. The fold applies exactly the carry transitions of parseRolloutLine:
+//
+//   - the file's first session_meta switches to record mode by cli_version (>= 0.153.0);
+//   - any token_usage_record switches to record mode;
+//   - outside record mode, a token_count with last and total usage sets the repeat signature.
+//
+// It also finds the one response a pre-#91 daemon can leave uncounted: that daemon counted each
+// response from its token_count (written right after the record), so a record whose token_count
+// lies beyond the consumed offset was never counted, while #91+ record mode will ignore that
+// token_count. Such a record becomes carry.Pending and is emitted once on resume. The fold only
+// reads type-discriminating fields, never delivers anything, and skips any line longer than
+// maxLine, which must be positive (the runtime overflow path never parses those either).
+func foldRolloutCarry(r io.Reader, maxLine int) (rolloutCarry, error) {
+	var carry rolloutCarry
+	metaSeen := false
+	br := bufio.NewReaderSize(r, 64<<10)
+	var line []byte
+	skipping := false
+	for {
+		chunk, err := br.ReadSlice('\n')
+		complete := err == nil
+		if err != nil && !errors.Is(err, bufio.ErrBufferFull) && !errors.Is(err, io.EOF) {
+			return rolloutCarry{}, err
+		}
+		if !skipping {
+			if len(line)+len(chunk) > maxLine {
+				line, skipping = nil, true
+			} else {
+				line = append(line, chunk...)
+			}
+		}
+		if complete {
+			if !skipping {
+				foldRolloutLine(bytes.TrimSpace(line), &carry, &metaSeen)
+			}
+			line, skipping = line[:0], false
+		}
+		if errors.Is(err, io.EOF) {
+			// A trailing unterminated fragment was never consumed by the cursor; ignore it.
+			return carry, nil
+		}
+	}
+}
+
+// foldRolloutLine applies one complete line's carry transition (see foldRolloutCarry).
+func foldRolloutLine(line []byte, carry *rolloutCarry, metaSeen *bool) {
+	if len(line) == 0 {
+		return
+	}
+	var probe formatProbe
+	if json.Unmarshal(line, &probe) != nil {
+		return
+	}
+	switch probe.Type {
+	case rolloutSessionMeta:
+		var meta struct {
+			ID         string `json:"id"`
+			CLIVersion string `json:"cli_version"`
+		}
+		if json.Unmarshal(probe.Payload, &meta) != nil || meta.ID == "" || *metaSeen {
+			return
+		}
+		*metaSeen = true
+		if writesUsageRecords(meta.CLIVersion) {
+			carry.RecordMode = true
+		}
+	case rolloutTokenUsageRecord:
+		carry.RecordMode = true
+		carry.Pending = nil
+		var rec struct {
+			ResponseID json.RawMessage    `json:"response_id"`
+			Usage      *rolloutTokenUsage `json:"usage"`
+		}
+		if json.Unmarshal(probe.Payload, &rec) != nil || rec.Usage == nil || rec.Usage.work() == 0 {
+			return
+		}
+		var responseID string
+		if json.Unmarshal(rec.ResponseID, &responseID) != nil {
+			responseID = ""
+		}
+		carry.Pending = &rolloutPending{
+			ResponseID: joinKeyID(responseID),
+			Usage:      *rec.Usage,
+			OccurredAt: probe.probeTime(),
+		}
+	case rolloutEventMsg:
+		var pl struct {
+			Type string `json:"type"`
+			Info struct {
+				Total *rolloutTokenUsage `json:"total_token_usage"`
+				Last  *rolloutTokenUsage `json:"last_token_usage"`
+			} `json:"info"`
+		}
+		if json.Unmarshal(probe.Payload, &pl) != nil || pl.Type != "token_count" || pl.Info.Last == nil {
+			return
+		}
+		// The pre-#91 daemon counted this token_count, i.e. the pending record's response.
+		carry.Pending = nil
+		if !carry.RecordMode && pl.Info.Total != nil {
+			carry.LegacyTotal = pl.Info.Total.signature()
+		}
+	}
 }
 
 // maxJoinKeyID mirrors the wire contract's UsagePayload.message_id maxLength (and
