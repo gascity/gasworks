@@ -24,6 +24,8 @@ import (
 //   - turn_context.payload.model        -> SESSION_LIFECYCLE.model (threaded onto the session)
 //   - event_msg token_count.last_token_usage -> a per-turn USAGE (deltas, so the run's sum equals
 //     the provider's real total)
+//   - token_usage_record.payload.response_id -> that USAGE's message_id (the Responses API resp_…
+//     id Manifold records as spend.message_id; see docs/observer-usage-message-id.md)
 //
 // This removes the throwaway rollout->normalized translate step: the daemon reads the file the
 // agent actually wrote.
@@ -32,8 +34,9 @@ import (
 // record parsed out of a Codex rollout, so the platform derives its per-session synthetic run.
 const rolloutProvider = "codex"
 
-// The recognized rollout record types. Only session_meta and token_count carry evidence this
-// adapter projects; every other rollout record (turn_context, response_item, task_* events) is a
+// The recognized rollout record types. session_meta and token_count carry the evidence this adapter
+// projects (token_usage_record only contributes the usage atom's message_id, and response_item its
+// tool surfaces); every other rollout record (turn_context, task_* events, ...) is a
 // recognized-but-uninteresting line that is skipped silently rather than emitting a diagnostic —
 // a rollout is dense with such records and a per-line diagnostic would drown the real signal.
 const (
@@ -41,7 +44,31 @@ const (
 	rolloutTurnContext  = "turn_context"
 	rolloutEventMsg     = "event_msg"
 	rolloutResponseItem = "response_item"
+	// rolloutTokenUsageRecord (Codex >= 0.153.0) is written once per completed Responses API
+	// response, immediately before the token_count event reporting the same response. Its
+	// payload.response_id is the resp_… id Manifold stores as spend.message_id.
+	rolloutTokenUsageRecord = "token_usage_record"
 )
+
+// maxJoinKeyID mirrors the wire contract's UsagePayload.message_id maxLength (and
+// evidence.maxMessageID). An id outside it would make the whole USAGE observation fail validation,
+// so the adapter drops the id (keeping the tokens) rather than lose the usage atom.
+const maxJoinKeyID = 128
+
+// joinKeyID returns id when it is a plausible provider message/response id for the spend-join key:
+// non-empty, within maxJoinKeyID bytes, and free of whitespace/control characters. Anything else
+// yields "" — the atom then carries no message_id and falls back to the heuristic lane.
+func joinKeyID(id string) string {
+	if id == "" || len(id) > maxJoinKeyID {
+		return ""
+	}
+	for _, r := range id {
+		if r > unicode.MaxASCII || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return id
+}
 
 // parseState carries the cross-line context a single Parse call needs to project a rollout or
 // Claude transcript: the model (which lives on a different record than the session id) discovered
@@ -51,12 +78,16 @@ const (
 type parseState struct {
 	rolloutModel          string
 	rolloutSessionEmitted bool
-	// rolloutTurnMessageID holds the provider response id (resp_…) of the most recent assistant
-	// response_item, threaded onto the token_count USAGE that reports that turn's tokens as the
-	// exact-lane spend-join key. It is consumed (cleared) when attached so one response id is never
-	// fanned across multiple usage atoms. Empty for the common rollout versions that record no id —
-	// those atoms stay exact-lane-ineligible and fall back to the heuristic lane, unchanged.
-	rolloutTurnMessageID string
+	// rolloutResponseID holds the Responses API response id (resp_…) from the most recent
+	// token_usage_record, threaded onto the next token_count USAGE (the event Codex writes right
+	// after the record for the same response) as the exact-lane spend-join key. It is consumed
+	// (cleared) when attached so one response id is never fanned across multiple usage atoms — a
+	// later rate-limit-only token_count therefore carries no id. Rollouts from Codex < 0.153.0 write
+	// no token_usage_record, so their atoms carry no message_id and fall back to the heuristic lane.
+	//
+	// The assistant response_item id is deliberately NOT used: it is the output ITEM id (msg_…),
+	// which never equals the response id Manifold meters, so it could only ever miss the join.
+	rolloutResponseID string
 
 	claudeModel          string
 	claudeSessionEmitted bool
@@ -152,6 +183,17 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		return []*Candidate{sessionLifecycleCandidate(meta.ID, rolloutProvider, st.rolloutModel, ts, lineNo)}
 	case rolloutResponseItem:
 		return st.parseRolloutResponseItem(probe.Payload, cfg, ts, lineNo)
+	case rolloutTokenUsageRecord:
+		var rec struct {
+			ResponseID string `json:"response_id"`
+		}
+		// Latest record wins; a malformed or id-less record clears the latch so a stale id from an
+		// earlier response can never ride onto this response's token_count.
+		st.rolloutResponseID = ""
+		if json.Unmarshal(probe.Payload, &rec) == nil {
+			st.rolloutResponseID = joinKeyID(rec.ResponseID)
+		}
+		return nil
 	case rolloutEventMsg:
 		var pl struct {
 			Type string `json:"type"`
@@ -165,8 +207,8 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		if pl.Type != "token_count" || pl.Info.Last == nil {
 			return nil
 		}
-		messageID := st.rolloutTurnMessageID
-		st.rolloutTurnMessageID = ""
+		messageID := st.rolloutResponseID
+		st.rolloutResponseID = ""
 		return pl.Info.Last.candidates(ts, lineNo, messageID)
 	default:
 		return nil
@@ -184,15 +226,13 @@ const (
 	rolloutItemShellOutput    = "local_shell_call_output"
 )
 
-// parseRolloutResponseItem projects one response_item. An assistant message latches the turn's
-// response id for the exact-lane usage join (unchanged); a function/shell call becomes a TOOL_CALL
+// parseRolloutResponseItem projects one response_item. A message item carries no evidence (its id is
+// the output item id, not the metered response id — see rolloutResponseID); a function/shell call becomes a TOOL_CALL
 // surface run through the reference extractors; a call output becomes a TOOL_RESULT surface,
 // classified against the CLI tool recorded for its call id. Every other item is skipped silently.
 func (st *parseState) parseRolloutResponseItem(payload json.RawMessage, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
 	var head struct {
 		Type   string `json:"type"`
-		Role   string `json:"role"`
-		ID     string `json:"id"`
 		CallID string `json:"call_id"`
 	}
 	if json.Unmarshal(payload, &head) != nil {
@@ -200,12 +240,6 @@ func (st *parseState) parseRolloutResponseItem(payload json.RawMessage, cfg Refe
 	}
 	switch head.Type {
 	case rolloutItemMessage:
-		// Latch the assistant turn's provider response id (resp_…) when the rollout records one, so
-		// the following token_count USAGE can carry it as the exact-lane spend-join key. Most rollout
-		// versions leave the id null (user/developer items never carry one), so this is usually a no-op.
-		if head.Role == "assistant" && head.ID != "" {
-			st.rolloutTurnMessageID = head.ID
-		}
 		return nil
 	case rolloutItemFunctionCall, rolloutItemLocalShellCall:
 		name, command := rolloutCallCommand(head.Type, payload)
@@ -326,7 +360,7 @@ type rolloutTokenUsage struct {
 
 // candidates projects a per-turn usage delta to a USAGE candidate, dropping a zero-work turn (a
 // token_count whose delta is empty) so a run's usage_totals is not padded with empties. messageID is
-// the latched assistant response id (resp_…) when the rollout recorded one, empty otherwise.
+// the latched token_usage_record response id (resp_…) when the rollout recorded one, empty otherwise.
 func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int, messageID string) []*Candidate {
 	if u.total() == 0 {
 		return nil
