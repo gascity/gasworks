@@ -77,6 +77,11 @@ type Cursor struct {
 	anchorSize int    // length of the anchor window the hash covers (<= anchorLen)
 	sealed     bool   // forward-only baseline; never corroborate pre-consent bytes
 
+	// carry is the Codex rollout usage state (record mode, legacy repeat signature) at consumed.
+	// It is committed with the offset and persisted, so a token_count whose token_usage_record was
+	// parsed in an earlier poll (or before a restart) is still recognized as already counted.
+	carry rolloutCarry
+
 	maxPartialLine int
 }
 
@@ -96,6 +101,11 @@ type persistedCursor struct {
 	AnchorSize int    `json:"anchor_size"` // length of the fingerprinted window (0 = none)
 	Scope      string `json:"scope,omitempty"`
 	Sealed     bool   `json:"sealed,omitempty"`
+	// RolloutRecordMode / RolloutLegacyTotal persist the rolloutCarry at the consumed offset. Both
+	// are counts-only (never transcript content); absent in older state files, which resume in
+	// legacy mode and switch at the next token_usage_record.
+	RolloutRecordMode  bool   `json:"rollout_record_mode,omitempty"`
+	RolloutLegacyTotal string `json:"rollout_legacy_total,omitempty"`
 }
 
 // fileIdentityOf extracts the device and inode of a stat result. ok is false only when the
@@ -184,6 +194,7 @@ func loadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 	c.anchorHash = p.AnchorHash
 	c.anchorSize = p.AnchorSize
 	c.sealed = p.Sealed
+	c.carry = rolloutCarry{RecordMode: p.RolloutRecordMode, LegacyTotal: p.RolloutLegacyTotal}
 	return c, nil
 }
 
@@ -259,6 +270,7 @@ func (c *Cursor) observe(size, modNanos int64) {
 // same-identity file that was truncated or rewritten in place. The caller is responsible for
 // emitting the truncation diagnostic; Reset only moves the position.
 func (c *Cursor) Reset() {
+	c.carry = rolloutCarry{}
 	c.consumed = 0
 	c.remainder = nil
 	c.skip = false
@@ -276,6 +288,7 @@ func (c *Cursor) SealAt(eof int64) {
 		eof = 0
 	}
 	c.consumed = eof
+	c.carry = rolloutCarry{} // pre-consent bytes are never read, so the usage source is unknown
 	c.remainder = nil
 	c.skip = false
 	c.anchor = nil
@@ -331,7 +344,7 @@ func (c *Cursor) ingestNormal(prefix, newBytes []byte, cfg ReferenceConfig) (can
 	buf = append(buf, prefix...)
 	buf = append(buf, newBytes...)
 
-	res := Parse(buf, cfg)
+	res := parseWithCarry(buf, cfg, c.carry)
 	rem := buf[res.Consumed:]
 
 	if len(rem) > c.maxPartialLine {
@@ -346,6 +359,7 @@ func (c *Cursor) ingestNormal(prefix, newBytes []byte, cfg ReferenceConfig) (can
 		return out, func() {
 			c.consumed += int64(len(consumed))
 			c.updateAnchor(consumed)
+			c.carry = res.carry
 			c.remainder = nil
 			c.skip = true
 		}
@@ -357,6 +371,7 @@ func (c *Cursor) ingestNormal(prefix, newBytes []byte, cfg ReferenceConfig) (can
 	return res.Candidates, func() {
 		c.consumed += int64(len(consumed))
 		c.updateAnchor(consumed)
+		c.carry = res.carry
 		c.remainder = nextRem
 	}
 }
@@ -378,6 +393,9 @@ func (c *Cursor) Save() error {
 		AnchorSize: c.anchorSize,
 		Scope:      c.scope,
 		Sealed:     c.sealed,
+
+		RolloutRecordMode:  c.carry.RecordMode,
+		RolloutLegacyTotal: c.carry.LegacyTotal,
 	}
 	data, err := json.Marshal(p)
 	if err != nil {

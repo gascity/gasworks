@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -22,10 +23,11 @@ import (
 //
 //   - session_meta.payload.id           -> SESSION_LIFECYCLE.native_session_id
 //   - turn_context.payload.model        -> SESSION_LIFECYCLE.model (threaded onto the session)
-//   - event_msg token_count.last_token_usage -> a per-turn USAGE (deltas, so the run's sum equals
-//     the provider's real total)
-//   - token_usage_record.payload.response_id -> that USAGE's message_id (the Responses API resp_…
-//     id Manifold records as spend.message_id; see docs/observer-usage-message-id.md)
+//   - token_usage_record.payload.usage   -> one USAGE per completed Responses API response
+//     (Codex >= 0.153.0), with payload.response_id as its message_id (the resp_… id Manifold
+//     records as spend.message_id; see docs/observer-usage-message-id.md)
+//   - event_msg token_count.last_token_usage -> a per-turn USAGE, ONLY for a legacy rollout that
+//     carries no token_usage_record (Codex < 0.153.0); a rate-limit-only repeat is dropped
 //
 // This removes the throwaway rollout->normalized translate step: the daemon reads the file the
 // agent actually wrote.
@@ -34,9 +36,9 @@ import (
 // record parsed out of a Codex rollout, so the platform derives its per-session synthetic run.
 const rolloutProvider = "codex"
 
-// The recognized rollout record types. session_meta and token_count carry the evidence this adapter
-// projects (token_usage_record only contributes the usage atom's message_id, and response_item its
-// tool surfaces); every other rollout record (turn_context, task_* events, ...) is a
+// The recognized rollout record types. session_meta, token_usage_record and (legacy) token_count
+// carry the evidence this adapter projects (response_item contributes its tool surfaces); every
+// other rollout record (turn_context, task_* events, ...) is a
 // recognized-but-uninteresting line that is skipped silently rather than emitting a diagnostic —
 // a rollout is dense with such records and a per-line diagnostic would drown the real signal.
 const (
@@ -44,11 +46,31 @@ const (
 	rolloutTurnContext  = "turn_context"
 	rolloutEventMsg     = "event_msg"
 	rolloutResponseItem = "response_item"
-	// rolloutTokenUsageRecord (Codex >= 0.153.0) is written once per completed Responses API
-	// response, immediately before the token_count event reporting the same response. Its
+	// rolloutTokenUsageRecord (Codex >= 0.153.0) is written exactly once per completed Responses
+	// API response that reported usage (turns and compactions alike), before the token_count event
+	// that reports the same response. Its payload.usage is that response's billed usage and its
 	// payload.response_id is the resp_… id Manifold stores as spend.message_id.
 	rolloutTokenUsageRecord = "token_usage_record"
 )
+
+// rolloutRecordMinVersion is the first Codex CLI release that writes token_usage_record. A rollout
+// whose own session_meta names this version or later derives its usage from the records alone.
+var rolloutRecordMinVersion = [3]int{0, 153, 0}
+
+// rolloutCarry is the cross-buffer Codex rollout usage state. Parse state is otherwise per poll
+// buffer, but the usage source must be decided per FILE: once a rollout is known to carry
+// token_usage_record, every later token_count in it is a second view of usage already counted from
+// a record and must not become an atom, even when its record landed in an earlier poll. The
+// durable cursor persists this alongside its offset (see Cursor.carry).
+type rolloutCarry struct {
+	// RecordMode is set once the stream is known to carry token_usage_record: its session_meta
+	// names Codex >= 0.153.0, or a record has been seen. From then on usage comes only from records.
+	RecordMode bool
+	// LegacyTotal is the cumulative total_token_usage of the last legacy token_count, rendered by
+	// rolloutTokenUsage.signature. A legacy token_count whose cumulative total equals it reported
+	// no new response (a rate-limit-only refresh, or a context-reset recount) and is dropped.
+	LegacyTotal string
+}
 
 // maxJoinKeyID mirrors the wire contract's UsagePayload.message_id maxLength (and
 // evidence.maxMessageID). An id outside it would make the whole USAGE observation fail validation,
@@ -78,16 +100,13 @@ func joinKeyID(id string) string {
 type parseState struct {
 	rolloutModel          string
 	rolloutSessionEmitted bool
-	// rolloutResponseID holds the Responses API response id (resp_…) from the most recent
-	// token_usage_record, threaded onto the next token_count USAGE (the event Codex writes right
-	// after the record for the same response) as the exact-lane spend-join key. It is consumed
-	// (cleared) when attached so one response id is never fanned across multiple usage atoms — a
-	// later rate-limit-only token_count therefore carries no id. Rollouts from Codex < 0.153.0 write
-	// no token_usage_record, so their atoms carry no message_id and fall back to the heuristic lane.
-	//
-	// The assistant response_item id is deliberately NOT used: it is the output ITEM id (msg_…),
-	// which never equals the response id Manifold meters, so it could only ever miss the join.
-	rolloutResponseID string
+	// rolloutSessionMetaSeen latches after the first session_meta of the buffer. Only the first one
+	// can be the rollout's own (a forked rollout copies its parent's session_meta after its own), so
+	// only it may switch the stream to record mode by cli_version.
+	rolloutSessionMetaSeen bool
+	// rolloutCarry is the usage-source state carried in from the previous buffer of the same file
+	// and handed back out in ParseResult for the cursor to commit.
+	rolloutCarry rolloutCarry
 
 	claudeModel          string
 	claudeSessionEmitted bool
@@ -128,8 +147,8 @@ func (st *parseState) toolSurfaceFor(id string) string {
 // newParseState builds the per-buffer parse context, peeking the buffer once for the session model
 // each dialect stashes on a record separate from the session id. The peeks are gated on a cheap
 // substring probe so a normalized-only buffer pays nothing.
-func newParseState(data []byte) *parseState {
-	st := &parseState{}
+func newParseState(data []byte, carry rolloutCarry) *parseState {
+	st := &parseState{rolloutCarry: carry}
 	if bytes.Contains(data, []byte(`"session_meta"`)) || bytes.Contains(data, []byte(`"turn_context"`)) {
 		st.rolloutModel = peekRolloutModel(data)
 	}
@@ -164,17 +183,25 @@ func peekRolloutModel(data []byte) string {
 }
 
 // parseRolloutLine projects one raw Codex rollout record. session_meta becomes the transcript's
-// single SESSION_LIFECYCLE (with the peeked model); a token_count event becomes a per-turn USAGE;
-// every other rollout record is skipped without a diagnostic.
+// single SESSION_LIFECYCLE (with the peeked model); a token_usage_record becomes that response's
+// USAGE; a token_count event becomes a per-turn USAGE only in a legacy (record-less) rollout; every
+// other rollout record is skipped without a diagnostic.
 func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg ReferenceConfig) []*Candidate {
 	ts := probe.probeTime()
 	switch probe.Type {
 	case rolloutSessionMeta:
 		var meta struct {
-			ID string `json:"id"`
+			ID         string `json:"id"`
+			CLIVersion string `json:"cli_version"`
 		}
 		if json.Unmarshal(probe.Payload, &meta) != nil || meta.ID == "" {
 			return nil
+		}
+		if !st.rolloutSessionMetaSeen {
+			st.rolloutSessionMetaSeen = true
+			if writesUsageRecords(meta.CLIVersion) {
+				st.rolloutCarry.RecordMode = true
+			}
 		}
 		if st.rolloutSessionEmitted {
 			return nil
@@ -184,21 +211,36 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 	case rolloutResponseItem:
 		return st.parseRolloutResponseItem(probe.Payload, cfg, ts, lineNo)
 	case rolloutTokenUsageRecord:
+		// A record (even a malformed one) proves this Codex writes records, so the file's
+		// token_count events are no longer a usage source from here on.
+		st.rolloutCarry.RecordMode = true
 		var rec struct {
-			ResponseID string `json:"response_id"`
+			ResponseID json.RawMessage    `json:"response_id"`
+			Usage      *rolloutTokenUsage `json:"usage"`
 		}
-		// Latest record wins; a malformed or id-less record clears the latch so a stale id from an
-		// earlier response can never ride onto this response's token_count.
-		st.rolloutResponseID = ""
-		if json.Unmarshal(probe.Payload, &rec) == nil {
-			st.rolloutResponseID = joinKeyID(rec.ResponseID)
+		if json.Unmarshal(probe.Payload, &rec) != nil || rec.Usage == nil {
+			return nil
 		}
-		return nil
+		// The id is decoded on its own so a missing, mistyped or implausible id only costs the
+		// join key (heuristic lane), never the response's tokens.
+		var responseID string
+		if json.Unmarshal(rec.ResponseID, &responseID) != nil {
+			responseID = ""
+		}
+		return rec.Usage.candidates(ts, lineNo, joinKeyID(responseID))
 	case rolloutEventMsg:
+		if st.rolloutCarry.RecordMode {
+			// Every billed response in a record-bearing rollout already produced its USAGE from its
+			// token_usage_record. Its token_count events only re-report that usage (after the
+			// record, again on each rate-limit refresh) or report a zeroed estimate after a context
+			// reset, so none of them is a usage source.
+			return nil
+		}
 		var pl struct {
 			Type string `json:"type"`
 			Info struct {
-				Last *rolloutTokenUsage `json:"last_token_usage"`
+				Total *rolloutTokenUsage `json:"total_token_usage"`
+				Last  *rolloutTokenUsage `json:"last_token_usage"`
 			} `json:"info"`
 		}
 		if json.Unmarshal(probe.Payload, &pl) != nil {
@@ -207,9 +249,17 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		if pl.Type != "token_count" || pl.Info.Last == nil {
 			return nil
 		}
-		messageID := st.rolloutResponseID
-		st.rolloutResponseID = ""
-		return pl.Info.Last.candidates(ts, lineNo, messageID)
+		// Legacy (< 0.153) rollout: token_count is the only usage source. Codex re-emits the
+		// unchanged token info on every rate-limit refresh and after a context reset; only a
+		// completed response advances the cumulative total, so an unchanged total is a repeat.
+		if pl.Info.Total != nil {
+			sig := pl.Info.Total.signature()
+			if sig == st.rolloutCarry.LegacyTotal {
+				return nil
+			}
+			st.rolloutCarry.LegacyTotal = sig
+		}
+		return pl.Info.Last.candidates(ts, lineNo, "")
 	default:
 		return nil
 	}
@@ -227,7 +277,7 @@ const (
 )
 
 // parseRolloutResponseItem projects one response_item. A message item carries no evidence (its id is
-// the output item id, not the metered response id — see rolloutResponseID); a function/shell call becomes a TOOL_CALL
+// the output item id, which never equals the metered response id, so it is never a message_id); a function/shell call becomes a TOOL_CALL
 // surface run through the reference extractors; a call output becomes a TOOL_RESULT surface,
 // classified against the CLI tool recorded for its call id. Every other item is skipped silently.
 func (st *parseState) parseRolloutResponseItem(payload json.RawMessage, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
@@ -348,21 +398,24 @@ func rolloutOutputText(raw json.RawMessage) string {
 	return concatTextBlocks(raw)
 }
 
-// rolloutTokenUsage is one token_count event's per-turn usage delta. Codex reports input_tokens as
-// the full input (cached included) and a cached_input_tokens breakdown, mirroring the USAGE
-// observation's input_tokens + cache_read_tokens; total_tokens gates whether the turn did any work.
+// rolloutTokenUsage is one Codex TokenUsage object: a token_usage_record's per-response usage or a
+// token_count's last/total usage. Codex reports input_tokens as the full input (cached included)
+// and a cached_input_tokens breakdown, mirroring the USAGE observation's input_tokens +
+// cache_read_tokens. output_tokens already includes reasoning_output_tokens, which is therefore
+// not mapped separately (it would double count); it only participates in the repeat signature.
 type rolloutTokenUsage struct {
-	InputTokens       *int64 `json:"input_tokens"`
-	CachedInputTokens *int64 `json:"cached_input_tokens"`
-	OutputTokens      *int64 `json:"output_tokens"`
-	TotalTokens       *int64 `json:"total_tokens"`
+	InputTokens           *int64 `json:"input_tokens"`
+	CachedInputTokens     *int64 `json:"cached_input_tokens"`
+	OutputTokens          *int64 `json:"output_tokens"`
+	ReasoningOutputTokens *int64 `json:"reasoning_output_tokens"`
+	TotalTokens           *int64 `json:"total_tokens"`
 }
 
-// candidates projects a per-turn usage delta to a USAGE candidate, dropping a zero-work turn (a
-// token_count whose delta is empty) so a run's usage_totals is not padded with empties. messageID is
-// the latched token_usage_record response id (resp_…) when the rollout recorded one, empty otherwise.
+// candidates projects one usage to a USAGE candidate, dropping a zero-work usage so a run's
+// usage_totals is not padded with empties. messageID is the token_usage_record response id (resp_…)
+// when there is one, empty otherwise.
 func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int, messageID string) []*Candidate {
-	if u.total() == 0 {
+	if u.work() == 0 {
 		return nil
 	}
 	return []*Candidate{{
@@ -380,9 +433,15 @@ func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int, messageID strin
 	}}
 }
 
-func (u *rolloutTokenUsage) total() int64 {
-	if u.TotalTokens != nil {
-		return *u.TotalTokens
+// work is the billed input+output of a usage. total_tokens is only the fallback for a usage that
+// reports neither: after a context reset Codex writes a token_count whose total_tokens is a local
+// context-size ESTIMATE with zero input and output, which is not billed work.
+func (u *rolloutTokenUsage) work() int64 {
+	if u.InputTokens == nil && u.OutputTokens == nil {
+		if u.TotalTokens != nil {
+			return *u.TotalTokens
+		}
+		return 0
 	}
 	var t int64
 	if u.InputTokens != nil {
@@ -392,6 +451,50 @@ func (u *rolloutTokenUsage) total() int64 {
 		t += *u.OutputTokens
 	}
 	return t
+}
+
+// signature renders every counter of a usage (absent as "-") so two usages compare equal only when
+// all of them match. It is persisted in the cursor, so it carries counts only, never content.
+func (u *rolloutTokenUsage) signature() string {
+	var b strings.Builder
+	for i, v := range []*int64{u.InputTokens, u.CachedInputTokens, u.OutputTokens, u.ReasoningOutputTokens, u.TotalTokens} {
+		if i > 0 {
+			b.WriteByte('/')
+		}
+		if v == nil {
+			b.WriteByte('-')
+			continue
+		}
+		b.WriteString(strconv.FormatInt(*v, 10))
+	}
+	return b.String()
+}
+
+// writesUsageRecords reports whether a session_meta cli_version (e.g. "0.153.4",
+// "0.154.0-alpha.1") is at or after rolloutRecordMinVersion. An absent or unparseable version is
+// unknown and reports false: the stream then switches to record mode at its first record instead.
+func writesUsageRecords(version string) bool {
+	if i := strings.IndexAny(version, "-+"); i >= 0 {
+		version = version[:i]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	var v [3]int
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 0 {
+			return false
+		}
+		v[i] = n
+	}
+	for i := range v {
+		if v[i] != rolloutRecordMinVersion[i] {
+			return v[i] > rolloutRecordMinVersion[i]
+		}
+	}
+	return true
 }
 
 // sessionLifecycleCandidate builds the STARTED SESSION_LIFECYCLE candidate every native dialect

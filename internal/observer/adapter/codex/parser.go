@@ -131,6 +131,10 @@ type ParseResult struct {
 	// (E1.8b) advances by exactly this many bytes and re-presents the unconsumed remainder
 	// prepended to the next read, so a record split across two reads is parsed exactly once.
 	Consumed int
+	// carry is the Codex rollout usage state at the end of the consumed bytes. The durable cursor
+	// commits it alongside Consumed and hands it to the next buffer's parse, so the usage source
+	// (token_usage_record vs legacy token_count) and the legacy repeat de-dup survive a poll split.
+	carry rolloutCarry
 }
 
 // Diagnostics returns just the diagnostic candidates, in order — a convenience for callers that
@@ -152,7 +156,13 @@ func (r ParseResult) Diagnostics() []*Candidate {
 // consumed but produce no candidate; every non-blank complete line produces at least one
 // candidate (a real record, or a diagnostic when the record is unrecognized).
 func Parse(data []byte, cfg ReferenceConfig) ParseResult {
-	st := newParseState(data)
+	return parseWithCarry(data, cfg, rolloutCarry{})
+}
+
+// parseWithCarry is Parse resuming from the rollout usage state a previous buffer of the same file
+// ended in (see rolloutCarry). Parse is the fresh-file (start-of-stream) case.
+func parseWithCarry(data []byte, cfg ReferenceConfig, carry rolloutCarry) ParseResult {
+	st := newParseState(data, carry)
 	var cands []*Candidate
 	consumed := 0
 	lineNo := 0
@@ -172,7 +182,7 @@ func Parse(data []byte, cfg ReferenceConfig) ParseResult {
 		}
 		cands = append(cands, st.parseLine(trimmed, lineNo, cfg)...)
 	}
-	return ParseResult{Candidates: cands, Consumed: consumed}
+	return ParseResult{Candidates: cands, Consumed: consumed, carry: st.rolloutCarry}
 }
 
 // ParseReader is the io.Reader convenience wrapper over Parse. It reads the reader to EOF and
