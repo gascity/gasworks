@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -240,14 +241,22 @@ func extractPullRequests(surface wire.ExtractionProvenanceSurface, text string) 
 }
 
 func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg ReferenceConfig) []ExtractedReference {
-	prefixes, resolver := cfg.BeadPrefixes, cfg.Resolver
+	resolver := cfg.Resolver
+	var snap *evidence.BeadPrefixMap
 	if cfg.PrefixMap != nil {
-		if snap := cfg.PrefixMap.Current(); snap.Len() > 0 {
-			prefixes = append(snap.Prefixes(), cfg.BeadPrefixes...)
-			resolver.Prefixes = snap
-		}
+		snap = cfg.PrefixMap.Current()
 	}
-	re := beadPattern(prefixes)
+	var re *regexp.Regexp
+	switch {
+	case snap.Len() == 0:
+		re = beadPattern(cfg.BeadPrefixes)
+	case len(cfg.BeadPrefixes) == 0:
+		resolver.Prefixes = snap
+		re = snapshotBeadPattern(snap)
+	default:
+		resolver.Prefixes = snap
+		re = beadPattern(append(snap.Prefixes(), cfg.BeadPrefixes...))
+	}
 	if re == nil {
 		return nil
 	}
@@ -311,6 +320,28 @@ func trimBeadToken(tok string) string {
 	return strings.TrimFunc(tok, func(r rune) bool {
 		return !(r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z')
 	})
+}
+
+// mappedBeadPattern memoizes the compiled bead pattern of the most recent prefix-map snapshot. A
+// snapshot is immutable and is replaced only when the map file's content changes, so the alternation
+// over every mapped prefix is compiled once per reload rather than on every bead-surface extraction
+// (at the MaxBeadPrefixMappings bound one compile costs tens of milliseconds and megabytes).
+var mappedBeadPattern atomic.Pointer[snapshotPattern]
+
+type snapshotPattern struct {
+	snap *evidence.BeadPrefixMap
+	re   *regexp.Regexp
+}
+
+// snapshotBeadPattern returns the bead pattern for a non-empty prefix-map snapshot, compiling it
+// only when the snapshot differs from the memoized one.
+func snapshotBeadPattern(snap *evidence.BeadPrefixMap) *regexp.Regexp {
+	if c := mappedBeadPattern.Load(); c != nil && c.snap == snap {
+		return c.re
+	}
+	re := beadPattern(snap.Prefixes())
+	mappedBeadPattern.Store(&snapshotPattern{snap: snap, re: re})
+	return re
 }
 
 // beadPattern compiles the declared prefix set into a whole-token bead-ID matcher, or nil when no

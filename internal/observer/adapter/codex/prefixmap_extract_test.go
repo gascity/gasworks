@@ -94,3 +94,52 @@ func TestPrefixMapCapturesAndResolvesEveryProject(t *testing.T) {
 		t.Fatalf("nil snapshot still extracted: %v", got)
 	}
 }
+
+// TestPrefixMapAmbiguousPrefixDropsWithDiagnostic: a prefix two projects share is still captured,
+// but its references drop with a content-free diagnostic instead of linking to either project or
+// falling back to a shorter prefix's project; the rest of the tool call links normally.
+func TestPrefixMapAmbiguousPrefixDropsWithDiagnostic(t *testing.T) {
+	m, err := evidence.NewBeadPrefixMap([]evidence.BeadPrefixMapping{
+		{Prefix: "gas-", ProjectID: "proj_gas"},
+		{Prefix: "gas-city-", ProjectID: "proj_city1"},
+		{Prefix: "gas-city-", ProjectID: "proj_city2"},
+		{Prefix: "acme-", ProjectID: "proj_acme"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := ReferenceConfig{PrefixMap: &swapSource{m: m}}
+	got := beadProjects(t, "bd dep add gas-city-9 gas-4 acme-2", cfg)
+	want := map[string]string{"gas-city-9": "", "gas-4": "proj_gas", "acme-2": "proj_acme"}
+	if len(got) != len(want) {
+		t.Fatalf("extracted %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s -> %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestPrefixMapPatternCompiledOncePerSnapshot: the alternation over every mapped prefix is compiled
+// once per snapshot (a reload), not on every bead-surface extraction.
+func TestPrefixMapPatternCompiledOncePerSnapshot(t *testing.T) {
+	src := &swapSource{m: prefixMapOf(t, "acme-", "proj_acme", "beta-", "proj_beta")}
+	cfg := ReferenceConfig{PrefixMap: src}
+	beadProjects(t, "bd show acme-1", cfg)
+	first := mappedBeadPattern.Load()
+	if first == nil || first.snap != src.Current() {
+		t.Fatal("snapshot pattern not memoized")
+	}
+	beadProjects(t, "bd show beta-2", cfg)
+	if mappedBeadPattern.Load() != first {
+		t.Fatal("unchanged snapshot recompiled its pattern")
+	}
+	src.set(prefixMapOf(t, "acme-", "proj_acme", "gamma-", "proj_gamma"))
+	if got := beadProjects(t, "bd show gamma-3", cfg); got["gamma-3"] != "proj_gamma" {
+		t.Fatalf("reloaded snapshot not used: %v", got)
+	}
+	if c := mappedBeadPattern.Load(); c == first || c.snap != src.Current() {
+		t.Fatal("a new snapshot did not get its own pattern")
+	}
+}

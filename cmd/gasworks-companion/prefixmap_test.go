@@ -7,36 +7,55 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/daemon"
+	"github.com/gascity/gasworks/internal/observer/prefixmap"
 	"github.com/gascity/gasworks/internal/observer/upload"
 	"github.com/gascity/gasworks/internal/observer/wire"
 )
 
 // TestDaemonPrefixMapFlagValidation: the multi-project map is mutually exclusive with the
-// single-project flags, and a present-but-invalid map fails startup (exit 2) rather than silently
-// capturing nothing.
+// single-project flags and its path must be absolute (a static misconfiguration fails startup with
+// exit 2; the file's content never does).
 func TestDaemonPrefixMapFlagValidation(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.json")
 	if err := os.WriteFile(good, []byte(`[{"prefix":"acme-","project_id":"p"}]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bad := filepath.Join(dir, "bad.json")
-	if err := os.WriteFile(bad, []byte(`[{"prefix":"acme","project_id":"p"}]`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	base := []string{"-dir", filepath.Join(dir, "state"), "-source-id", e2eSourceID}
 	for name, extra := range map[string][]string{
-		"with_bead_prefix":   {"-bead-prefix-map-file", good, "-bead-prefix", "acme-"},
-		"with_beads_project": {"-bead-prefix-map-file", good, "-beads-project", "p"},
-		"invalid_map":        {"-bead-prefix-map-file", bad},
+		"with_single_project_pair": {"-bead-prefix-map-file", good, "-bead-prefix", "acme-", "-beads-project", "p"},
+		"with_beads_project":       {"-bead-prefix-map-file", good, "-beads-project", "p"},
+		"relative_path":            {"-bead-prefix-map-file", "bead-prefixes.json"},
 	} {
 		if code := runDaemon(append(append([]string{}, base...), extra...)); code != 2 {
 			t.Errorf("%s: exit %d, want 2", name, code)
 		}
+	}
+}
+
+// TestOpenPrefixMapNeverFailsOnTheFile: the map file is written by bd from team-server data, so its
+// content must never stop the daemon — an exit here crash-loops under launchd/systemd and stops ALL
+// transcript capture. An invalid file is logged and leaves bead capture idle.
+func TestOpenPrefixMapNeverFailsOnTheFile(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(bad, []byte(`[{"prefix":"acme-","project_id":"p"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs []string
+	pm, err := openPrefixMap(bad, 0, func(s string) { logs = append(logs, s) })
+	if err != nil {
+		t.Fatalf("openPrefixMap failed on an invalid file: %v", err)
+	}
+	if pm.Current().Len() != 0 {
+		t.Fatal("invalid file served prefixes")
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "bead capture idle until a valid map is written") {
+		t.Fatalf("logs = %q", logs)
 	}
 }
 
@@ -67,19 +86,11 @@ func durableWorkRefs(dir string) (map[string]string, error) {
 	return out, nil
 }
 
-// TestDaemonPrefixMapMultiProjectHotReloadEndToEnd is the bead acceptance through a REAL assembled
-// daemon (watcher -> extractor -> policy -> durable WAL) wired exactly as -bead-prefix-map-file
-// wires it: a session referencing beads of two projects yields durable EXTRACTED references to
-// both, each under its own project; then the map file is rewritten with a new project and, with the
-// daemon still running, the new project's bead is captured and resolved.
-func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
-	stateDir := t.TempDir()
-	root := t.TempDir()
-	cursorDir := t.TempDir()
-	mapFile := filepath.Join(t.TempDir(), "bead-prefixes.json")
-	if err := os.WriteFile(mapFile, []byte(`[{"prefix":"acme-","project_id":"btsproj_acme"},{"prefix":"beta-","project_id":"btsproj_beta"}]`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+// prefixMapDaemon starts a REAL assembled daemon (watcher -> extractor -> policy -> durable WAL)
+// wired exactly as -bead-prefix-map-file wires it, tailing one transcript root.
+func prefixMapDaemon(t *testing.T, mapFile string) (stateDir, root string, pm *prefixmap.File) {
+	t.Helper()
+	stateDir, root = t.TempDir(), t.TempDir()
 	const poll = 15 * time.Millisecond
 	refs := newReferenceConfig(nil, "")
 	pm, err := openPrefixMap(mapFile, poll, func(string) {})
@@ -87,7 +98,7 @@ func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
 		t.Fatalf("openPrefixMap: %v", err)
 	}
 	refs.PrefixMap = pm
-	watch := newWatchLoopConfig([]string{root}, cursorDir, poll, refs)
+	watch := newWatchLoopConfig([]string{root}, t.TempDir(), poll, refs)
 	watch.Policy = e2eWatchPolicy()
 
 	svc, err := daemon.NewService(daemon.ServiceConfig{
@@ -110,12 +121,53 @@ func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
 		defer cancel()
 		_ = svc.Shutdown(ctx)
 	})
+	return stateDir, root, pm
+}
+
+func bdToolLine(cmd string) string {
+	return `{"type":"tool_call","tool":"bd","category":"SHELL","command":"` + cmd + `","ts":"2026-07-17T10:00:01Z"}` + "\n"
+}
+
+func appendLine(t *testing.T, path, line string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// replaceMapFile atomically replaces the map file, as bd's refresh does.
+func replaceMapFile(t *testing.T, path, body string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestDaemonPrefixMapMultiProjectHotReloadEndToEnd is the bead acceptance through a REAL assembled
+// daemon: a session referencing beads of two projects yields durable EXTRACTED references to both,
+// each under its own project, while a malformed declaration and a prefix two projects share (both
+// possible in the team server's project list) neither block the map nor mis-link; then the map file
+// is rewritten with a new project and, with the daemon still running, the new project's bead is
+// captured and resolved.
+func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	if err := os.WriteFile(mapFile, []byte(`[{"prefix":"acme-","project_id":"btsproj_acme"},{"prefix":"beta-","project_id":"btsproj_beta"},`+
+		`{"prefix":"my_app-","project_id":"btsproj_mine"},{"prefix":"fe-","project_id":"btsproj_fe1"},{"prefix":"fe-","project_id":"btsproj_fe2"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, root, pm := prefixMapDaemon(t, mapFile)
 
 	transcript := filepath.Join(root, "session.jsonl")
-	line := func(cmd string) string {
-		return `{"type":"tool_call","tool":"bd","category":"SHELL","command":"` + cmd + `","ts":"2026-07-17T10:00:01Z"}` + "\n"
-	}
-	writeFile(t, transcript, line("bd dep add acme-12 beta-7")+line("bd show gamma-3"))
+	writeFile(t, transcript, bdToolLine("bd dep add acme-12 beta-7")+bdToolLine("bd show gamma-3 fe-5"))
 
 	want := map[string]string{"acme-12": "btsproj_acme", "beta-7": "btsproj_beta"}
 	if !waitUntil(8*time.Second, func() bool {
@@ -125,33 +177,20 @@ func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
 		got, _ := durableWorkRefs(stateDir)
 		t.Fatalf("cross-project refs = %v, want %v", got, want)
 	}
-	if got, _ := durableWorkRefs(stateDir); got["gamma-3"] != "" {
+	got, _ := durableWorkRefs(stateDir)
+	if _, ok := got["gamma-3"]; ok {
 		t.Fatalf("unmapped prefix was captured before the reload: %v", got)
+	}
+	if _, ok := got["fe-5"]; ok {
+		t.Fatalf("a prefix declared for two projects linked: %v", got)
 	}
 
 	// A new project lands in the map while the daemon runs (bd's refresh rewrites the file).
-	tmp := mapFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(`[{"prefix":"acme-","project_id":"btsproj_acme"},{"prefix":"beta-","project_id":"btsproj_beta"},{"prefix":"gamma-","project_id":"btsproj_gamma"}]`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().Add(time.Minute)
-	if err := os.Chtimes(tmp, future, future); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(tmp, mapFile); err != nil {
-		t.Fatal(err)
-	}
+	replaceMapFile(t, mapFile, `[{"prefix":"acme-","project_id":"btsproj_acme"},{"prefix":"beta-","project_id":"btsproj_beta"},{"prefix":"gamma-","project_id":"btsproj_gamma"}]`)
 	if !waitUntil(2*time.Second, func() bool { _, ok := pm.Current().Lookup("gamma-1"); return ok }) {
 		t.Fatal("prefix map file change not observed")
 	}
-	f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString(line("bd close gamma-4")); err != nil {
-		t.Fatal(err)
-	}
-	_ = f.Close()
+	appendLine(t, transcript, bdToolLine("bd close gamma-4"))
 
 	if !waitUntil(8*time.Second, func() bool {
 		got, err := durableWorkRefs(stateDir)
@@ -159,5 +198,43 @@ func TestDaemonPrefixMapMultiProjectHotReloadEndToEnd(t *testing.T) {
 	}) {
 		got, _ := durableWorkRefs(stateDir)
 		t.Fatalf("new project not picked up without restart: %v", got)
+	}
+}
+
+// TestDaemonPrefixMapInvalidAtStartupRecovers: a daemon whose map file is invalid when it starts
+// keeps running (transcript capture is never held hostage by the enrichment map) and links beads as
+// soon as bd writes a valid map — no restart.
+func TestDaemonPrefixMapInvalidAtStartupRecovers(t *testing.T) {
+	mapFile := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	if err := os.WriteFile(mapFile, []byte(`[{"prefix":"acme-","project_id":"btsproj_acme"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, root, pm := prefixMapDaemon(t, mapFile)
+
+	transcript := filepath.Join(root, "session.jsonl")
+	writeFile(t, transcript, bdToolLine("bd show acme-1"))
+	// The daemon is up and tailing: the session's own metadata becomes durable even though the
+	// map is invalid, and no bead is linked yet.
+	if !waitUntil(8*time.Second, func() bool {
+		recs, err := upload.SpoolFrameStore{Dir: stateDir}.ReadRange(wire.SequenceMin, 1<<40)
+		return err == nil && len(recs) > 0
+	}) {
+		t.Fatal("daemon with an invalid map captured nothing")
+	}
+	if got, _ := durableWorkRefs(stateDir); len(got) != 0 {
+		t.Fatalf("refs linked from an invalid map: %v", got)
+	}
+
+	replaceMapFile(t, mapFile, `[{"prefix":"acme-","project_id":"btsproj_acme"}]`)
+	if !waitUntil(2*time.Second, func() bool { _, ok := pm.Current().Lookup("acme-2"); return ok }) {
+		t.Fatal("valid map not picked up")
+	}
+	appendLine(t, transcript, bdToolLine("bd close acme-2"))
+	if !waitUntil(8*time.Second, func() bool {
+		got, err := durableWorkRefs(stateDir)
+		return err == nil && got["acme-2"] == "btsproj_acme"
+	}) {
+		got, _ := durableWorkRefs(stateDir)
+		t.Fatalf("bead not linked after the map was fixed: %v", got)
 	}
 }

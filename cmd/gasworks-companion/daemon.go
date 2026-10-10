@@ -77,7 +77,9 @@ func runDaemon(args []string) int {
 	// it from the team server's project list). Every listed prefix is captured and each captured id
 	// resolves to the project of its longest matching prefix, so cross-project references survive.
 	// The file is re-read when it changes (polled at the watcher cadence), so a new project is picked
-	// up without a restart. Mutually exclusive with the single-project -bead-prefix/-beads-project.
+	// up without a restart. A missing or invalid file never stops the daemon (bead capture idles,
+	// logged, until bd writes a valid one). Mutually exclusive with the single-project
+	// -bead-prefix/-beads-project.
 	beadPrefixMapFile := fs.String("bead-prefix-map-file", "", "multi-project bead prefix map: JSON array of {prefix, project_id}, hot-reloaded on change (mutually exclusive with -bead-prefix/-beads-project)")
 
 	if err := fs.Parse(args); err != nil {
@@ -362,8 +364,10 @@ func newReferenceConfig(beadPrefixes []string, beadsProject string) codex.Refere
 
 // openPrefixMap loads the -bead-prefix-map-file and arms its hot reload at the transcript watcher's
 // poll cadence (pollInterval, or the watcher default when unset), so a rewritten map takes effect
-// within one poll of the next bead-bearing tool call. A missing file is tolerated (capture of mapped
-// prefixes stays idle until bd writes it); a present but invalid file fails startup.
+// within one poll of the next bead-bearing tool call. The map is enrichment, so its file never fails
+// startup: a missing, unreadable or invalid file is logged and bead capture of mapped prefixes stays
+// idle until bd writes a valid one (a daemon that exited here would crash-loop under launchd/systemd
+// and stop ALL transcript capture over a bad map).
 func openPrefixMap(path string, pollInterval time.Duration, log func(string)) (*prefixmap.File, error) {
 	if pollInterval <= 0 {
 		pollInterval = codex.DefaultPollInterval

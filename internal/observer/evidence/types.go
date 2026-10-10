@@ -862,7 +862,9 @@ func NewDeclaredWorkReference(c Common, in DeclaredWorkRefInput) (PendingObserva
 // the longest declared bead-prefix mapping that matches the captured bead id, or a single
 // configured default project. The stamped context always wins. The prefix map is declared
 // configuration (each project's sealed issue prefix), so the project is still never parsed out of
-// the identifier — the id only selects which declared mapping applies.
+// the identifier — the id only selects which declared mapping applies. A bead id whose longest
+// matching prefix is declared for more than one project resolves to nothing: ambiguous ownership
+// never authorizes a link, and never falls through to a shorter prefix or the default project.
 type ProjectResolver struct {
 	// StampedProjectID is the project from the daemon-stamped run context ("" if none).
 	StampedProjectID string
@@ -872,17 +874,21 @@ type ProjectResolver struct {
 	DefaultProjectID string
 }
 
-func (r ProjectResolver) resolve(beadID string) (string, bool) {
+// resolve returns the project for beadID, or "" and the reason it cannot resolve.
+func (r ProjectResolver) resolve(beadID string) (string, RefDropReason) {
 	if r.StampedProjectID != "" {
-		return r.StampedProjectID, true
+		return r.StampedProjectID, ""
 	}
-	if projectID, ok := r.Prefixes.Lookup(beadID); ok {
-		return projectID, true
+	if projectID, matched := r.Prefixes.match(beadID); matched {
+		if projectID == "" {
+			return "", RefDropAmbiguousPrefix
+		}
+		return projectID, ""
 	}
 	if r.DefaultProjectID != "" {
-		return r.DefaultProjectID, true
+		return r.DefaultProjectID, ""
 	}
-	return "", false
+	return "", RefDropUnresolvableProject
 }
 
 // BeadPrefixMapping declares that bead ids beginning with Prefix belong to the team-server project
@@ -899,80 +905,132 @@ const MaxBeadPrefixMappings = 4096
 // maxBeadPrefix bounds one declared prefix (a bead id is itself bounded by maxBeadID).
 const maxBeadPrefix = 64
 
+// maxReportedAmbiguous bounds how many ambiguous prefixes Problems names.
+const maxReportedAmbiguous = 8
+
 // beadPrefixPattern is the shape of a declared prefix: alphanumeric dash-joined segments ending in
 // the separator dash ("acme-", "gas-city-"). It keeps regex/shell metacharacters out of the
 // extraction pattern and guarantees a prefix can never match across a token boundary.
 var beadPrefixPattern = regexp.MustCompile(`^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-$`)
 
-// BeadPrefixMap is an immutable, validated multi-project bead-prefix map. Lookup is a
-// longest-prefix match, so nested prefixes ("gas-" and "gas-city-") resolve to the most specific
-// project. A nil *BeadPrefixMap is a valid empty map.
-type BeadPrefixMap struct {
-	// entries is sorted by descending prefix length (ties by prefix) for longest-match lookup.
-	entries []BeadPrefixMapping
+// beadPrefixEntry is one distinct declared prefix. projectID is "" when the prefix is ambiguous
+// (declared for more than one project).
+type beadPrefixEntry struct {
+	prefix    string
+	projectID string
 }
 
-// NewBeadPrefixMap validates and freezes a prefix map. It fails closed on a malformed prefix, an
-// empty or oversized project id, more than MaxBeadPrefixMappings entries, or a prefix declared
-// twice for different projects (an ambiguous map is never half-applied). An exact duplicate entry
-// is collapsed. An empty input yields a valid empty map.
+// BeadPrefixMap is an immutable multi-project bead-prefix map. Lookup is a longest-prefix match,
+// so nested prefixes ("gas-" and "gas-city-") resolve to the most specific project. A nil
+// *BeadPrefixMap is a valid empty map.
+type BeadPrefixMap struct {
+	// entries is sorted by descending prefix length (ties by prefix) for longest-match lookup.
+	entries []beadPrefixEntry
+	// skipped counts declarations dropped as malformed; firstSkip describes the first one.
+	skipped   int
+	firstSkip string
+	// ambiguous lists the prefixes declared for more than one project, sorted.
+	ambiguous []string
+}
+
+// NewBeadPrefixMap builds a prefix map from declared mappings. Validation is per declaration, so
+// one bad project never disables linking for every other project: the team server's project list
+// (which bd writes the map from) neither forbids two projects sharing an issue prefix nor limits a
+// prefix's characters.
+//   - A declaration whose prefix is not dash-joined alphanumerics ending in '-' (at most 64 bytes),
+//     or whose project id is empty or longer than 128 bytes, is skipped.
+//   - A prefix declared for two or more different projects is AMBIGUOUS. It stays in the map (it is
+//     still captured), but a bead id whose longest matching prefix it is resolves to no project and
+//     never falls back to a shorter prefix's project.
+//   - An exact duplicate collapses.
+//
+// Problems summarizes what was skipped or ambiguous. Only a map with more than
+// MaxBeadPrefixMappings declarations fails as a whole. An empty input yields a valid empty map.
 func NewBeadPrefixMap(mappings []BeadPrefixMapping) (*BeadPrefixMap, error) {
 	if len(mappings) > MaxBeadPrefixMappings {
 		return nil, fmt.Errorf("bead prefix map has %d entries, max %d", len(mappings), MaxBeadPrefixMappings)
 	}
-	seen := make(map[string]string, len(mappings))
-	entries := make([]BeadPrefixMapping, 0, len(mappings))
-	for i, m := range mappings {
-		if len(m.Prefix) > maxBeadPrefix || !beadPrefixPattern.MatchString(m.Prefix) {
-			return nil, fmt.Errorf("bead prefix map entry %d: prefix %q must be dash-joined alphanumerics ending in '-' (max %d bytes)", i, m.Prefix, maxBeadPrefix)
-		}
-		if err := boundedNonEmpty("bead_prefix_map.project_id", m.ProjectID, maxTeamServerProject); err != nil {
-			return nil, fmt.Errorf("bead prefix map entry %d (%s): %w", i, m.Prefix, err)
-		}
-		if prev, dup := seen[m.Prefix]; dup {
-			if prev != m.ProjectID {
-				return nil, fmt.Errorf("bead prefix map: prefix %q declared for two projects", m.Prefix)
+	m := &BeadPrefixMap{entries: make([]beadPrefixEntry, 0, len(mappings))}
+	index := make(map[string]int, len(mappings)) // prefix -> position in m.entries
+	for i, d := range mappings {
+		if reason := beadPrefixMappingProblem(d); reason != "" {
+			if m.skipped == 0 {
+				m.firstSkip = fmt.Sprintf("entry %d: %s", i, reason)
 			}
+			m.skipped++
 			continue
 		}
-		seen[m.Prefix] = m.ProjectID
-		entries = append(entries, m)
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if len(entries[i].Prefix) != len(entries[j].Prefix) {
-			return len(entries[i].Prefix) > len(entries[j].Prefix)
+		j, seen := index[d.Prefix]
+		if !seen {
+			index[d.Prefix] = len(m.entries)
+			m.entries = append(m.entries, beadPrefixEntry{prefix: d.Prefix, projectID: d.ProjectID})
+			continue
 		}
-		return entries[i].Prefix < entries[j].Prefix
+		if e := &m.entries[j]; e.projectID != "" && e.projectID != d.ProjectID {
+			e.projectID = ""
+			m.ambiguous = append(m.ambiguous, d.Prefix)
+		}
+	}
+	sort.Slice(m.entries, func(i, j int) bool {
+		if len(m.entries[i].prefix) != len(m.entries[j].prefix) {
+			return len(m.entries[i].prefix) > len(m.entries[j].prefix)
+		}
+		return m.entries[i].prefix < m.entries[j].prefix
 	})
-	return &BeadPrefixMap{entries: entries}, nil
+	sort.Strings(m.ambiguous)
+	return m, nil
 }
 
-// Lookup returns the project of the longest declared prefix that beadID begins with.
-func (m *BeadPrefixMap) Lookup(beadID string) (string, bool) {
+// beadPrefixMappingProblem returns why one declaration cannot be applied ("" when it can). The
+// reason never carries an unbounded value: an oversized prefix is reported by length only.
+func beadPrefixMappingProblem(d BeadPrefixMapping) string {
+	if len(d.Prefix) > maxBeadPrefix {
+		return fmt.Sprintf("prefix is %d bytes, max %d", len(d.Prefix), maxBeadPrefix)
+	}
+	if !beadPrefixPattern.MatchString(d.Prefix) {
+		return fmt.Sprintf("prefix %q is not dash-joined alphanumerics ending in '-'", d.Prefix)
+	}
+	if err := boundedNonEmpty("project_id", d.ProjectID, maxTeamServerProject); err != nil {
+		return fmt.Sprintf("prefix %q: %v", d.Prefix, err)
+	}
+	return ""
+}
+
+// match finds the longest declared prefix beadID begins with. matched reports whether any prefix
+// matched; projectID is "" when that prefix is ambiguous.
+func (m *BeadPrefixMap) match(beadID string) (projectID string, matched bool) {
 	if m == nil {
 		return "", false
 	}
 	for _, e := range m.entries {
-		if strings.HasPrefix(beadID, e.Prefix) {
-			return e.ProjectID, true
+		if strings.HasPrefix(beadID, e.prefix) {
+			return e.projectID, true
 		}
 	}
 	return "", false
 }
 
-// Prefixes returns the declared prefixes (longest first); the caller owns the returned slice.
+// Lookup returns the project of the longest declared prefix that beadID begins with. It reports
+// false when no prefix matches or when the longest matching prefix is ambiguous.
+func (m *BeadPrefixMap) Lookup(beadID string) (string, bool) {
+	projectID, _ := m.match(beadID)
+	return projectID, projectID != ""
+}
+
+// Prefixes returns every distinct declared prefix, ambiguous ones included (longest first): the
+// set bead ids are captured with. The caller owns the returned slice.
 func (m *BeadPrefixMap) Prefixes() []string {
 	if m == nil {
 		return nil
 	}
 	out := make([]string, len(m.entries))
 	for i, e := range m.entries {
-		out[i] = e.Prefix
+		out[i] = e.prefix
 	}
 	return out
 }
 
-// Len reports the number of distinct declared prefixes.
+// Len reports the number of distinct declared prefixes, ambiguous ones included.
 func (m *BeadPrefixMap) Len() int {
 	if m == nil {
 		return 0
@@ -980,12 +1038,60 @@ func (m *BeadPrefixMap) Len() int {
 	return len(m.entries)
 }
 
+// Problems summarizes the declarations the map does not resolve: skipped malformed entries and
+// ambiguous prefixes. It is "" when every declaration applies. The summary is bounded (prefixes
+// are at most 64 bytes and at most a few are named) and carries no project id.
+func (m *BeadPrefixMap) Problems() string {
+	if m == nil {
+		return ""
+	}
+	var parts []string
+	if m.skipped > 0 {
+		parts = append(parts, fmt.Sprintf("skipped %d malformed entr%s (first: %s)", m.skipped, plural(m.skipped, "y", "ies"), m.firstSkip))
+	}
+	if n := len(m.ambiguous); n > 0 {
+		named := m.ambiguous
+		more := ""
+		if n > maxReportedAmbiguous {
+			named, more = named[:maxReportedAmbiguous], fmt.Sprintf(" and %d more", n-maxReportedAmbiguous)
+		}
+		parts = append(parts, fmt.Sprintf("%d prefix%s declared for more than one project resolve%s to no project: %s%s",
+			n, plural(n, "", "es"), plural(n, "s", ""), strings.Join(named, ", "), more))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Equal reports whether two maps resolve every bead id identically and report the same problems.
+func (m *BeadPrefixMap) Equal(o *BeadPrefixMap) bool {
+	if m.Len() != o.Len() || m.Problems() != o.Problems() {
+		return false
+	}
+	for i := 0; i < m.Len(); i++ {
+		if m.entries[i] != o.entries[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
 // RefDropReason is the typed reason an EXTRACTED reference was dropped.
 type RefDropReason string
 
-// RefDropUnresolvableProject means no stamped run context and no configured default project
-// could supply a team_server_project_id, so the reference cannot be built.
-const RefDropUnresolvableProject RefDropReason = "UNRESOLVABLE_PROJECT"
+const (
+	// RefDropUnresolvableProject means no stamped run context, no declared prefix mapping and no
+	// configured default project could supply a team_server_project_id.
+	RefDropUnresolvableProject RefDropReason = "UNRESOLVABLE_PROJECT"
+	// RefDropAmbiguousPrefix means the bead id's longest matching declared prefix belongs to more
+	// than one project, so no project may be chosen.
+	RefDropAmbiguousPrefix RefDropReason = "AMBIGUOUS_PREFIX"
+)
 
 // ExtractedWorkRefResult is the typed outcome of building an EXTRACTED work reference:
 // exactly one of Resolved and Drop is non-nil. When the project resolves, Resolved holds
@@ -1016,18 +1122,22 @@ func NewExtractedWorkReference(c Common, in ExtractedWorkRefInput, resolver Proj
 	if err := boundedNonEmpty("work_reference.bead_id", in.BeadID, maxBeadID); err != nil {
 		return ExtractedWorkRefResult{}, err
 	}
-	projectID, ok := resolver.resolve(in.BeadID)
-	if !ok {
+	projectID, reason := resolver.resolve(in.BeadID)
+	if reason != "" {
+		detail := "extracted work reference dropped: no stamped, prefix-mapped, or default team-server project"
+		if reason == RefDropAmbiguousPrefix {
+			detail = "extracted work reference dropped: its bead prefix is declared for more than one team-server project"
+		}
 		diag, err := NewCaptureDiagnostic(c, CaptureDiagnosticInput{
 			Code:               wire.CaptureDiagnosticPayloadCodeCAPTURELOSS,
 			Severity:           wire.CaptureDiagnosticPayloadSeverityINFO,
 			CompletenessEffect: wire.CaptureDiagnosticPayloadCompletenessEffectNONE,
-			Context:            "extracted work reference dropped: no stamped, prefix-mapped, or default team-server project",
+			Context:            detail,
 		})
 		if err != nil {
 			return ExtractedWorkRefResult{}, err
 		}
-		return ExtractedWorkRefResult{Drop: &diag, DropReason: RefDropUnresolvableProject}, nil
+		return ExtractedWorkRefResult{Drop: &diag, DropReason: reason}, nil
 	}
 	ref := wire.WorkReference{
 		TeamServerProjectId: projectID,

@@ -51,6 +51,17 @@ func writeMap(t *testing.T, path, body string, mtime time.Time) {
 	}
 }
 
+// replaceMap atomically replaces path (temp file + rename, as bd writes it) with body and the given
+// mtime.
+func replaceMap(t *testing.T, path, body string, mtime time.Time) {
+	t.Helper()
+	tmp := path + ".tmp"
+	writeMap(t, tmp, body, mtime)
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func lookup(t *testing.T, f *File, bead string) string {
 	t.Helper()
 	p, _ := f.Current().Lookup(bead)
@@ -62,47 +73,97 @@ func TestParse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if m.Len() != 2 {
-		t.Fatalf("Len = %d, want 2", m.Len())
+	if m.Len() != 2 || m.Problems() != "" {
+		t.Fatalf("Len = %d problems = %q, want 2 and none", m.Len(), m.Problems())
 	}
-	if m, err := Parse([]byte(`[]`)); err != nil || m.Len() != 0 {
+	if m, err := Parse([]byte("[]\n")); err != nil || m.Len() != 0 {
 		t.Fatalf("empty array: m=%v err=%v", m, err)
 	}
+	// A malformed document is rejected whole: it is not the file bd writes (or it is truncated).
 	for _, bad := range []string{
-		``, `   `, `null`, `{}`, `[{"prefix":"acme","project_id":"p"}]`,
-		`[{"prefix":"acme-"}]`, `[] []`, `[{"prefix":"acme-","project_id":"p"}`,
-		`[{"prefix":"acme-","project_id":"a"},{"prefix":"acme-","project_id":"b"}]`,
+		``, `   `, `null`, `{}`, `[1]`, `["acme-"]`, `[] []`, `[]]`, `[] }`, `[{"prefix":"acme-","project_id":"p"}`,
 	} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("Parse(%q) accepted, want error", bad)
 		}
 	}
+	// A well-formed document applies every declaration it can; the rest are reported.
+	m, err = Parse([]byte(`[{"prefix":"acme","project_id":"p"},{"prefix":"beta-","project_id":"p_beta"},null,` +
+		`{"prefix":"fe-","project_id":"a"},{"prefix":"fe-","project_id":"b"}]`))
+	if err != nil {
+		t.Fatalf("per-entry problems failed the document: %v", err)
+	}
+	if got, ok := m.Lookup("beta-1"); !ok || got != "p_beta" {
+		t.Fatalf("valid declaration not applied: %q,%v", got, ok)
+	}
+	if _, ok := m.Lookup("fe-1"); ok {
+		t.Fatal("ambiguous prefix resolved")
+	}
+	if p := m.Problems(); !strings.Contains(p, "skipped 2 malformed entries") || !strings.Contains(p, "fe-") {
+		t.Fatalf("problems = %q", p)
+	}
 }
 
-func TestOpenFailsLoudOnInvalidFileButToleratesMissing(t *testing.T) {
+// TestOpenNeverFailsOnTheFile: the map is enrichment, so the file's state never fails startup (a
+// daemon that exits there crash-loops under launchd/systemd and stops ALL capture). An invalid,
+// oversized, non-regular or missing file leaves capture idle with one log line; only a missing path
+// (a configuration error) fails.
+func TestOpenNeverFailsOnTheFile(t *testing.T) {
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad.json")
-	writeMap(t, bad, `[{"prefix":"nope","project_id":"p"}]`, time.Now())
-	if _, err := Open(Config{Path: bad}); err == nil {
-		t.Fatal("Open accepted an invalid map")
-	}
-	if _, err := Open(Config{Path: dir}); err == nil {
-		t.Fatal("Open accepted a directory")
-	}
+	writeMap(t, bad, `[{"prefix":"acme-","project_id":"p"}`, time.Now())
 	big := filepath.Join(dir, "big.json")
 	writeMap(t, big, "["+strings.Repeat(" ", MaxFileBytes)+"]", time.Now())
-	if _, err := Open(Config{Path: big}); err == nil {
-		t.Fatal("Open accepted an oversized file")
+	for name, path := range map[string]string{
+		"invalid":   bad,
+		"oversized": big,
+		"directory": dir,
+		"missing":   filepath.Join(dir, "absent.json"),
+	} {
+		logs := &logSink{}
+		f, err := Open(Config{Path: path, Log: logs.Log})
+		if err != nil {
+			t.Errorf("%s: Open failed: %v", name, err)
+			continue
+		}
+		if f.Current().Len() != 0 {
+			t.Errorf("%s: served prefixes", name)
+		}
+		f.Current()
+		f.Current()
+		if len(logs.lines) != 1 {
+			t.Errorf("%s: want exactly one log line, got %q", name, logs.lines)
+		}
 	}
-	f, err := Open(Config{Path: filepath.Join(dir, "absent.json")})
+	for _, p := range []string{"", "bead-prefixes.json", "./x/bead-prefixes.json"} {
+		if _, err := Open(Config{Path: p}); err == nil {
+			t.Errorf("Open(%q) accepted a missing or relative path", p)
+		}
+	}
+}
+
+// TestInvalidAtStartupThenFixed: a file that is invalid when the daemon starts is picked up as soon
+// as it becomes valid, with no restart.
+func TestInvalidAtStartupThenFixed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	logs := &logSink{}
+	mt := time.Unix(1_700_000_000, 0)
+	writeMap(t, path, `not json`, mt)
+	f, err := Open(Config{Path: path, CheckInterval: time.Second, Now: clk.Now, Log: logs.Log})
 	if err != nil {
-		t.Fatalf("missing file must be tolerated: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
-	if f.Current().Len() != 0 {
-		t.Fatal("missing file must yield an empty map")
+	if logs.count("bead capture idle until a valid map is written") != 1 {
+		t.Fatalf("startup failure not logged: %v", logs.lines)
 	}
-	if _, err := Open(Config{}); err == nil {
-		t.Fatal("Open without a path accepted")
+	replaceMap(t, path, `[{"prefix":"acme-","project_id":"p_acme"}]`, mt.Add(time.Second))
+	clk.Advance(time.Second)
+	if got := lookup(t, f, "acme-1"); got != "p_acme" {
+		t.Fatalf("fixed map not picked up: acme-1 -> %q", got)
+	}
+	if logs.count("loaded: 1 prefixes") != 1 {
+		t.Fatalf("load not logged: %v", logs.lines)
 	}
 }
 
@@ -125,6 +186,9 @@ func TestHotReload(t *testing.T) {
 	if got := lookup(t, f, "acme-1"); got != "p_acme" {
 		t.Fatalf("acme-1 -> %q", got)
 	}
+	if logs.count("loaded: 1 prefixes") != 1 {
+		t.Fatalf("initial load not logged: %v", logs.lines)
+	}
 
 	// A new project is added. Within the interval the old snapshot still serves (no stat storm).
 	mt = mt.Add(time.Second)
@@ -136,7 +200,7 @@ func TestHotReload(t *testing.T) {
 	if got := lookup(t, f, "beta-1"); got != "p_beta" {
 		t.Fatalf("new project not picked up without restart: beta-1 -> %q", got)
 	}
-	if logs.count("reloaded: 2 prefixes") != 1 {
+	if logs.count("loaded: 2 prefixes") != 1 {
 		t.Fatalf("reload not logged: %v", logs.lines)
 	}
 
@@ -149,7 +213,7 @@ func TestHotReload(t *testing.T) {
 			t.Fatalf("invalid rewrite displaced the last good map: beta-1 -> %q", got)
 		}
 	}
-	if n := logs.count("not reloaded"); n != 1 {
+	if n := logs.count("keeping the last loaded map (2 prefixes)"); n != 1 {
 		t.Fatalf("invalid file logged %d times, want once: %v", n, logs.lines)
 	}
 
@@ -172,6 +236,9 @@ func TestHotReload(t *testing.T) {
 	if got := lookup(t, f, "gamma-1"); got != "p_gamma" {
 		t.Fatalf("removed file dropped the last good map: gamma-1 -> %q", got)
 	}
+	if logs.count("file removed; keeping the last loaded map (1 prefixes)") != 1 {
+		t.Fatalf("removal not logged: %v", logs.lines)
+	}
 
 	// A file that appears after startup is picked up.
 	late := filepath.Join(dir, "late.json")
@@ -186,6 +253,80 @@ func TestHotReload(t *testing.T) {
 	clk.Advance(time.Second)
 	if got := lookup(t, g, "late-1"); got != "p_late" {
 		t.Fatalf("late file not picked up: late-1 -> %q", got)
+	}
+}
+
+// TestAtomicReplaceDetectedWithinOneTimestampTick: bd replaces the file by rename. A replacement
+// with the same size and the same mtime (two writes inside one filesystem timestamp tick) is still a
+// different file and must be re-read.
+func TestAtomicReplaceDetectedWithinOneTimestampTick(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	mt := time.Unix(1_700_000_000, 0)
+	writeMap(t, path, `[{"prefix":"acme-","project_id":"p_aaaa"}]`, mt)
+	f, err := Open(Config{Path: path, CheckInterval: time.Second, Now: clk.Now})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := lookup(t, f, "acme-1"); got != "p_aaaa" {
+		t.Fatalf("acme-1 -> %q", got)
+	}
+	replaceMap(t, path, `[{"prefix":"acme-","project_id":"p_bbbb"}]`, mt) // same size, same mtime
+	clk.Advance(time.Second)
+	if got := lookup(t, f, "acme-1"); got != "p_bbbb" {
+		t.Fatalf("same-size same-mtime replacement not detected: acme-1 -> %q", got)
+	}
+}
+
+// TestIdenticalRewriteKeepsSnapshot: bd's periodic refresh rewrites unchanged content. The daemon
+// keeps the same snapshot (so the extractor's compiled pattern stays cached) and logs nothing.
+func TestIdenticalRewriteKeepsSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	clk := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	logs := &logSink{}
+	mt := time.Unix(1_700_000_000, 0)
+	body := `[{"prefix":"acme-","project_id":"p_acme"},{"prefix":"beta-","project_id":"p_beta"}]`
+	writeMap(t, path, body, mt)
+	f, err := Open(Config{Path: path, CheckInterval: time.Second, Now: clk.Now, Log: logs.Log})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	first := f.Current()
+	for i := 1; i <= 3; i++ {
+		replaceMap(t, path, `[{"prefix":"beta-","project_id":"p_beta"},{"prefix":"acme-","project_id":"p_acme"}]`, mt.Add(time.Duration(i)*time.Hour))
+		clk.Advance(time.Second)
+		if f.Current() != first {
+			t.Fatalf("identical rewrite %d swapped the snapshot", i)
+		}
+	}
+	if n := len(logs.lines); n != 1 {
+		t.Fatalf("identical rewrites logged: %v", logs.lines)
+	}
+}
+
+// TestLoadReportsPerEntryProblems: a file with a malformed and an ambiguous declaration still
+// applies the rest, and the load line names the problems (bounded, no project ids).
+func TestLoadReportsPerEntryProblems(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bead-prefixes.json")
+	logs := &logSink{}
+	writeMap(t, path, `[{"prefix":"acme-","project_id":"p_acme"},{"prefix":"my_app-","project_id":"p_mine"},`+
+		`{"prefix":"FE-","project_id":"p_fe1"},{"prefix":"FE-","project_id":"p_fe2"}]`, time.Now())
+	f, err := Open(Config{Path: path, Log: logs.Log})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := lookup(t, f, "acme-1"); got != "p_acme" {
+		t.Fatalf("acme-1 -> %q", got)
+	}
+	if got := lookup(t, f, "FE-1"); got != "" {
+		t.Fatalf("ambiguous FE-1 -> %q", got)
+	}
+	want := `loaded: 2 prefixes; skipped 1 malformed entry (first: entry 1: prefix "my_app-" is not dash-joined alphanumerics ending in '-'); 1 prefix declared for more than one project resolves to no project: FE-`
+	if logs.count(want) != 1 {
+		t.Fatalf("load line = %v, want it to contain %q", logs.lines, want)
+	}
+	if logs.count("p_fe") != 0 || logs.count("p_mine") != 0 {
+		t.Fatalf("project ids leaked into the log: %v", logs.lines)
 	}
 }
 
@@ -211,7 +352,7 @@ func TestCurrentIsConcurrencySafe(t *testing.T) {
 	}
 	for j := 0; j < 20; j++ {
 		mt = mt.Add(time.Second)
-		writeMap(t, path, `[{"prefix":"acme-","project_id":"p"},{"prefix":"beta-","project_id":"q"}]`, mt)
+		replaceMap(t, path, `[{"prefix":"acme-","project_id":"p"},{"prefix":"beta-","project_id":"q"}]`, mt)
 	}
 	wg.Wait()
 }

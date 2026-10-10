@@ -7,9 +7,14 @@
 // projects yields references to all of them.
 //
 // Reload is poll-based and lazy: Current re-stats the file at most once per check interval (the
-// transcript watcher's poll cadence) and re-reads it only when its modification time or size
-// changed. A file that fails to read or validate never replaces the last good map — the previous
-// snapshot keeps serving and the failure is logged once per distinct file state.
+// transcript watcher's poll cadence) and re-reads it only when the file was replaced (a different
+// inode, as an atomic rename produces) or its modification time or size changed. The map is
+// best-effort enrichment, so its file never stops the daemon: a missing, unreadable or invalid file
+// at startup leaves bead capture idle until a valid map is written, and one that becomes unreadable,
+// invalid or removed later keeps serving the last good snapshot. Each failure is logged once per
+// distinct file state. Individual declarations the map cannot apply (a malformed prefix, a prefix
+// declared for two projects) are skipped or left unresolved by evidence.NewBeadPrefixMap without
+// rejecting the rest of the file, and are reported in the load log line.
 package prefixmap
 
 import (
@@ -20,6 +25,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -35,7 +41,7 @@ type Config struct {
 	Path string
 	// CheckInterval is the minimum spacing between file stats; <=0 stats on every Current call.
 	CheckInterval time.Duration
-	// Log receives content-free reload status lines (nil discards them).
+	// Log receives content-free load status lines (nil discards them).
 	Log func(string)
 	// Now is the clock (nil uses time.Now).
 	Now func() time.Time
@@ -48,29 +54,38 @@ type File struct {
 
 	mu        sync.Mutex
 	current   *evidence.BeadPrefixMap
-	loaded    fileState // the state the current snapshot was read from
+	loaded    fileState // the state the current snapshot was read from (absent before any load)
 	failed    fileState // the last state that failed (log de-duplication)
-	failedMsg string    // the last failure message (log de-duplication)
+	failedMsg string    // the last failure message (log de-duplication); "" when the last check succeeded
 	lastCheck time.Time
 }
 
-// fileState identifies one observed version of the file.
+// fileState identifies one observed version of the file. info is nil when the file is absent.
 type fileState struct {
-	present bool
-	modTime time.Time
-	size    int64
+	info fs.FileInfo
 }
 
+func (s fileState) present() bool { return s.info != nil }
+
+// equal reports whether two observations are the same version of the file: the same file object
+// (device and inode, so an atomic replace is always a change even within one timestamp tick) with
+// the same size and modification time (an in-place rewrite).
 func (s fileState) equal(o fileState) bool {
-	return s.present == o.present && s.size == o.size && s.modTime.Equal(o.modTime)
+	if s.info == nil || o.info == nil {
+		return s.info == nil && o.info == nil
+	}
+	return os.SameFile(s.info, o.info) && s.info.Size() == o.info.Size() && s.info.ModTime().Equal(o.info.ModTime())
 }
 
-// Open performs the initial load. A missing file is not an error (bd may write it after the daemon
-// starts; capture stays off until it appears), but a present file that is unreadable or invalid is,
-// so a misconfigured map fails loud at startup instead of silently capturing nothing.
+// Open arms the map file and performs the initial load. It fails only on a configuration error (an
+// empty or relative path — a service manager's working directory is not the caller's): the file's
+// absence or content never fails startup, because the map is enrichment and a daemon that refuses
+// to start stops all transcript capture (under launchd/systemd it would crash-loop on a bad file bd
+// wrote). A missing file is expected (bd may write it after the daemon starts); an unreadable or
+// invalid one is logged and retried on every check until it is fixed.
 func Open(cfg Config) (*File, error) {
-	if cfg.Path == "" {
-		return nil, errors.New("prefixmap: path is required")
+	if cfg.Path == "" || !filepath.IsAbs(cfg.Path) {
+		return nil, errors.New("bead prefix map path must be absolute")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -79,26 +94,19 @@ func Open(cfg Config) (*File, error) {
 		cfg.Log = func(string) {}
 	}
 	f := &File{cfg: cfg}
-	st, err := stat(cfg.Path)
-	if err != nil {
-		return nil, err
-	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastCheck = cfg.Now()
-	if !st.present {
-		f.loaded = st
+	f.refreshLocked()
+	if f.current == nil && f.failedMsg == "" {
 		cfg.Log(fmt.Sprintf("bead prefix map %s not present yet; bead capture idle until it appears", cfg.Path))
-		return f, nil
 	}
-	m, err := Load(cfg.Path)
-	if err != nil {
-		return nil, err
-	}
-	f.current, f.loaded = m, st
 	return f, nil
 }
 
-// Current returns the latest good snapshot, first re-reading the file when the check interval has
-// elapsed and the file changed. It never returns an error: on failure the previous snapshot stays.
+// Current returns the latest good snapshot (nil before any valid map was read), first re-reading
+// the file when the check interval has elapsed and the file changed. It never returns an error: on
+// failure the previous snapshot stays.
 func (f *File) Current() *evidence.BeadPrefixMap {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -118,12 +126,15 @@ func (f *File) refreshLocked() {
 		return
 	}
 	if st.equal(f.loaded) {
+		// Unchanged since the last good load (or still absent before any load). A failure seen in
+		// between (e.g. a transient stat error) is over.
+		f.failed, f.failedMsg = fileState{}, ""
 		return
 	}
-	if !st.present {
+	if !st.present() {
 		// A removed file keeps the last good map: deletion is not a declaration that every
 		// project went away, and the daemon's lifecycle (revoke/stop) is owned elsewhere.
-		f.failLocked(st, errors.New("file removed; keeping the last loaded map"))
+		f.failLocked(st, errors.New("file removed"))
 		return
 	}
 	m, err := Load(f.cfg.Path)
@@ -131,19 +142,38 @@ func (f *File) refreshLocked() {
 		f.failLocked(st, err)
 		return
 	}
-	f.current, f.loaded, f.failed, f.failedMsg = m, st, fileState{}, ""
-	f.cfg.Log(fmt.Sprintf("bead prefix map reloaded: %d prefixes", m.Len()))
+	recovered := f.failedMsg != ""
+	changed := !m.Equal(f.current) || f.current == nil
+	f.loaded, f.failed, f.failedMsg = st, fileState{}, ""
+	if !changed && !recovered {
+		// A rewrite with identical content (bd's periodic refresh) keeps the current snapshot, so
+		// the extractor's compiled pattern stays valid and the log stays quiet.
+		return
+	}
+	if changed {
+		f.current = m
+	}
+	msg := fmt.Sprintf("bead prefix map %s loaded: %d prefixes", f.cfg.Path, m.Len())
+	if p := m.Problems(); p != "" {
+		msg += "; " + p
+	}
+	f.cfg.Log(msg)
 }
 
-// failLocked logs a reload failure once per distinct (file state, error). The loaded state is deliberately
-// not advanced, so a half-written file is retried on the next check and picked up once complete.
+// failLocked logs a load failure once per distinct (file state, error). The loaded state is
+// deliberately not advanced, so a file that failed is re-read on the next check and picked up as
+// soon as it is valid.
 func (f *File) failLocked(st fileState, err error) {
 	msg := err.Error()
 	if st.equal(f.failed) && msg == f.failedMsg {
 		return
 	}
 	f.failed, f.failedMsg = st, msg
-	f.cfg.Log(fmt.Sprintf("bead prefix map %s not reloaded: %v", f.cfg.Path, err))
+	keep := "bead capture idle until a valid map is written"
+	if f.current != nil {
+		keep = fmt.Sprintf("keeping the last loaded map (%d prefixes)", f.current.Len())
+	}
+	f.cfg.Log(fmt.Sprintf("bead prefix map %s not loaded: %v; %s", f.cfg.Path, err, keep))
 }
 
 func stat(path string) (fileState, error) {
@@ -155,12 +185,12 @@ func stat(path string) (fileState, error) {
 		return fileState{}, fmt.Errorf("stat bead prefix map: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return fileState{}, fmt.Errorf("bead prefix map %s is not a regular file", path)
+		return fileState{}, errors.New("not a regular file")
 	}
-	return fileState{present: true, modTime: info.ModTime(), size: info.Size()}, nil
+	return fileState{info: info}, nil
 }
 
-// Load reads and validates a prefix map file.
+// Load reads and parses a prefix map file.
 func Load(path string) (*evidence.BeadPrefixMap, error) {
 	fh, err := os.Open(path)
 	if err != nil {
@@ -177,26 +207,22 @@ func Load(path string) (*evidence.BeadPrefixMap, error) {
 	return Parse(data)
 }
 
-// Parse decodes and validates a prefix map document: a JSON array of {prefix, project_id}. Unknown
-// member names are ignored (forward-compatible additive fields); trailing data is rejected.
+// Parse decodes a prefix map document: a JSON array of {prefix, project_id}. The document itself
+// must be well formed — exactly one JSON array of objects, nothing after it — or it is rejected
+// whole (a truncated or corrupt write never applies). Within a well-formed array each declaration
+// stands alone (see evidence.NewBeadPrefixMap): a malformed one is skipped and reported by
+// Problems, never failing the rest. Unknown member names are ignored (forward-compatible
+// additive fields).
 func Parse(data []byte) (*evidence.BeadPrefixMap, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, errors.New("bead prefix map is empty (want a JSON array)")
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
 	var mappings []evidence.BeadPrefixMapping
-	if err := dec.Decode(&mappings); err != nil {
+	if err := json.Unmarshal(data, &mappings); err != nil {
 		return nil, fmt.Errorf("decode bead prefix map: %w", err)
-	}
-	if dec.More() {
-		return nil, errors.New("decode bead prefix map: trailing data after the array")
 	}
 	if mappings == nil {
 		return nil, errors.New("bead prefix map must be a JSON array, not null")
 	}
-	m, err := evidence.NewBeadPrefixMap(mappings)
-	if err != nil {
-		return nil, err
-	}
-	return m, nil
+	return evidence.NewBeadPrefixMap(mappings)
 }
