@@ -1,6 +1,6 @@
 module github.com/gascity/gasworks
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/gastownhall/gascity v1.4.1-0.20260805194759-b19a3da8b5bb
