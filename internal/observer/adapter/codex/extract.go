@@ -40,12 +40,23 @@ type DistinctRefAdmitter interface {
 // ReferenceConfig is the declared extraction configuration for one parse. BeadPrefixes is the
 // project-prefix set that selects which bead identifiers to capture (declared configuration, not
 // policy parsed out of the identifier — the captured value stays opaque downstream). Resolver
-// supplies the team_server_project_id for every extracted bead reference. DistinctRefs is the
-// optional caller-owned cross-observation cap hook.
+// supplies the team_server_project_id for every extracted bead reference. PrefixMap, when set, is
+// the hot-reloadable multi-project prefix map: each parse takes its current snapshot, whose
+// prefixes are captured in addition to BeadPrefixes and which the resolver consults (longest
+// prefix) ahead of its default project. DistinctRefs is the optional caller-owned
+// cross-observation cap hook.
 type ReferenceConfig struct {
 	BeadPrefixes []string
 	Resolver     evidence.ProjectResolver
+	PrefixMap    BeadPrefixMapSource
 	DistinctRefs DistinctRefAdmitter
+}
+
+// BeadPrefixMapSource supplies the current multi-project bead-prefix map snapshot. Current is
+// called once per bead-surface extraction and must be safe for concurrent use; a nil snapshot
+// means no mapped prefixes (yet).
+type BeadPrefixMapSource interface {
+	Current() *evidence.BeadPrefixMap
 }
 
 // SurfaceText is the input to the extractors: the producing tool name and the recognized
@@ -229,7 +240,14 @@ func extractPullRequests(surface wire.ExtractionProvenanceSurface, text string) 
 }
 
 func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg ReferenceConfig) []ExtractedReference {
-	re := beadPattern(cfg.BeadPrefixes)
+	prefixes, resolver := cfg.BeadPrefixes, cfg.Resolver
+	if cfg.PrefixMap != nil {
+		if snap := cfg.PrefixMap.Current(); snap.Len() > 0 {
+			prefixes = append(snap.Prefixes(), cfg.BeadPrefixes...)
+			resolver.Prefixes = snap
+		}
+	}
+	re := beadPattern(prefixes)
 	if re == nil {
 		return nil
 	}
@@ -252,7 +270,7 @@ func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg Ref
 		}
 		out = append(out, ExtractedReference{
 			Kind: RefKindBead,
-			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: id, Resolver: cfg.Resolver},
+			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: id, Resolver: resolver},
 		})
 	}
 	return out

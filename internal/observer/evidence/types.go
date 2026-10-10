@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -856,24 +857,127 @@ func NewDeclaredWorkReference(c Common, in DeclaredWorkRefInput) (PendingObserva
 	return newWorkReference(c, ref)
 }
 
-// ProjectResolver supplies the only two sources a team_server_project_id may come from for
-// an EXTRACTED reference (spec "Reference extraction"): the daemon-stamped run context, or
-// a single configured default project. The stamped context wins when both are present.
+// ProjectResolver supplies the sources a team_server_project_id may come from for an EXTRACTED
+// reference (spec "Reference extraction"), in precedence order: the daemon-stamped run context,
+// the longest declared bead-prefix mapping that matches the captured bead id, or a single
+// configured default project. The stamped context always wins. The prefix map is declared
+// configuration (each project's sealed issue prefix), so the project is still never parsed out of
+// the identifier — the id only selects which declared mapping applies.
 type ProjectResolver struct {
 	// StampedProjectID is the project from the daemon-stamped run context ("" if none).
 	StampedProjectID string
+	// Prefixes is the declared multi-project bead-prefix map snapshot (nil if none).
+	Prefixes *BeadPrefixMap
 	// DefaultProjectID is the single configured default project ("" if none).
 	DefaultProjectID string
 }
 
-func (r ProjectResolver) resolve() (string, bool) {
+func (r ProjectResolver) resolve(beadID string) (string, bool) {
 	if r.StampedProjectID != "" {
 		return r.StampedProjectID, true
+	}
+	if projectID, ok := r.Prefixes.Lookup(beadID); ok {
+		return projectID, true
 	}
 	if r.DefaultProjectID != "" {
 		return r.DefaultProjectID, true
 	}
 	return "", false
+}
+
+// BeadPrefixMapping declares that bead ids beginning with Prefix belong to the team-server project
+// ProjectID. Prefix is a project's issue prefix INCLUDING its trailing dash (e.g. "acme-").
+type BeadPrefixMapping struct {
+	Prefix    string `json:"prefix"`
+	ProjectID string `json:"project_id"`
+}
+
+// MaxBeadPrefixMappings bounds a prefix map so a corrupt or hostile file cannot make every
+// bead-surface parse compile an unbounded pattern.
+const MaxBeadPrefixMappings = 4096
+
+// maxBeadPrefix bounds one declared prefix (a bead id is itself bounded by maxBeadID).
+const maxBeadPrefix = 64
+
+// beadPrefixPattern is the shape of a declared prefix: alphanumeric dash-joined segments ending in
+// the separator dash ("acme-", "gas-city-"). It keeps regex/shell metacharacters out of the
+// extraction pattern and guarantees a prefix can never match across a token boundary.
+var beadPrefixPattern = regexp.MustCompile(`^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-$`)
+
+// BeadPrefixMap is an immutable, validated multi-project bead-prefix map. Lookup is a
+// longest-prefix match, so nested prefixes ("gas-" and "gas-city-") resolve to the most specific
+// project. A nil *BeadPrefixMap is a valid empty map.
+type BeadPrefixMap struct {
+	// entries is sorted by descending prefix length (ties by prefix) for longest-match lookup.
+	entries []BeadPrefixMapping
+}
+
+// NewBeadPrefixMap validates and freezes a prefix map. It fails closed on a malformed prefix, an
+// empty or oversized project id, more than MaxBeadPrefixMappings entries, or a prefix declared
+// twice for different projects (an ambiguous map is never half-applied). An exact duplicate entry
+// is collapsed. An empty input yields a valid empty map.
+func NewBeadPrefixMap(mappings []BeadPrefixMapping) (*BeadPrefixMap, error) {
+	if len(mappings) > MaxBeadPrefixMappings {
+		return nil, fmt.Errorf("bead prefix map has %d entries, max %d", len(mappings), MaxBeadPrefixMappings)
+	}
+	seen := make(map[string]string, len(mappings))
+	entries := make([]BeadPrefixMapping, 0, len(mappings))
+	for i, m := range mappings {
+		if len(m.Prefix) > maxBeadPrefix || !beadPrefixPattern.MatchString(m.Prefix) {
+			return nil, fmt.Errorf("bead prefix map entry %d: prefix %q must be dash-joined alphanumerics ending in '-' (max %d bytes)", i, m.Prefix, maxBeadPrefix)
+		}
+		if err := boundedNonEmpty("bead_prefix_map.project_id", m.ProjectID, maxTeamServerProject); err != nil {
+			return nil, fmt.Errorf("bead prefix map entry %d (%s): %w", i, m.Prefix, err)
+		}
+		if prev, dup := seen[m.Prefix]; dup {
+			if prev != m.ProjectID {
+				return nil, fmt.Errorf("bead prefix map: prefix %q declared for two projects", m.Prefix)
+			}
+			continue
+		}
+		seen[m.Prefix] = m.ProjectID
+		entries = append(entries, m)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if len(entries[i].Prefix) != len(entries[j].Prefix) {
+			return len(entries[i].Prefix) > len(entries[j].Prefix)
+		}
+		return entries[i].Prefix < entries[j].Prefix
+	})
+	return &BeadPrefixMap{entries: entries}, nil
+}
+
+// Lookup returns the project of the longest declared prefix that beadID begins with.
+func (m *BeadPrefixMap) Lookup(beadID string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	for _, e := range m.entries {
+		if strings.HasPrefix(beadID, e.Prefix) {
+			return e.ProjectID, true
+		}
+	}
+	return "", false
+}
+
+// Prefixes returns the declared prefixes (longest first); the caller owns the returned slice.
+func (m *BeadPrefixMap) Prefixes() []string {
+	if m == nil {
+		return nil
+	}
+	out := make([]string, len(m.entries))
+	for i, e := range m.entries {
+		out[i] = e.Prefix
+	}
+	return out
+}
+
+// Len reports the number of distinct declared prefixes.
+func (m *BeadPrefixMap) Len() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.entries)
 }
 
 // RefDropReason is the typed reason an EXTRACTED reference was dropped.
@@ -898,7 +1002,8 @@ type ExtractedWorkRefResult struct {
 func (r ExtractedWorkRefResult) Dropped() bool { return r.Resolved == nil }
 
 // ExtractedWorkRefInput builds an EXTRACTED WORK_REFERENCE from a pattern-captured bead ID.
-// The team_server_project_id is never taken from the identifier; it is resolved separately.
+// The team_server_project_id is never parsed out of the identifier; it is resolved separately
+// (the identifier only selects which declared bead-prefix mapping, if any, applies).
 type ExtractedWorkRefInput struct {
 	BeadID string
 }
@@ -911,13 +1016,13 @@ func NewExtractedWorkReference(c Common, in ExtractedWorkRefInput, resolver Proj
 	if err := boundedNonEmpty("work_reference.bead_id", in.BeadID, maxBeadID); err != nil {
 		return ExtractedWorkRefResult{}, err
 	}
-	projectID, ok := resolver.resolve()
+	projectID, ok := resolver.resolve(in.BeadID)
 	if !ok {
 		diag, err := NewCaptureDiagnostic(c, CaptureDiagnosticInput{
 			Code:               wire.CaptureDiagnosticPayloadCodeCAPTURELOSS,
 			Severity:           wire.CaptureDiagnosticPayloadSeverityINFO,
 			CompletenessEffect: wire.CaptureDiagnosticPayloadCompletenessEffectNONE,
-			Context:            "extracted work reference dropped: no stamped or default team-server project",
+			Context:            "extracted work reference dropped: no stamped, prefix-mapped, or default team-server project",
 		})
 		if err != nil {
 			return ExtractedWorkRefResult{}, err
