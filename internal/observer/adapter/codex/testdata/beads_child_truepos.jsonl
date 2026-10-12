@@ -1,0 +1,4 @@
+{"type":"tool_call","tool":"bd","category":"SHELL","command":"bd show ga-xpw.13.3 ga-xpw","argument_bytes":26,"ts":"2026-10-12T10:00:00Z"}
+{"type":"tool_call","tool":"bd","category":"SHELL","command":"bd close ga-a1b2.1 --reason done.","argument_bytes":32,"ts":"2026-10-12T10:00:01Z"}
+{"type":"tool_call","tool":"bd","category":"SHELL","command":"bd update ga-5g3her.2.10 --status in_progress","argument_bytes":43,"ts":"2026-10-12T10:00:02Z"}
+{"type":"tool_result","tool":"bd","category":"SHELL","status":"OK","output":"closed ga-a1b2.1.\nga-pilot.git is a repo, not a bead\n","ts":"2026-10-12T10:00:03Z"}
