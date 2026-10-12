@@ -29,7 +29,8 @@ func TestExtractChildBeadsTruePositives(t *testing.T) {
 }
 
 // TestChildBeadPatternBoundaries pins the child-segment grammar: only numeric dot segments extend
-// an id, so path/extension tokens remain rejected (spec finding 4) and a trailing '.' is trimmed.
+// an id, and they must end the token, so path/extension tokens remain rejected (spec finding 4) —
+// including a child-shaped id followed by an extension or a slug — and a trailing '.' is trimmed.
 func TestChildBeadPatternBoundaries(t *testing.T) {
 	cases := []struct {
 		text string
@@ -39,8 +40,11 @@ func TestChildBeadPatternBoundaries(t *testing.T) {
 		{"bd close ga-a1b2.1.", []string{"ga-a1b2.1"}},
 		{"bd update (ga-a1b2.1)", []string{"ga-a1b2.1"}},
 		{"bd show ga-x-repair.4", []string{"ga-x-repair.4"}},
+		{"closed (ga-xpw.13.3.3).", []string{"ga-xpw.13.3.3"}},
 		{"bd export --out ga-pilot.git", nil},
 		{"bd export --out ga-1.json", nil},
+		{"bd export --out ga-xpw.13.3.md", nil},
+		{"bd show ga-xpw.13.3-fix", nil},
 		{"bd show ga-1.2a", nil},
 		{"bd show ga-1..2", nil},
 		{"bd show ga-.1", nil},
