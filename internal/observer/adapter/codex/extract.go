@@ -13,7 +13,7 @@ import (
 // ExtractorVersion is the versioned identity of the deterministic reference extractors. Each
 // captured reference records this alongside the fixture-proven pattern_id that matched, so a
 // later extractor revision is distinguishable on the wire. Bump it whenever a pattern changes.
-const ExtractorVersion = "codex-refextract-v1"
+const ExtractorVersion = "codex-refextract-v2"
 
 // RefKind is the closed set of reference kinds this extractor can capture. COMMIT and
 // PULL_REQUEST are VCS references; BEAD is an extracted work reference. BRANCH is deliberately
@@ -345,9 +345,11 @@ func snapshotBeadPattern(snap *evidence.BeadPrefixMap) *regexp.Regexp {
 }
 
 // beadPattern compiles the declared prefix set into a whole-token bead-ID matcher, or nil when no
-// prefixes are declared. A bead ID is a declared prefix followed by one or more alphanumerics and
-// any number of dash-joined alphanumeric segments (e.g. ga-1tzraj, ga-1tzraj-repair-merge). It is
-// anchored ^…$ because the caller matches it against a single already-tokenized field.
+// prefixes are declared. A bead ID is a declared prefix followed by one or more alphanumerics, any
+// number of dash-joined alphanumeric segments (e.g. ga-1tzraj, ga-1tzraj-repair-merge), and any
+// number of dot-joined NUMERIC child segments (hierarchical child beads: bts-xpw.13.3, ga-a1b2.1).
+// Child segments are numeric-only so a path/extension token (ga-pilot.git) still fails the match.
+// It is anchored ^…$ because the caller matches it against a single already-tokenized field.
 func beadPattern(prefixes []string) *regexp.Regexp {
 	if len(prefixes) == 0 {
 		return nil
@@ -362,7 +364,7 @@ func beadPattern(prefixes []string) *regexp.Regexp {
 	if len(quoted) == 0 {
 		return nil
 	}
-	return regexp.MustCompile(`^(?:` + strings.Join(quoted, "|") + `)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$`)
+	return regexp.MustCompile(`^(?:` + strings.Join(quoted, "|") + `)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:\.[0-9]+)*$`)
 }
 
 // isGitGhSurface reports whether a tool surface is a recognized git/gh surface, gating COMMIT
