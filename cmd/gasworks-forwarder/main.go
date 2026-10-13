@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -53,6 +54,8 @@ func run(argv []string) int {
 		return runRecall(ctx, rest)
 	case "events":
 		return runEvents(ctx, rest)
+	case "events-backfill":
+		return runEventsBackfill(ctx, rest)
 	case "usage":
 		return runUsage(ctx, rest)
 	case "all":
@@ -170,6 +173,54 @@ func runEvents(ctx context.Context, args []string) int {
 	runner := eventsaxis.NewRunner(cfg, logf)
 	if err := runner.Run(ctx); err != nil {
 		eprintf("gasworks-forwarder events: %v", err)
+		return 1
+	}
+	return 0
+}
+
+// runEventsBackfill replays a city's recorded event history (rotated archives +
+// the live events.jsonl) through the SAME projection and credential as the events
+// axis, POSTing envelopes in bounded chunks. Use it to fill an ingest gap after an
+// export stall: the live SSE resume path serves only the active events.jsonl, so
+// events that rotated into archives during a stall are unreachable to the daemon
+// and must be replayed from disk. One-shot: it exits when the window is drained.
+func runEventsBackfill(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("events-backfill", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	city := fs.String("city", "", "city name to backfill (required)")
+	cityDir := fs.String("city-dir", "", "city directory holding .gc/ (required)")
+	fromSeq := fs.Uint64("from-seq", 0, "replay events with seq strictly greater than this")
+	toSeq := fs.Uint64("to-seq", 0, "replay events with seq up to and including this (0 = unbounded)")
+	dryRun := fs.Bool("dry-run", false, "project and count without dialing the ingest")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *city == "" || *cityDir == "" {
+		eprintln("usage: gasworks-forwarder events-backfill --city <name> --city-dir <dir> --from-seq <n> [--to-seq <n>] [--dry-run]")
+		return 2
+	}
+
+	cfg, warn := eventsaxis.ConfigFromEnv()
+	if warn != "" {
+		eprintf("gasworks-forwarder: warning: %s", warn)
+	}
+
+	files, err := eventsaxis.DiscoverEventFiles(*cityDir, *fromSeq, *toSeq)
+	if err != nil {
+		eprintf("gasworks-forwarder events-backfill: %v", err)
+		return 1
+	}
+	if len(files) == 0 {
+		eprintln("gasworks-forwarder events-backfill: no event files found for the window")
+		return 1
+	}
+	logf("events-backfill: %s window (%d, %d] across %d files", *city, *fromSeq, *toSeq, len(files))
+
+	res, err := eventsaxis.Backfill(ctx, cfg, *city, files, *fromSeq, *toSeq, *dryRun, logf)
+	logf("events-backfill: read=%d projected=%d posted=%d dupes=%d rejected=%d last_seq=%d dry_run=%v",
+		res.Read, res.Projected, res.Posted, res.Dupes, res.Rejected, res.LastSeq, *dryRun)
+	if err != nil {
+		eprintf("gasworks-forwarder events-backfill: %v", err)
 		return 1
 	}
 	return 0
@@ -345,6 +396,7 @@ func usage() {
 Usage:
   gasworks-forwarder recall [--once]   run the recall transcript forwarder
   gasworks-forwarder events            run the events forwarder (tails the supervisor SSE)
+  gasworks-forwarder events-backfill   replay recorded event history into the events ingest
   gasworks-forwarder usage  [--once]   run the usage forwarder (tails .gc/usage.jsonl)
   gasworks-forwarder all               run every axis (own goroutine + recover + backoff)
 
