@@ -113,13 +113,15 @@ type CandidateSink interface {
 // ordered and stop-on-first-failure; a sink that does not implement this keeps the all-or-nothing
 // behavior, so existing sinks are unaffected.
 //
-// SCOPE — the double-append is eliminated across LINE boundaries only. The cursor advances a whole
+// SCOPE — the cursor eliminates the double-append across LINE boundaries only. It advances a whole
 // transcript line at a time, so when a single line emits MULTIPLE candidates (a tool_call plus its
-// extracted git/gh reference candidates) and delivery fails PART-WAY through that one line, the
-// line is not committed and the retry re-appends the line's already-durable leading candidates.
-// That residual is a bounded at-least-once duplicate the platform's observation-id dedup tolerates
-// — never a loss and never a cross-line duplicate; the common one-candidate-per-line case (message,
-// usage, session records) is exact.
+// extracted git/gh reference candidates; or two Claude responses' usage, when a new response
+// closes the previous one and finishes itself) and delivery fails PART-WAY through that one line,
+// the line is not committed and the retry re-delivers the line's already-durable leading
+// candidates. The daemon's sink recognizes a re-delivered session start or usage (by session id and
+// message id) and does not append it twice; for other candidates (references, diagnostics) the
+// residual is a bounded at-least-once duplicate the platform's observation-id dedup tolerates —
+// never a loss and never a cross-line duplicate.
 type PartialCandidateSink interface {
 	CandidateSink
 	// DeliverCandidatesPartial delivers cands in transcript order, stopping at the first failure,
@@ -937,7 +939,7 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 // The floor removal is only marked dirty here; flushPolicyControls persists it once per root per
 // poll instead of once per identity.
 func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
-	_ = os.Remove(tf.cursor.StatePath())
+	removeCursorState(tf.cursor.StatePath())
 	if tf.policy != nil && tf.forwardBaseline {
 		// Orphan any live fence still NAMING this identity before its floor is dropped. Releasing the
 		// identity frees its inode number, and a fence that kept naming that number would grant a later,
@@ -986,7 +988,7 @@ func (w *Watcher) sweepActivationBaselines(policy *rootPolicyState, scan *rootSc
 		// The evicted identity is corroborated gone, so nothing live loses a cursor here; dropping it on
 		// the same evidence as the floor keeps a reused inode number from resuming a stranger's sealed
 		// position instead of being captured from its own byte zero.
-		_ = os.Remove(cursorStatePath(scopedDir, id.dev, id.ino))
+		removeCursorState(cursorStatePath(scopedDir, id.dev, id.ino))
 	}
 }
 
@@ -1347,10 +1349,15 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 
-	// A cursor resumed from a pre-#91 state has an offset but no usage carry: derive it from the
-	// consented bytes it already consumed before parsing past them.
+	// A cursor resumed from an older release's state lacks part of its carry: derive it from the
+	// consented bytes it already consumed before parsing past them, and persist it at once. A
+	// transcript that is never written again commits nothing else, and without this save every
+	// later daemon start would derive it again.
 	if tf.cursor.NeedsCarryDerivation() {
 		if err := w.deriveUpgradeCarry(f, tf); err != nil {
+			return err
+		}
+		if err := tf.cursor.Save(); err != nil {
 			return err
 		}
 	}
@@ -1363,7 +1370,7 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 	readOff := tf.cursor.ReadOffset()
 	if size <= readOff {
 		tf.cursor.observe(size, mod)
-		return nil
+		return w.settleOpenUsage(ctx, tf, mod)
 	}
 	length := size - readOff
 	if length > w.maxReadChunk {
@@ -1410,11 +1417,36 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 	return derr
 }
 
-// deriveUpgradeCarry reads the bytes a pre-#91 cursor already consumed and derives its rollout
-// usage carry (Cursor.DeriveCarry). It runs once per such file, on the first drain after the
-// upgrade, after the offset is corroborated. A forward-only cursor is folded from its committed
-// floor only, so no pre-consent byte is ever read; without a committed floor it keeps the zero
-// carry, exactly what a #91+ daemon sealing that file would have started from.
+// openUsageSettle is how long a transcript must stay unwritten before the Claude responses still
+// waiting for their final record are counted with the usage they have. Claude Code writes the
+// records of one response minutes apart at most (the longest gap in a sample of 230k was about
+// eight minutes), so after a quiet hour no record of an open response can still arrive: the
+// session ended mid-response. A response that is merely waiting on a long tool run is already
+// final, so counting it then is right as well.
+const openUsageSettle = time.Hour
+
+// settleOpenUsage counts the Claude responses of a transcript that is no longer being written
+// (see openUsageSettle), delivering them like a parsed batch: what was durably delivered is
+// committed, and a delivery failure leaves the rest for the next poll.
+func (w *Watcher) settleOpenUsage(ctx context.Context, tf *trackedFile, modNanos int64) error {
+	if !tf.cursor.HasOpenUsage() || w.cfg.Now().Sub(time.Unix(0, modNanos)) < openUsageSettle {
+		return nil
+	}
+	cands, commit := tf.cursor.FlushOpenUsage()
+	delivered, derr := deliverCandidates(ctx, w.cfg.Sink, tf.ref(), cands)
+	commit(delivered)
+	if err := tf.cursor.Save(); err != nil {
+		return err
+	}
+	return derr
+}
+
+// deriveUpgradeCarry reads the bytes an older release's cursor already consumed and derives what
+// its state lacks (Cursor.DeriveCarry): the rollout usage carry of a pre-#91 cursor, the session of
+// any cursor written before sessions were carried. It runs once per such file, on the first drain
+// after the upgrade, after the offset is corroborated. A forward-only cursor is folded from its
+// committed floor only, so no pre-consent byte is ever read; without a committed floor it keeps the
+// zero carry, exactly what a current daemon sealing that file would have started from.
 func (w *Watcher) deriveUpgradeCarry(f *os.File, tf *trackedFile) error {
 	start := int64(0)
 	if tf.forwardBaseline {

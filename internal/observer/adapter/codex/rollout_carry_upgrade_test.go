@@ -205,7 +205,7 @@ func TestCursorPre91PendingSurvivesRestart(t *testing.T) {
 	cands, commit = c.Ingest([]byte(tail), defaultRefConfig())
 	commit()
 	assertRolloutUsages(t, rolloutUsages(cands), []rolloutUsageWant{
-		{"resp_pending", 400, 100, 40},
+		{"resp_pending", 300, 100, 40},
 		{"resp_next", 500, 0, 50},
 	})
 	if err := c.Save(); err != nil {
@@ -220,7 +220,7 @@ func TestCursorPre91PendingSurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestCursorFreshAndPost91StatesSkipDerivation: only a pre-#91 state re-derives.
+// TestCursorFreshAndPost91StatesSkipDerivation: only a state written by an older release re-derives.
 func TestCursorFreshAndPost91StatesSkipDerivation(t *testing.T) {
 	dir := t.TempDir()
 	c, err := LoadCursor(dir, 4, 4, testBigSize, testBigMtime, 0)

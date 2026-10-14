@@ -12,14 +12,22 @@ import (
 )
 
 // ParserVersion is the versioned transcript-parser identity, stamped into provenance as the
-// parser_version. Codex warns that its transcript format is not a stable hook interface, so
-// parsing is adapter-versioned and fixture-pinned: a record shape this version does not
-// recognize degrades to an UNSUPPORTED_FORMAT diagnostic rather than being coerced into a known
-// kind. It is distinct from the adapter contract version (AdapterVersion) and the reference
-// extractor version (ExtractorVersion); bump it whenever the recognized record grammar changes.
-const ParserVersion = "codex-transcript-v1"
+// parser_version of every observation parsed out of a transcript (and never onto the Codex
+// SessionStart hook's start, which reads no transcript). Codex warns that its transcript format is
+// not a stable hook interface, so parsing is adapter-versioned and fixture-pinned: a record shape
+// this version does not recognize degrades to an UNSUPPORTED_FORMAT diagnostic rather than being
+// coerced into a known kind. It is distinct from the adapter contract version (AdapterVersion) and
+// the reference extractor version (ExtractorVersion); bump it whenever the recognized record
+// grammar, or the meaning of what the parser projects from it, changes.
+//
+// v2 changed the meaning of native usage, so a reader can tell its observations from v1's:
+//   - a Codex USAGE's input_tokens is fresh input (v1: cached input included);
+//   - a Claude response is one USAGE, from its last record (v1: one per content-block record);
+//   - a transcript's start carries the model, emitted once a record names it (v1: from the first
+//     buffer that named the session, with a model only if that buffer already held one).
+const ParserVersion = "codex-transcript-v2"
 
-// The recognized transcript record grammar (adapter version codex-transcript-v1). Each JSONL
+// The recognized normalized transcript record grammar (the codex-transcript-v1 schema). Each JSONL
 // line is one record object discriminated by "type". Fields not listed are ignored (the format
 // is allowed to grow additively without forcing an UNSUPPORTED_FORMAT), but an unknown "type",
 // an empty "type", or a line that is not valid JSON is an unrecognized record.
@@ -79,6 +87,13 @@ type Candidate struct {
 	PullRequest      *evidence.PullRequestReferenceCandidate
 	Work             *evidence.ExtractedWorkReferenceCandidate
 	Diagnostic       *evidence.DiagnosticCandidate
+
+	// Session is the native session the transcript was in when the candidate was parsed, from the
+	// transcript's durable parse state, set once that session's start was emitted. The sink stamps
+	// it as provenance directly, so attribution survives a daemon restart: the sink's in-memory
+	// threading starts empty while the cursor resumes the transcript past its start. Nil leaves the
+	// candidate to that threading (the normalized dialect, or a record parsed before any start).
+	Session *SessionRef
 }
 
 // Transform routes the candidate through the matching committed Policy transform, returning the
@@ -131,10 +146,11 @@ type ParseResult struct {
 	// (E1.8b) advances by exactly this many bytes and re-presents the unconsumed remainder
 	// prepended to the next read, so a record split across two reads is parsed exactly once.
 	Consumed int
-	// carry is the Codex rollout usage state at the end of the consumed bytes. The durable cursor
+	// carry is the transcript's parse state at the end of the consumed bytes. The durable cursor
 	// commits it alongside Consumed and hands it to the next buffer's parse, so the usage source
-	// (token_usage_record vs legacy token_count) and the legacy repeat de-dup survive a poll split.
-	carry rolloutCarry
+	// (token_usage_record vs legacy token_count), the legacy repeat de-dup, the session and its
+	// start, and the Claude responses still awaiting their final record all survive a poll split.
+	carry transcriptCarry
 }
 
 // Diagnostics returns just the diagnostic candidates, in order — a convenience for callers that
@@ -149,20 +165,27 @@ func (r ParseResult) Diagnostics() []*Candidate {
 	return out
 }
 
-// Parse consumes a transcript byte slice and emits the ordered candidates plus the consumed
-// byte offset. It parses complete newline-terminated lines only; the final line is parsed only
-// if it ends in a newline. The scan is single-pass and O(len(data)), so a caller that feeds
-// only the bytes appended since the last cursor does O(new bytes) of work. Blank lines are
-// consumed but produce no candidate; every non-blank complete line produces at least one
-// candidate (a real record, or a diagnostic when the record is unrecognized).
+// Parse consumes a whole transcript and emits the ordered candidates plus the consumed byte
+// offset. It parses complete newline-terminated lines only; the final line is parsed only if it
+// ends in a newline. The scan is single-pass and O(len(data)). Blank lines are consumed but produce
+// no candidate, and an unrecognized record yields a diagnostic. Because data is the whole
+// transcript, a Claude response still waiting for its final record at the end is counted there,
+// with the usage it has; a tailing caller parses with parseWithCarry instead, where the end of the
+// bytes read so far is not the end of the transcript.
 func Parse(data []byte, cfg ReferenceConfig) ParseResult {
-	return parseWithCarry(data, cfg, rolloutCarry{})
+	return parse(data, cfg, transcriptCarry{}, true)
 }
 
-// parseWithCarry is Parse resuming from the rollout usage state a previous buffer of the same file
-// ended in (see rolloutCarry). Parse is the fresh-file (start-of-stream) case.
-func parseWithCarry(data []byte, cfg ReferenceConfig, carry rolloutCarry) ParseResult {
-	st := newParseState(data, carry)
+// parseWithCarry parses the next buffer of a transcript whose previous buffers left carry (see
+// transcriptCarry), for the durable cursor: responses still open at the end of the buffer stay
+// open in the returned carry.
+func parseWithCarry(data []byte, cfg ReferenceConfig, carry transcriptCarry) ParseResult {
+	return parse(data, cfg, carry, false)
+}
+
+// parse is Parse and parseWithCarry; complete reports that data runs to the end of the transcript.
+func parse(data []byte, cfg ReferenceConfig, carry transcriptCarry, complete bool) ParseResult {
+	st := newParseState(carry)
 	var cands []*Candidate
 	consumed := 0
 	lineNo := 0
@@ -180,15 +203,18 @@ func parseWithCarry(data []byte, cfg ReferenceConfig, carry rolloutCarry) ParseR
 		if len(trimmed) == 0 {
 			continue
 		}
-		if pending := st.rolloutCarry.Pending; pending != nil {
-			// The pre-#91 cursor upgrade's uncounted response (see foldRolloutCarry), emitted
+		if pending := st.carry.rollout.Pending; pending != nil {
+			// The pre-#91 cursor upgrade's uncounted response (see foldUpgradeCarry), emitted
 			// exactly once on the first line after the resumed offset and committed with it.
-			st.rolloutCarry.Pending = nil
-			cands = append(cands, pending.candidates(lineNo)...)
+			st.carry.rollout.Pending = nil
+			cands = append(cands, st.attribute(pending.candidates(lineNo))...)
 		}
-		cands = append(cands, st.parseLine(trimmed, lineNo, cfg)...)
+		cands = append(cands, st.stamp(st.parseLine(trimmed, lineNo, cfg))...)
 	}
-	return ParseResult{Candidates: cands, Consumed: consumed, carry: st.rolloutCarry}
+	if complete {
+		cands = append(cands, st.closeClaudeMessages(lineNo)...)
+	}
+	return ParseResult{Candidates: cands, Consumed: consumed, carry: st.carry}
 }
 
 // ParseReader is the io.Reader convenience wrapper over Parse. It reads the reader to EOF and
@@ -256,11 +282,16 @@ type rawRecord struct {
 // route is unambiguous and a line that matches none degrades to an UNSUPPORTED_FORMAT diagnostic.
 type formatProbe struct {
 	Type           string          `json:"type"`
-	Payload        json.RawMessage `json:"payload"`   // rollout
-	SessionIDCamel string          `json:"sessionId"` // Claude envelope
-	Message        json.RawMessage `json:"message"`   // Claude message block
-	TS             *time.Time      `json:"ts"`        // normalized / Claude-absent
-	Timestamp      *time.Time      `json:"timestamp"` // rollout / Claude
+	Payload        json.RawMessage `json:"payload"`    // rollout
+	SessionIDCamel string          `json:"sessionId"`  // Claude envelope
+	Message        json.RawMessage `json:"message"`    // Claude message block
+	IsMeta         bool            `json:"isMeta"`     // Claude record injected by Claude Code, not a user turn
+	UUID           string          `json:"uuid"`       // Claude record id
+	ParentUUID     string          `json:"parentUuid"` // Claude record this one follows
+	// LogicalParentUUID is the record a Claude compaction boundary continues; its parentUuid is null.
+	LogicalParentUUID string     `json:"logicalParentUuid"`
+	TS                *time.Time `json:"ts"`        // normalized / Claude-absent
+	Timestamp         *time.Time `json:"timestamp"` // rollout / Claude
 }
 
 // probeTime resolves the record's provider event time from whichever timestamp key the dialect
@@ -286,8 +317,8 @@ func isNormalizedType(t string) bool {
 }
 
 // parseLine routes one transcript line to the dialect-specific parser. It is a method on
-// parseState because the rollout and Claude dialects thread a one-per-buffer SESSION_LIFECYCLE
-// (the session id and model live on different records than the usage that must inherit them).
+// parseState because the rollout and Claude dialects carry per-file state across records: the
+// session, its start, and (for Claude) the responses awaiting their final record.
 func (st *parseState) parseLine(line []byte, lineNo int, cfg ReferenceConfig) []*Candidate {
 	var probe formatProbe
 	if err := json.Unmarshal(line, &probe); err != nil {

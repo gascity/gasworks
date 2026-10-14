@@ -3,6 +3,7 @@
 package codex
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
@@ -87,20 +88,30 @@ func TestCursorLegacyRepeatDedupAcrossPollSplit(t *testing.T) {
 }
 
 // TestCursorResetAndSealClearRolloutCarry pins that a rewrite (Reset) or a forward-only baseline
-// (SealAt) forgets the usage source: the bytes it was derived from are no longer the stream.
+// (SealAt) forgets everything parsed from the old bytes — the usage source, the session and the
+// Claude message state: the bytes they were derived from are no longer the stream.
 func TestCursorResetAndSealClearRolloutCarry(t *testing.T) {
 	c, err := LoadCursor(t.TempDir(), 8, 8, testBigSize, testBigMtime, 0)
 	if err != nil {
 		t.Fatalf("LoadCursor: %v", err)
 	}
-	c.carry = rolloutCarry{RecordMode: true, LegacyTotal: "1/2/3/4/5"}
+	parsed := func() transcriptCarry {
+		carry := transcriptCarry{
+			rollout: rolloutCarry{RecordMode: true, LegacyTotal: "1/2/3/4/5"},
+			session: sessionCarry{NativeID: "s-1", Provider: claudeProvider, Started: true},
+			claude:  claudeCarry{Open: []claudeMessage{{ID: "msg_open"}}},
+		}
+		carry.claude.Counted.add(idHash("msg_counted"))
+		return carry
+	}
+	c.carry = parsed()
 	c.Reset()
-	if c.carry != (rolloutCarry{}) {
+	if !reflect.DeepEqual(c.carry, transcriptCarry{}) {
 		t.Fatalf("Reset kept carry %+v", c.carry)
 	}
-	c.carry = rolloutCarry{RecordMode: true}
+	c.carry = parsed()
 	c.SealAt(100)
-	if c.carry != (rolloutCarry{}) {
+	if !reflect.DeepEqual(c.carry, transcriptCarry{}) {
 		t.Fatalf("SealAt kept carry %+v", c.carry)
 	}
 }

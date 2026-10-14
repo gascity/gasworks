@@ -311,6 +311,38 @@ always-on content guard (secret-filename denylist, per-provider transcript-shape
 PEM/PKCS key sniff) working as designed, but it can refuse a file that previously uploaded.
 Read the refusals on day one.
 
+New with `parser_version` `codex-transcript-v2`:
+
+- USAGE atoms are one per Claude response, not one per transcript record.
+- Codex `input_tokens` excludes cached input.
+- A transcript's start carries its model.
+
+A Claude response's usage is emitted when the response finishes, so a session shows its latest
+response's usage a little later than before. A session that stopped mid-response shows it once
+its transcript has been quiet for an hour.
+
+On the first drain after rolling forward, the daemon reads the bytes each tracked transcript
+already consumed, once, and saves what it derived. For Codex it reads only up to the first
+`session_meta`. Expect a burst on the first start:
+
+- read I/O proportional to the tracked Claude transcripts;
+- a cursor and a counted-id file written for every tracked transcript, a few fsyncs each.
+
+With many transcripts this can take minutes on macOS, where fsync is slow. Later starts do not
+repeat it.
+
+The cursor directory gains a `codex-cursor-<dev>-<ino>.counted` file next to each Claude
+transcript's cursor. It holds the counted response ids: 8 bytes per response, appended as
+responses are counted. Keep it with its cursor. Deleting both restarts that transcript from byte
+zero, as deleting a cursor always did.
+
+A transcript that never names a model and never reports usage is no longer content-uploaded. Its
+observations name no session to key the snapshot by. A new transcript is uploaded after its first
+model record, a few seconds later than before.
+
+See [observer-usage-message-id.md](./observer-usage-message-id.md) for the exact rules and the
+one-time effects on transcripts captured before the roll.
+
 **The spool is advancing.** `acknowledged_through` should climb:
 
 ```sh

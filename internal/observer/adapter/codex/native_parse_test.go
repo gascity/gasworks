@@ -47,8 +47,8 @@ func assertToken(t *testing.T, field string, got *int64, want int64) {
 // and every token_count delta verbatim; only the system-prompt blobs the parser ignores are
 // trimmed). It must yield one STARTED SESSION_LIFECYCLE carrying the native session id and the
 // model (which lives on a separate turn_context record) plus one PROVIDER_REPORTED USAGE per
-// token_count turn with the real token deltas — the shape that regressed to a lone
-// CAPTURE_DIAGNOSTIC before native rollout support.
+// token_count turn with the real token deltas, input made fresh — the shape that regressed to a
+// lone CAPTURE_DIAGNOSTIC before native rollout support.
 func TestParseRealCodexRollout(t *testing.T) {
 	res := Parse(readFixture(t, "rollout_real.jsonl"), defaultRefConfig())
 
@@ -77,20 +77,21 @@ func TestParseRealCodexRollout(t *testing.T) {
 		t.Fatalf("transition = %q, want STARTED", sess.Transition)
 	}
 
-	// The first token_count turn's real per-turn delta.
+	// The first token_count turn's real per-turn delta: 14003 input of which 5504 cached.
 	u := firstUsage(t, res.Candidates)
 	if u.Quality != wire.UsagePayloadQualityPROVIDERREPORTED {
 		t.Fatalf("usage quality = %q, want PROVIDER_REPORTED", u.Quality)
 	}
-	assertToken(t, "input_tokens", u.InputTokens, 14003)
+	assertToken(t, "input_tokens", u.InputTokens, 14003-5504)
 	assertToken(t, "output_tokens", u.OutputTokens, 451)
 	assertToken(t, "cache_read_tokens", u.CacheReadTokens, 5504)
 }
 
 // TestParseRealClaudeTranscript proves the daemon captures a REAL Claude Code transcript natively:
-// each assistant envelope's message.usage becomes a USAGE, and the parser synthesizes one
+// each assistant message's usage becomes one USAGE — the fixture's response is written as two
+// records sharing one message.id and one usage, which count once — and the parser synthesizes one
 // SESSION_LIFECYCLE (Claude writes no dedicated session record) from the camelCase sessionId with
-// the model peeked off the first assistant record. This is the primary interactive-session lane.
+// the model of the first assistant record. This is the primary interactive-session lane.
 func TestParseRealClaudeTranscript(t *testing.T) {
 	res := Parse(readFixture(t, "claude_real.jsonl"), defaultRefConfig())
 
@@ -101,8 +102,8 @@ func TestParseRealClaudeTranscript(t *testing.T) {
 	if counts[KindSessionLifecycle] != 1 {
 		t.Fatalf("SESSION_LIFECYCLE count = %d, want 1 (synthesized once)", counts[KindSessionLifecycle])
 	}
-	if counts[KindUsage] != 2 {
-		t.Fatalf("USAGE count = %d, want 2 (one per assistant message)", counts[KindUsage])
+	if counts[KindUsage] != 1 {
+		t.Fatalf("USAGE count = %d, want 1 (one per message id, not per record)", counts[KindUsage])
 	}
 
 	sess := firstSession(t, res.Candidates)
@@ -157,7 +158,8 @@ func rolloutUsages(cands []*Candidate) []*evidence.UsageCandidate {
 	return usages
 }
 
-// rolloutUsageWant is the expected projection of one Codex USAGE atom.
+// rolloutUsageWant is the expected projection of one Codex USAGE atom. input is fresh input: the
+// usage's input_tokens less its cached_input_tokens, which travel as cache_read_tokens.
 type rolloutUsageWant struct {
 	messageID             string
 	input, cached, output int64
@@ -202,12 +204,13 @@ func usageSum(usages []*evidence.UsageCandidate) (in, cached, out int64) {
 }
 
 // fixtureRolloutWant is rollout_usage_record.jsonl's per-response usage: one atom per
-// token_usage_record, keyed on its resp_… id, with cached input mapped to cache_read and
-// reasoning (already inside output_tokens) not added again.
+// token_usage_record, keyed on its resp_… id, with cached input mapped to cache_read and taken out
+// of input (input_tokens 1000/1300/1400 include it), and reasoning (already inside output_tokens)
+// not added again.
 var fixtureRolloutWant = []rolloutUsageWant{
-	{"resp_fixture1", 1000, 200, 50},
-	{"resp_fixture2", 1300, 1000, 20},
-	{"resp_fixture3", 1400, 1300, 10},
+	{"resp_fixture1", 800, 200, 50},
+	{"resp_fixture2", 300, 1000, 20},
+	{"resp_fixture3", 100, 1300, 10},
 }
 
 // TestParseRolloutUsageFromUsageRecords proves the Codex >= 0.153 contract: usage atoms come from
@@ -227,7 +230,7 @@ func TestParseRolloutUsageFromUsageRecords(t *testing.T) {
 			t.Errorf("usage[%d] quality/provider = %q/%q, want PROVIDER_REPORTED/codex", i, u.Quality, u.ProviderSource)
 		}
 	}
-	if !res.carry.RecordMode {
+	if !res.carry.rollout.RecordMode {
 		t.Fatal("carry.RecordMode = false after a record-bearing buffer")
 	}
 }
@@ -266,8 +269,8 @@ func TestParseRolloutZeroUsageTokenCountAfterReset(t *testing.T) {
 		synthTokenCount(5000, 100, 0, 0, 12345) // rate-limit refresh repeating it
 	usages := rolloutUsages(Parse([]byte(buf), defaultRefConfig()).Candidates)
 	assertRolloutUsages(t, usages, []rolloutUsageWant{
-		{"resp_turn", 5000, 4000, 100},
-		{"resp_compact", 90000, 80000, 2500},
+		{"resp_turn", 1000, 4000, 100},
+		{"resp_compact", 10000, 80000, 2500},
 	})
 }
 
@@ -331,8 +334,8 @@ func TestParseRolloutResumedLegacyThenRecords(t *testing.T) {
 	if len(usages) != 2 || usages[0].MessageID != "" || usages[1].MessageID != "resp_new" {
 		t.Fatalf("usages = %d (%v), want legacy atom then resp_new", len(usages), usages)
 	}
-	if in, _, out := usageSum(usages); in != 400 || out != 40 {
-		t.Fatalf("totals = %d / %d, want 400 / 40", in, out)
+	if in, _, out := usageSum(usages); in != 300 || out != 40 {
+		t.Fatalf("totals = %d / %d, want 300 / 40 (the record's 300 input holds 100 cached)", in, out)
 	}
 }
 
@@ -376,7 +379,7 @@ func TestParseRolloutUsageRecordDegradesGracefully(t *testing.T) {
 			if n := len(res.Diagnostics()); n != 0 {
 				t.Fatalf("%d diagnostics, want 0", n)
 			}
-			assertRolloutUsages(t, rolloutUsages(res.Candidates), []rolloutUsageWant{{"", 10, 4, 2}})
+			assertRolloutUsages(t, rolloutUsages(res.Candidates), []rolloutUsageWant{{"", 6, 4, 2}})
 		})
 	}
 }

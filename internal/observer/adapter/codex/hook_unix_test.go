@@ -100,6 +100,24 @@ func TestHookSupportedFixturesAttachCorrectly(t *testing.T) {
 	}
 }
 
+// TestHookStartCarriesNoParserVersion pins the provenance split the platform relies on to tell a
+// transcript's start from the SessionStart hook's: the hook reads no transcript, so it never stamps
+// a parser_version (and never a model), while every observation parsed out of a transcript does.
+func TestHookStartCarriesNoParserVersion(t *testing.T) {
+	seam := newFakeSeam()
+	cfg := HookConfig{SourceID: "src_1", HookPID: os.Getpid()}
+	if _, err := runHook(t, seam, cfg, hookJSON(t, "sess-pv", nil, "/work/dir", "startup")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	sl := lastSessionLifecycle(t, seam)
+	if sl.Provenance.ParserVersion != nil {
+		t.Fatalf("hook start carries parser_version %q; only transcript observations may", *sl.Provenance.ParserVersion)
+	}
+	if sl.SessionLifecycle.Model != nil {
+		t.Fatalf("hook start carries model %q; the hook cannot know it", *sl.SessionLifecycle.Model)
+	}
+}
+
 // TestHookWrappedSessionAttachesHigh proves a session whose inherited GASWORKS_RUN_ID resolves
 // to an OPEN same-source boundary attaches HIGH and stamps the INHERITED_RUN_ID run context.
 func TestHookWrappedSessionAttachesHigh(t *testing.T) {

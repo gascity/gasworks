@@ -4,12 +4,15 @@ package codex
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 
 	"github.com/gascity/gasworks/internal/observer/evidence"
@@ -78,14 +81,23 @@ type Cursor struct {
 	anchorSize int    // length of the anchor window the hash covers (<= anchorLen)
 	sealed     bool   // forward-only baseline; never corroborate pre-consent bytes
 
-	// carry is the Codex rollout usage state (record mode, legacy repeat signature) at consumed.
-	// It is committed with the offset and persisted, so a token_count whose token_usage_record was
-	// parsed in an earlier poll (or before a restart) is still recognized as already counted.
-	carry rolloutCarry
+	// carry is the transcript's parse state at consumed: the Codex usage source, the session and
+	// its start, and the Claude responses awaiting their final record. It is committed with the
+	// offset and persisted, so a token_count whose token_usage_record was parsed in an earlier poll
+	// (or before a restart) is still recognized as already counted, a session is started once and
+	// keeps its usage after a restart, and a response split across polls is counted once.
+	carry transcriptCarry
 	// carryKnown is false only for a cursor resumed from a pre-#91 state file, which persisted an
 	// offset but no rollout usage state. The watcher then derives the carry from the consumed bytes
 	// (DeriveCarry) before the first parse, so the upgrade neither re-counts nor drops a response.
 	carryKnown bool
+	// sessionKnown is false only for a cursor resumed from a state file written before sessions
+	// were carried, whose daemon kept the transcript's session in memory. DeriveCarry recovers it
+	// from the head of the consumed bytes, so the rest of the transcript stays attributed to it.
+	sessionKnown bool
+	// countedSaved is how many of the hashes at the head of the counted-id sidecar the saved state
+	// claims (see Save).
+	countedSaved int
 
 	maxPartialLine int
 }
@@ -110,11 +122,21 @@ type persistedCursor struct {
 	// consumed offset. All are counts-only (plus a provider response id and time), never transcript
 	// content. RolloutCarry marks that the state carries them at all: every save since the upgrade
 	// fix sets it. A state without it (and without either value) was written before #91, and its
-	// carry is re-derived from the consumed bytes on the first drain (see foldRolloutCarry).
+	// carry is re-derived from the consumed bytes on the first drain (see foldUpgradeCarry).
 	RolloutRecordMode  bool            `json:"rollout_record_mode,omitempty"`
 	RolloutLegacyTotal string          `json:"rollout_legacy_total,omitempty"`
 	RolloutPending     *rolloutPending `json:"rollout_pending,omitempty"`
 	RolloutCarry       bool            `json:"rollout_carry,omitempty"`
+	// Session / Claude persist the rest of the transcriptCarry: the transcript's session and its
+	// start, and the Claude responses awaiting their final record — ids, counts and times, never
+	// content. ClaudeCounted is how many hashes at the head of the counted-id sidecar hold the Claude
+	// responses already counted (see Save). SessionCarry marks a state that carries all of them:
+	// every save since they were introduced sets it, so a state without it re-derives them from the
+	// consumed bytes (see foldUpgradeCarry).
+	Session       *sessionCarry `json:"session,omitempty"`
+	Claude        *claudeCarry  `json:"claude,omitempty"`
+	ClaudeCounted int           `json:"claude_counted,omitempty"`
+	SessionCarry  bool          `json:"session_carry,omitempty"`
 }
 
 // fileIdentityOf extracts the device and inode of a stat result. ok is false only when the
@@ -134,6 +156,20 @@ func fileIdentityOf(info os.FileInfo) (dev, ino uint64, ok bool) {
 // reused path with a new inode get a fresh one.
 func cursorStatePath(stateDir string, dev, ino uint64) string {
 	return filepath.Join(stateDir, fmt.Sprintf("codex-cursor-%d-%d.json", dev, ino))
+}
+
+// countedPath is the counted-id sidecar of the cursor whose state file is statePath: the 8-byte
+// big-endian hashes of the Claude message ids the transcript has counted, appended as they are
+// counted. Only the first ClaudeCounted of them belong to the saved state; zero hashes are filler
+// (see saveCounted).
+func countedPath(statePath string) string {
+	return strings.TrimSuffix(statePath, ".json") + ".counted"
+}
+
+// removeCursorState deletes a cursor's state file and its counted-id sidecar.
+func removeCursorState(statePath string) {
+	_ = os.Remove(statePath)
+	_ = os.Remove(countedPath(statePath))
 }
 
 // LoadCursor returns the durable cursor for the file identified by (dev, ino) beneath stateDir,
@@ -173,6 +209,7 @@ func loadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 		maxPartialLine: maxPartialLine,
 		scope:          scope,
 		carryKnown:     true,
+		sessionKnown:   true,
 	}
 	data, err := os.ReadFile(c.statePath)
 	if err != nil {
@@ -204,10 +241,31 @@ func loadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 	c.anchorHash = p.AnchorHash
 	c.anchorSize = p.AnchorSize
 	c.sealed = p.Sealed
-	c.carry = rolloutCarry{RecordMode: p.RolloutRecordMode, LegacyTotal: p.RolloutLegacyTotal, Pending: p.RolloutPending}
+	c.carry.rollout = rolloutCarry{RecordMode: p.RolloutRecordMode, LegacyTotal: p.RolloutLegacyTotal, Pending: p.RolloutPending}
+	if p.Session != nil {
+		c.carry.session = *p.Session
+	}
+	if p.Claude != nil {
+		c.carry.claude = *p.Claude
+	}
+	if p.ClaudeCounted > 0 {
+		hashes, err := readCounted(countedPath(c.statePath), p.ClaudeCounted)
+		if err != nil {
+			return nil, err
+		}
+		// A sidecar shorter than the state claims lost ids it held: keep the ones left (a response
+		// they named could be counted again by a later copy of the transcript's history), but keep
+		// the claim, which no later write may reach below (see saveCounted). Zero hashes are the
+		// filler such a write leaves.
+		c.countedSaved = p.ClaudeCounted
+		hashes = slices.DeleteFunc(hashes, func(h uint64) bool { return h == 0 })
+		slices.Sort(hashes)
+		c.carry.claude.Counted = slices.Compact(hashes)
+	}
 	// A #91 state that never left the zero carry is indistinguishable from a pre-#91 one; deriving
 	// it again is idempotent (the fold of those bytes is that same zero carry), so both re-derive.
 	c.carryKnown = p.RolloutCarry || p.RolloutRecordMode || p.RolloutLegacyTotal != "" || p.RolloutPending != nil || c.consumed == 0
+	c.sessionKnown = p.SessionCarry || c.consumed == 0
 	return c, nil
 }
 
@@ -283,8 +341,10 @@ func (c *Cursor) observe(size, modNanos int64) {
 // same-identity file that was truncated or rewritten in place. The caller is responsible for
 // emitting the truncation diagnostic; Reset only moves the position.
 func (c *Cursor) Reset() {
-	c.carry = rolloutCarry{}
+	c.carry = transcriptCarry{}
 	c.carryKnown = true
+	c.sessionKnown = true
+	c.countedSaved = 0
 	c.consumed = 0
 	c.remainder = nil
 	c.skip = false
@@ -302,8 +362,10 @@ func (c *Cursor) SealAt(eof int64) {
 		eof = 0
 	}
 	c.consumed = eof
-	c.carry = rolloutCarry{} // pre-consent bytes are never read, so the usage source is unknown
+	c.carry = transcriptCarry{} // pre-consent bytes are never read: usage source and session are unknown
 	c.carryKnown = true
+	c.sessionKnown = true
+	c.countedSaved = 0
 	c.remainder = nil
 	c.skip = false
 	c.anchor = nil
@@ -314,36 +376,76 @@ func (c *Cursor) SealAt(eof int64) {
 
 func (c *Cursor) IsSealed() bool { return c.sealed }
 
-// NeedsCarryDerivation reports whether this cursor resumed a pre-#91 state whose rollout usage
-// carry must be derived from its consumed bytes before the next Ingest (see DeriveCarry).
-func (c *Cursor) NeedsCarryDerivation() bool { return !c.carryKnown }
+// NeedsCarryDerivation reports whether this cursor resumed a state from an older release whose
+// carry must be derived from its consumed bytes before the next Ingest (see DeriveCarry): a
+// pre-#91 state lacks the rollout usage carry, and every state written before sessions were
+// carried lacks the transcript's session.
+func (c *Cursor) NeedsCarryDerivation() bool { return !c.carryKnown || !c.sessionKnown }
 
-// DeriveCarry completes the pre-#91 upgrade: consumed is the reader over the bytes this cursor has
-// already consumed (from byte zero, or from a forward-only floor — never pre-consent bytes), and
-// the carry becomes exactly what a #91+ daemon would have committed at the end of them, plus the
-// one record a pre-#91 daemon could have consumed without counting. Nothing is delivered here;
-// the derived carry is persisted with the next commit. A mid-overflow cursor (consumed not on a
-// line boundary) keeps the zero carry.
+// DeriveCarry completes the upgrade from an older release's state: consumed is the reader over the
+// bytes this cursor has already consumed (from byte zero, or from a forward-only floor — never
+// pre-consent bytes). A missing rollout carry becomes exactly what a #91+ daemon would have
+// committed at the end of them, plus the one record a pre-#91 daemon could have consumed without
+// counting; a mid-overflow cursor (consumed not on a line boundary) keeps the zero rollout carry. A
+// missing session becomes the one the consumed bytes name, already started, with the Claude
+// responses in them already counted (see foldUpgradeCarry). Nothing is delivered here; the derived
+// carry is persisted with the next commit.
 func (c *Cursor) DeriveCarry(consumed io.Reader) error {
-	if c.carryKnown {
+	if !c.NeedsCarryDerivation() {
 		return nil
 	}
-	if c.skip {
-		c.carryKnown = true
-		return nil
-	}
-	carry, err := foldRolloutCarry(consumed, c.maxPartialLine)
+	foldRollout := !c.carryKnown && !c.skip
+	fold, err := foldUpgradeCarry(consumed, c.maxPartialLine, foldRollout)
 	if err != nil {
 		return fmt.Errorf("deriving the codex usage carry for %s: %w", c.statePath, err)
 	}
-	c.carry = carry
-	c.carryKnown = true
+	if foldRollout {
+		c.carry.rollout = fold.rollout
+	}
+	if !c.sessionKnown {
+		c.carry.session = fold.session
+		c.carry.claude = claudeCarry{Counted: fold.counted, Unsaved: slices.Clone(fold.counted)}
+		c.countedSaved = 0
+	}
+	c.MarkCarryKnown()
 	return nil
 }
 
-// MarkCarryKnown keeps the zero carry for a pre-#91 cursor whose consumed bytes may not be read
-// (a forward-only cursor with no committed floor).
-func (c *Cursor) MarkCarryKnown() { c.carryKnown = true }
+// MarkCarryKnown keeps the zero carry for an older release's cursor whose consumed bytes may not
+// be read (a forward-only cursor with no committed floor).
+func (c *Cursor) MarkCarryKnown() {
+	c.carryKnown = true
+	c.sessionKnown = true
+}
+
+// HasOpenUsage reports whether a Claude response of this transcript still waits for its final
+// record.
+func (c *Cursor) HasOpenUsage() bool { return len(c.carry.claude.Open) > 0 }
+
+// FlushOpenUsage counts every Claude response still waiting for its final record, with the usage
+// its last record reported — for a transcript that has been quiet long enough that no further
+// record of them can arrive (the watcher's openUsageSettle): a session that ended mid-response. It
+// does not move the cursor. commit takes how many of the returned candidates were durably
+// delivered and records the responses they cover as counted, so a partial delivery re-offers only
+// the rest and nothing is counted twice.
+func (c *Cursor) FlushOpenUsage() (cands []*Candidate, commit func(delivered int)) {
+	st := newParseState(c.carry)
+	var ends []int
+	var states []transcriptCarry
+	for len(st.carry.claude.Open) > 0 {
+		cands = append(cands, st.closeClaudeMessage(0, 0)...)
+		ends = append(ends, len(cands))
+		states = append(states, st.carry.clone())
+	}
+	return cands, func(delivered int) {
+		for i := len(ends) - 1; i >= 0; i-- {
+			if ends[i] <= delivered {
+				c.carry = states[i]
+				return
+			}
+		}
+	}
+}
 
 // Ingest folds newBytes (the freshly appended tail) into the cursor. It prepends the buffered
 // remainder, parses only complete newline-terminated lines via the committed Parse, and returns
@@ -426,7 +528,18 @@ func (c *Cursor) ingestNormal(prefix, newBytes []byte, cfg ReferenceConfig) (can
 // corroborating size/mtime) using temp-file → fsync → rename → directory-fsync, so the state file
 // is left either fully old or fully new across a crash. It never persists the in-memory remainder;
 // the consumed offset is newline-aligned and the remainder is re-derived from the file on reload.
+//
+// The Claude message ids the transcript counted grow with it, so they are not rewritten with every
+// save: they live in an append-only sidecar, and a save first appends (and fsyncs) only the ids
+// counted since the last one, then records the new count in the state file. A crash between the
+// two leaves the state file's older offset and count, which fences the appended ids out on reload
+// — the counted set always matches the consumed bytes — and the next save cuts them before
+// appending again.
 func (c *Cursor) Save() error {
+	counted, err := c.saveCounted()
+	if err != nil {
+		return err
+	}
 	p := persistedCursor{
 		Version:    cursorStateVersion,
 		Device:     c.dev,
@@ -440,18 +553,113 @@ func (c *Cursor) Save() error {
 		Scope:      c.scope,
 		Sealed:     c.sealed,
 
-		RolloutRecordMode:  c.carry.RecordMode,
-		RolloutLegacyTotal: c.carry.LegacyTotal,
-		RolloutPending:     c.carry.Pending,
+		RolloutRecordMode:  c.carry.rollout.RecordMode,
+		RolloutLegacyTotal: c.carry.rollout.LegacyTotal,
+		RolloutPending:     c.carry.rollout.Pending,
 		// Only a derived (or natively tracked) carry is marked; an underived pre-#91 carry stays
 		// unmarked so a restart before the first drain derives it rather than trusting zero.
 		RolloutCarry: c.carryKnown,
+		SessionCarry: c.sessionKnown,
 	}
+	if c.carry.session.NativeID != "" || len(c.carry.session.Sessions) > 0 {
+		session := c.carry.session
+		p.Session = &session
+	}
+	if len(c.carry.claude.Open) > 0 {
+		claude := c.carry.claude
+		p.Claude = &claude
+	}
+	p.ClaudeCounted = counted
 	data, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("encoding codex cursor state: %w", err)
 	}
-	return atomicWriteCursorFile(c.statePath, data)
+	if err := atomicWriteCursorFile(c.statePath, data); err != nil {
+		return err
+	}
+	c.countedSaved = counted
+	c.carry.claude.Unsaved = nil
+	return nil
+}
+
+// saveCounted makes the ids counted since the last save durable in the sidecar and returns how
+// many of its hashes the state now claims. The ids go right after the countedSaved the saved state
+// claims; anything beyond those (left by a save that crashed before its state file was written) is
+// cut first. Nothing is ever written below that claim: if this save is cut short, the saved state
+// must still own exactly what it owned, never ids appended after it. So a sidecar that lost hashes
+// the saved state claims is zero-filled up to the claim, and every id the cursor knows is written
+// after it.
+func (c *Cursor) saveCounted() (int, error) {
+	unsaved := c.carry.claude.Unsaved
+	if len(unsaved) == 0 {
+		return c.countedSaved, nil
+	}
+	path := countedPath(c.statePath)
+	keep, hashes := c.countedSaved, unsaved
+	if keep > 0 {
+		info, err := os.Stat(path)
+		if err != nil && !os.IsNotExist(err) {
+			return 0, fmt.Errorf("stat codex cursor counted ids %s: %w", path, err)
+		}
+		if err != nil || info.Size() < int64(8*keep) {
+			hashes = c.carry.claude.Counted
+		}
+	}
+	if err := writeCounted(path, keep, hashes); err != nil {
+		return 0, err
+	}
+	return keep + len(hashes), nil
+}
+
+// writeCounted writes hashes into the sidecar at path right after its first keep hashes, cutting
+// whatever followed them (or zero-filling up to them, when the file is shorter), and fsyncs it. A
+// sidecar it creates is made durable in its directory too.
+func writeCounted(path string, keep int, hashes []uint64) error {
+	dir := filepath.Dir(path)
+	if err := ensureCursorDir(dir); err != nil {
+		return err
+	}
+	_, statErr := os.Stat(path)
+	created := os.IsNotExist(statErr)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, cursorFileMode)
+	if err != nil {
+		return fmt.Errorf("opening codex cursor counted ids %s: %w", path, err)
+	}
+	b := make([]byte, 0, 8*len(hashes))
+	for _, h := range hashes {
+		b = binary.BigEndian.AppendUint64(b, h)
+	}
+	err = f.Truncate(int64(8 * keep))
+	if err == nil {
+		_, err = f.WriteAt(b, int64(8*keep))
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("writing codex cursor counted ids %s: %w", path, err)
+	}
+	if created {
+		return fsyncCursorDir(dir)
+	}
+	return nil
+}
+
+// readCounted reads the first n hashes of the sidecar at path; fewer when it holds fewer.
+func readCounted(path string, n int) ([]uint64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading codex cursor counted ids %s: %w", path, err)
+	}
+	b = b[:min(len(b)/8, n)*8]
+	hashes := make([]uint64, len(b)/8)
+	for i := range hashes {
+		hashes[i] = binary.BigEndian.Uint64(b[8*i:])
+	}
+	return hashes, nil
 }
 
 // overflowDiagnostic builds the content-free diagnostic emitted when an unterminated transcript

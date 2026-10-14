@@ -24,13 +24,18 @@ import (
 // {"type":"event_msg","payload":{"type":"token_count",...}}, {"type":"response_item",...}. The
 // parser projects the two evidence-bearing shapes natively:
 //
-//   - session_meta.payload.id           -> SESSION_LIFECYCLE.native_session_id
-//   - turn_context.payload.model        -> SESSION_LIFECYCLE.model (threaded onto the session)
+//   - session_meta.payload.id           -> SESSION_LIFECYCLE.native_session_id, and its time
+//     becomes the start's occurred_at
+//   - turn_context.payload.model        -> SESSION_LIFECYCLE.model: the start is emitted at the
+//     first turn_context that names a model, never earlier without one
 //   - token_usage_record.payload.usage   -> one USAGE per completed Responses API response
 //     (Codex >= 0.153.0), with payload.response_id as its message_id (the resp_… id Manifold
 //     records as spend.message_id; see docs/observer-usage-message-id.md)
 //   - event_msg token_count.last_token_usage -> a per-turn USAGE, ONLY for a legacy rollout that
 //     carries no token_usage_record (Codex < 0.153.0); a rate-limit-only repeat is dropped
+//
+// A USAGE's input_tokens is fresh input: Codex's input_tokens less its cached_input_tokens, which
+// travel as cache_read_tokens.
 //
 // This removes the throwaway rollout->normalized translate step: the daemon reads the file the
 // agent actually wrote.
@@ -73,7 +78,7 @@ type rolloutCarry struct {
 	// rolloutTokenUsage.signature. A legacy token_count whose cumulative total equals it reported
 	// no new response (a rate-limit-only refresh, or a context-reset recount) and is dropped.
 	LegacyTotal string
-	// Pending is set only by the pre-#91 cursor upgrade (foldRolloutCarry): a token_usage_record
+	// Pending is set only by the pre-#91 cursor upgrade (foldUpgradeCarry): a token_usage_record
 	// the old daemon consumed without counting, because it counted usage from the token_count that
 	// follows each record and stopped before that token_count. The next parse emits it once, as the
 	// record's own usage and response id, ahead of its first line.
@@ -95,12 +100,29 @@ func (p *rolloutPending) candidates(lineNo int) []*Candidate {
 	return p.Usage.candidates(p.OccurredAt, lineNo, p.ResponseID)
 }
 
-// foldRolloutCarry reconstructs, from the already-consumed bytes of one file, the rolloutCarry a
-// #91+ daemon would have committed at the end of them. It exists for the upgrade from a cursor
-// persisted before #91, which carries only an offset: resuming such a file in the zero (legacy)
-// state is inexact — a record-bearing rollout's next rate-limit token_count would re-count the
-// response the old daemon already counted, and a legacy rollout's next repeat would pass the
-// empty repeat signature. The fold applies exactly the carry transitions of parseRolloutLine:
+// upgradeFold is what the bytes a cursor consumed before an upgrade say about its file: the usage
+// source a #91+ daemon would hold at their end, the transcript's session, and (Claude) the
+// responses the earlier daemon already counted.
+type upgradeFold struct {
+	rollout rolloutCarry
+	session sessionCarry
+	counted messageIDSet
+}
+
+// maxUpgradeSessionLines bounds the scan for a transcript's session. The session is named near the
+// top of every transcript (a rollout's first record is its session_meta, and nearly every Claude
+// record carries its sessionId), so a file that names none by then is not a native transcript.
+const maxUpgradeSessionLines = 64
+
+// foldUpgradeCarry reconstructs, from the already-consumed bytes of one file, what a current
+// daemon would have committed at the end of them. It exists for the upgrade from a cursor persisted
+// by an older release.
+//
+// The usage source (withRollout) is needed for a cursor persisted before #91, which carries only
+// an offset: resuming such a file in the zero (legacy) state is inexact — a record-bearing
+// rollout's next rate-limit token_count would re-count the response the old daemon already
+// counted, and a legacy rollout's next repeat would pass the empty repeat signature. The fold
+// applies exactly the carry transitions of parseRolloutLine:
 //
 //   - the file's first session_meta switches to record mode by cli_version (>= 0.153.0);
 //   - any token_usage_record switches to record mode;
@@ -109,12 +131,25 @@ func (p *rolloutPending) candidates(lineNo int) []*Candidate {
 // It also finds the one response a pre-#91 daemon can leave uncounted: that daemon counted each
 // response from its token_count (written right after the record), so a record whose token_count
 // lies beyond the consumed offset was never counted, while #91+ record mode will ignore that
-// token_count. Such a record becomes carry.Pending and is emitted once on resume. The fold only
-// reads type-discriminating fields, never delivers anything, and skips any line longer than
-// maxLine, which must be positive (the runtime overflow path never parses those either).
-func foldRolloutCarry(r io.Reader, maxLine int) (rolloutCarry, error) {
-	var carry rolloutCarry
+// token_count. Such a record becomes carry.Pending and is emitted once on resume.
+//
+// The session is needed by every cursor persisted before sessions were carried. An older daemon
+// emitted a transcript's start from the first buffer that named its session and kept the session
+// only in memory, so the fold recovers it — a rollout's first session_meta, a Claude transcript's
+// latest sessionId — as already started: the resumed parse attributes the rest of the file to it
+// without starting it again. That daemon also counted every Claude record, so the fold collects the
+// message id of every Claude response in the consumed bytes as counted: a response whose records
+// straddle the upgrade, or a resumed agent's later copy of its history, is not counted again.
+// Without withRollout a rollout is read only up to its session_meta; a Claude transcript is read
+// to the end, and a file that names no session within maxUpgradeSessionLines lines no further.
+//
+// The fold only reads type-discriminating fields, never delivers anything, and skips any line
+// longer than maxLine, which must be positive (the runtime overflow path never parses those
+// either).
+func foldUpgradeCarry(r io.Reader, maxLine int, withRollout bool) (upgradeFold, error) {
+	var fold upgradeFold
 	metaSeen := false
+	lines := 0
 	br := bufio.NewReaderSize(r, 64<<10)
 	var line []byte
 	skipping := false
@@ -122,7 +157,7 @@ func foldRolloutCarry(r io.Reader, maxLine int) (rolloutCarry, error) {
 		chunk, err := br.ReadSlice('\n')
 		complete := err == nil
 		if err != nil && !errors.Is(err, bufio.ErrBufferFull) && !errors.Is(err, io.EOF) {
-			return rolloutCarry{}, err
+			return upgradeFold{}, err
 		}
 		if !skipping {
 			if len(line)+len(chunk) > maxLine {
@@ -133,26 +168,52 @@ func foldRolloutCarry(r io.Reader, maxLine int) (rolloutCarry, error) {
 		}
 		if complete {
 			if !skipping {
-				foldRolloutLine(bytes.TrimSpace(line), &carry, &metaSeen)
+				foldUpgradeLine(bytes.TrimSpace(line), &fold, &metaSeen, withRollout)
 			}
 			line, skipping = line[:0], false
+			lines++
+			if !withRollout && (fold.session.Provider == rolloutProvider || fold.session.NativeID == "" && lines >= maxUpgradeSessionLines) {
+				return fold, nil
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			// A trailing unterminated fragment was never consumed by the cursor; ignore it.
-			return carry, nil
+			return fold, nil
 		}
 	}
 }
 
-// foldRolloutLine applies one complete line's carry transition (see foldRolloutCarry).
-func foldRolloutLine(line []byte, carry *rolloutCarry, metaSeen *bool) {
+// foldUpgradeLine applies one complete line's transitions (see foldUpgradeCarry).
+func foldUpgradeLine(line []byte, fold *upgradeFold, metaSeen *bool, withRollout bool) {
 	if len(line) == 0 {
+		return
+	}
+	if !withRollout && fold.session.Provider == claudeProvider &&
+		!bytes.Contains(line, []byte(`"assistant"`)) && bytes.Contains(line, []byte(fold.session.NativeID)) {
+		// A record of the same Claude session that holds no response: nothing to fold, and most of
+		// a transcript's bytes, so it is not decoded.
 		return
 	}
 	var probe formatProbe
 	if json.Unmarshal(line, &probe) != nil {
 		return
 	}
+	if probe.SessionIDCamel != "" && len(probe.Payload) == 0 {
+		if fold.session.NativeID != probe.SessionIDCamel {
+			// The earlier build emitted a start each time its buffers moved to another session.
+			fold.session.enter(probe.SessionIDCamel, claudeProvider)
+			fold.session.markStarted()
+		}
+		if probe.Type == "assistant" && len(probe.Message) > 0 {
+			var m struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(probe.Message, &m) == nil && m.ID != "" {
+				_ = fold.counted.add(idHash(m.ID))
+			}
+		}
+	}
+	carry := &fold.rollout
 	switch probe.Type {
 	case rolloutSessionMeta:
 		var meta struct {
@@ -163,10 +224,15 @@ func foldRolloutLine(line []byte, carry *rolloutCarry, metaSeen *bool) {
 			return
 		}
 		*metaSeen = true
-		if writesUsageRecords(meta.CLIVersion) {
+		fold.session = sessionCarry{NativeID: meta.ID, Provider: rolloutProvider, StartedAt: probe.probeTime()}
+		fold.session.markStarted()
+		if withRollout && writesUsageRecords(meta.CLIVersion) {
 			carry.RecordMode = true
 		}
 	case rolloutTokenUsageRecord:
+		if !withRollout {
+			return
+		}
 		carry.RecordMode = true
 		carry.Pending = nil
 		var rec struct {
@@ -186,6 +252,9 @@ func foldRolloutLine(line []byte, carry *rolloutCarry, metaSeen *bool) {
 			OccurredAt: probe.probeTime(),
 		}
 	case rolloutEventMsg:
+		if !withRollout {
+			return
+		}
 		var pl struct {
 			Type string `json:"type"`
 			Info struct {
@@ -224,24 +293,11 @@ func joinKeyID(id string) string {
 	return id
 }
 
-// parseState carries the cross-line context a single Parse call needs to project a rollout or
-// Claude transcript: the model (which lives on a different record than the session id) discovered
-// by a one-pass peek over the buffer, and a per-buffer latch so exactly one SESSION_LIFECYCLE is
-// emitted per buffer. Cross-BUFFER de-duplication (a Claude session id recurs on every record, so
-// every poll would otherwise re-emit its STARTED) is the sink's job, keyed by transcript identity.
+// parseState is the context one Parse call threads through the lines of a buffer: the transcript's
+// carry — handed in from the previous buffer of the same file and handed back out in ParseResult
+// for the cursor to commit — and the tool surfaces the buffer has seen.
 type parseState struct {
-	rolloutModel          string
-	rolloutSessionEmitted bool
-	// rolloutSessionMetaSeen latches after the first session_meta of the buffer. Only the first one
-	// can be the rollout's own (a forked rollout copies its parent's session_meta after its own), so
-	// only it may switch the stream to record mode by cli_version.
-	rolloutSessionMetaSeen bool
-	// rolloutCarry is the usage-source state carried in from the previous buffer of the same file
-	// and handed back out in ParseResult for the cursor to commit.
-	rolloutCarry rolloutCarry
-
-	claudeModel          string
-	claudeSessionEmitted bool
+	carry transcriptCarry
 
 	// toolSurfaceByID maps a tool-invocation id (Claude tool_use.id, Codex function_call.call_id)
 	// to the effective CLI tool of the command it ran, so the matching later result record
@@ -276,48 +332,17 @@ func (st *parseState) toolSurfaceFor(id string) string {
 	return st.toolSurfaceByID[id]
 }
 
-// newParseState builds the per-buffer parse context, peeking the buffer once for the session model
-// each dialect stashes on a record separate from the session id. The peeks are gated on a cheap
-// substring probe so a normalized-only buffer pays nothing.
-func newParseState(data []byte, carry rolloutCarry) *parseState {
-	st := &parseState{rolloutCarry: carry}
-	if bytes.Contains(data, []byte(`"session_meta"`)) || bytes.Contains(data, []byte(`"turn_context"`)) {
-		st.rolloutModel = peekRolloutModel(data)
-	}
-	if bytes.Contains(data, []byte(`"assistant"`)) {
-		st.claudeModel = peekClaudeModel(data)
-	}
-	return st
+// newParseState builds the parse context for one buffer of a transcript whose previous buffers
+// left carry. The parse works on a clone, so the cursor's committed carry is untouched until the
+// parse is committed.
+func newParseState(carry transcriptCarry) *parseState {
+	return &parseState{carry: carry.clone()}
 }
 
-// peekRolloutModel scans the buffer for the first turn_context.payload.model. The model rides its
-// own rollout record (turn_context), separate from session_meta which carries the id, so a
-// single-pass line parser cannot both emit the session at session_meta AND stamp the model without
-// this look-ahead. When session_meta and turn_context split across polls (the file was discovered
-// between the two writes) the model is simply absent on that session — an accepted degradation the
-// SESSION_LIFECYCLE's optional model field already allows.
-func peekRolloutModel(data []byte) string {
-	for _, line := range splitJSONLines(data) {
-		var probe formatProbe
-		if json.Unmarshal(line, &probe) != nil {
-			continue
-		}
-		if probe.Type == rolloutTurnContext && len(probe.Payload) > 0 {
-			var tc struct {
-				Model string `json:"model"`
-			}
-			if json.Unmarshal(probe.Payload, &tc) == nil && tc.Model != "" {
-				return tc.Model
-			}
-		}
-	}
-	return ""
-}
-
-// parseRolloutLine projects one raw Codex rollout record. session_meta becomes the transcript's
-// single SESSION_LIFECYCLE (with the peeked model); a token_usage_record becomes that response's
-// USAGE; a token_count event becomes a per-turn USAGE only in a legacy (record-less) rollout; every
-// other rollout record is skipped without a diagnostic.
+// parseRolloutLine projects one raw Codex rollout record. The file's first session_meta names the
+// transcript's session; the first turn_context that names a model starts it; a token_usage_record
+// becomes that response's USAGE; a token_count event becomes a per-turn USAGE only in a legacy
+// (record-less) rollout; every other rollout record is skipped without a diagnostic.
 func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg ReferenceConfig) []*Candidate {
 	ts := probe.probeTime()
 	switch probe.Type {
@@ -329,23 +354,32 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		if json.Unmarshal(probe.Payload, &meta) != nil || meta.ID == "" {
 			return nil
 		}
-		if !st.rolloutSessionMetaSeen {
-			st.rolloutSessionMetaSeen = true
-			if writesUsageRecords(meta.CLIVersion) {
-				st.rolloutCarry.RecordMode = true
-			}
-		}
-		if st.rolloutSessionEmitted {
+		if st.carry.session.NativeID != "" {
+			// Only the file's first session_meta is its own: a forked rollout copies its parent's
+			// after its own, and that copy neither names this transcript's session nor decides its
+			// usage source — whichever poll it lands in.
 			return nil
 		}
-		st.rolloutSessionEmitted = true
-		return []*Candidate{sessionLifecycleCandidate(meta.ID, rolloutProvider, st.rolloutModel, ts, lineNo)}
+		if writesUsageRecords(meta.CLIVersion) {
+			st.carry.rollout.RecordMode = true
+		}
+		// The start waits for the model, which rides the turn_context written after this record.
+		st.carry.session = sessionCarry{NativeID: meta.ID, Provider: rolloutProvider, StartedAt: ts}
+		return nil
+	case rolloutTurnContext:
+		var tc struct {
+			Model string `json:"model"`
+		}
+		if json.Unmarshal(probe.Payload, &tc) != nil || tc.Model == "" {
+			return nil
+		}
+		return st.startSession(tc.Model, ts, lineNo)
 	case rolloutResponseItem:
-		return st.parseRolloutResponseItem(probe.Payload, cfg, ts, lineNo)
+		return st.attribute(st.parseRolloutResponseItem(probe.Payload, cfg, ts, lineNo))
 	case rolloutTokenUsageRecord:
 		// A record (even a malformed one) proves this Codex writes records, so the file's
 		// token_count events are no longer a usage source from here on.
-		st.rolloutCarry.RecordMode = true
+		st.carry.rollout.RecordMode = true
 		var rec struct {
 			ResponseID json.RawMessage    `json:"response_id"`
 			Usage      *rolloutTokenUsage `json:"usage"`
@@ -359,9 +393,9 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		if json.Unmarshal(rec.ResponseID, &responseID) != nil {
 			responseID = ""
 		}
-		return rec.Usage.candidates(ts, lineNo, joinKeyID(responseID))
+		return st.attribute(rec.Usage.candidates(ts, lineNo, joinKeyID(responseID)))
 	case rolloutEventMsg:
-		if st.rolloutCarry.RecordMode {
+		if st.carry.rollout.RecordMode {
 			// Every billed response in a record-bearing rollout already produced its USAGE from its
 			// token_usage_record. Its token_count events only re-report that usage (after the
 			// record, again on each rate-limit refresh) or report a zeroed estimate after a context
@@ -386,12 +420,12 @@ func (st *parseState) parseRolloutLine(probe formatProbe, lineNo int, cfg Refere
 		// completed response advances the cumulative total, so an unchanged total is a repeat.
 		if pl.Info.Total != nil {
 			sig := pl.Info.Total.signature()
-			if sig == st.rolloutCarry.LegacyTotal {
+			if sig == st.carry.rollout.LegacyTotal {
 				return nil
 			}
-			st.rolloutCarry.LegacyTotal = sig
+			st.carry.rollout.LegacyTotal = sig
 		}
-		return pl.Info.Last.candidates(ts, lineNo, "")
+		return st.attribute(pl.Info.Last.candidates(ts, lineNo, ""))
 	default:
 		return nil
 	}
@@ -532,9 +566,10 @@ func rolloutOutputText(raw json.RawMessage) string {
 
 // rolloutTokenUsage is one Codex TokenUsage object: a token_usage_record's per-response usage or a
 // token_count's last/total usage. Codex reports input_tokens as the full input (cached included)
-// and a cached_input_tokens breakdown, mirroring the USAGE observation's input_tokens +
-// cache_read_tokens. output_tokens already includes reasoning_output_tokens, which is therefore
-// not mapped separately (it would double count); it only participates in the repeat signature.
+// and a cached_input_tokens breakdown; the USAGE observation's input_tokens is fresh input, as
+// Claude's is, so the cached part is taken out of it and reported as cache_read_tokens (see
+// freshInput). output_tokens already includes reasoning_output_tokens, which is therefore not
+// mapped separately (it would double count); it only participates in the repeat signature.
 type rolloutTokenUsage struct {
 	InputTokens           *int64 `json:"input_tokens"`
 	CachedInputTokens     *int64 `json:"cached_input_tokens"`
@@ -556,13 +591,24 @@ func (u *rolloutTokenUsage) candidates(ts time.Time, lineNo int, messageID strin
 		LineNumber: lineNo,
 		Usage: &evidence.UsageCandidate{
 			Quality:         wire.UsagePayloadQualityPROVIDERREPORTED,
-			InputTokens:     u.InputTokens,
+			InputTokens:     freshInput(u.InputTokens, u.CachedInputTokens),
 			OutputTokens:    u.OutputTokens,
 			CacheReadTokens: u.CachedInputTokens,
 			ProviderSource:  rolloutProvider,
 			MessageID:       messageID,
 		},
 	}}
+}
+
+// freshInput is the input a Codex usage reports beyond its cached input: input_tokens less
+// cached_input_tokens, clamped at zero. An absent input stays absent, and an absent cached count
+// leaves input as reported.
+func freshInput(input, cached *int64) *int64 {
+	if input == nil || cached == nil {
+		return input
+	}
+	fresh := max(*input-*cached, 0)
+	return &fresh
 }
 
 // work is the billed input+output of a usage. total_tokens is only the fallback for a usage that
@@ -630,9 +676,10 @@ func writesUsageRecords(version string) bool {
 }
 
 // sessionLifecycleCandidate builds the STARTED SESSION_LIFECYCLE candidate every native dialect
-// emits once per transcript. The native session id is the load-bearing field: the sink threads it
-// onto the transcript's later session-free USAGE records so the platform sums their tokens into one
-// synthetic run. Model is optional (absent when a split buffer hid it from the peek).
+// emits once per transcript session. The native session id is the load-bearing field: the
+// transcript's later USAGE records are attributed to it so the platform sums their tokens into one
+// synthetic run, and its model is what the platform prices that usage at. Model is empty only when
+// usage arrived before any record named the model (see parseState.attribute).
 func sessionLifecycleCandidate(nativeID, provider, model string, ts time.Time, lineNo int) *Candidate {
 	return &Candidate{
 		Kind:       KindSessionLifecycle,
@@ -717,8 +764,8 @@ func concatTextBlocks(raw json.RawMessage) string {
 	return b.String()
 }
 
-// splitJSONLines returns the complete newline-terminated lines of data (blank lines dropped), for
-// the model look-ahead peeks. It never allocates the line contents — the returned slices alias data.
+// splitJSONLines returns the complete newline-terminated lines of data (blank lines dropped). It
+// never allocates the line contents — the returned slices alias data.
 func splitJSONLines(data []byte) [][]byte {
 	var out [][]byte
 	for len(data) > 0 {

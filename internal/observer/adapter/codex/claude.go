@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"bytes"
 	"encoding/json"
 	"time"
 
@@ -9,20 +10,52 @@ import (
 )
 
 // Native capture of a real Claude Code transcript
-// (~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl).
+// (~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl, and its subagents/ transcripts).
 //
-// Claude writes one JSON envelope per line; the ones that carry cost are the "assistant" records,
-// each with a message.model and a message.usage block (input_tokens, output_tokens,
-// cache_creation_input_tokens, cache_read_input_tokens). The session id rides every envelope as the
-// camelCase "sessionId". Unlike Codex there is no dedicated session record, so the parser
-// synthesizes the transcript's single SESSION_LIFECYCLE from the first envelope that carries a
-// sessionId, stamping the model peeked from the first assistant record. Per-message usage becomes a
-// USAGE observation; the sink threads the session id onto each so the tokens sum into one run.
+// Claude writes one JSON envelope per line; the session id rides nearly every envelope as the
+// camelCase "sessionId", and the ones that carry cost are the "assistant" records, each with a
+// message.id, a message.model and a message.usage block (input_tokens, output_tokens,
+// cache_creation_input_tokens, cache_read_input_tokens). There is no dedicated session record, so
+// the parser synthesizes the transcript's SESSION_LIFECYCLE start — and it does so only at the
+// first assistant record that names the model, because the platform prices a session's usage at
+// its start's model: a start written from an earlier record could not know it. The start is
+// stamped with the session's earliest record time.
+//
+// Claude Code writes one record per content block of a response, every block repeating the
+// response's message.id and its usage as known when the block was written: a block written while
+// the response still streams carries partial counts (output_tokens of a handful), and the block
+// written once it finished carries the final usage and a stop_reason. Counting every record would
+// count each response once per block, so the parser counts each message.id once, with its LAST
+// record's usage, emitted once nothing can change it:
+//
+//   - at its first record with a stop_reason (no later record of a response differs from it);
+//   - when the response's branch continues: each record names the record it follows (uuid,
+//     parentUuid), and a new response or a user turn that follows from the response's records —
+//     its own blocks, its tool results, their attachments — is written only once the response
+//     finished. A response whose last block Claude Code wrote before the response finished never
+//     gets a stop_reason, and is counted here;
+//   - when the transcript moves to another session;
+//   - when the transcript stays quiet for openUsageSettle (Cursor.FlushOpenUsage), for a session
+//     that ended mid-response.
+//
+// Responses can stream concurrently into one transcript, interleaving their records, so neither a
+// new message.id nor a user record on another branch closes a response: only its own branch does.
+// Every counted id is remembered for the file: a resumed agent writes its whole history back into
+// its transcript, and those copies count nothing.
 
 // claudeProvider stamps SESSION_LIFECYCLE.provider (and provenance.provider, via the sink) for a
 // record parsed out of a Claude transcript, so the platform derives a distinct per-session run from
 // a co-resident Codex session.
 const claudeProvider = "claude"
+
+// claudeSyntheticModel is the model Claude Code stamps on a placeholder assistant record it writes
+// itself — an API error, an interrupted turn — rather than from a model response. It names no
+// model and carries no usage.
+const claudeSyntheticModel = "<synthetic>"
+
+// isClaudeModel reports whether an assistant record's model is the model that answered: present,
+// and not Claude Code's placeholder.
+func isClaudeModel(model string) bool { return model != "" && model != claudeSyntheticModel }
 
 // isClaudeBookkeepingType reports whether a top-level type names a Claude Code record that carries
 // neither the session envelope nor a message: the file-history checkpoint records and the
@@ -38,65 +71,202 @@ func isClaudeBookkeepingType(t string) bool {
 	}
 }
 
-// peekClaudeModel scans the WHOLE buffer for the first assistant record's message.model — not just
-// the first line — so the synthesized SESSION_LIFECYCLE (emitted at the first sessionId-bearing
-// envelope, which may be a non-assistant record like a user turn) carries the model without a second
-// parser pass over the data.
-//
-// KNOWN tail-only artifact (model=None mid-session): when capture resumes tail-only-new part-way
-// through a session, the first ingested buffer runs from the seed offset to EOF. If that buffer holds
-// no assistant record at all (every remaining line is a user/tool turn), the model is absent on the
-// synthesized session — the optional model field already tolerates this. It is NOT fixable cheaply:
-// the SESSION_LIFECYCLE is emitted and shipped the instant the session is first seen, so backfilling
-// a model from a LATER buffer would mean deferring that emission or mutating an already-durable
-// observation. The whole-buffer look-ahead here is the cheap win (it catches every model-bearing line
-// already in the resume buffer); the residual is inherent to tail-only-new resumption. The
-// newline-boundary seed reduces it further by not dropping the in-flight (often model-bearing)
-// assistant line at the resume point.
-func peekClaudeModel(data []byte) string {
-	for _, line := range splitJSONLines(data) {
-		var probe formatProbe
-		if json.Unmarshal(line, &probe) != nil {
-			continue
-		}
-		if probe.Type != "assistant" || len(probe.Message) == 0 {
-			continue
-		}
-		var m struct {
-			Model string `json:"model"`
-		}
-		if json.Unmarshal(probe.Message, &m) == nil && m.Model != "" {
-			return m.Model
-		}
-	}
-	return ""
+// claudeRecordMessage is the message block of a Claude record, as far as this adapter reads it.
+type claudeRecordMessage struct {
+	ID         string          `json:"id"`
+	Model      string          `json:"model"`
+	StopReason json.RawMessage `json:"stop_reason"`
+	Usage      *claudeUsage    `json:"usage"`
+	Content    json.RawMessage `json:"content"`
 }
 
-// parseClaudeLine projects one Claude transcript envelope. The first sessionId-bearing envelope in
-// the buffer yields the transcript's SESSION_LIFECYCLE (the sink de-dups the recurrence across
-// polls); an assistant envelope's message.usage yields a USAGE. The session candidate is ordered
-// before the usage so a single assistant record that triggers both still threads correctly.
+// finished reports whether the record was written once its response had finished: it carries a
+// stop_reason.
+func (m claudeRecordMessage) finished() bool {
+	return len(m.StopReason) > 0 && !bytes.Equal(m.StopReason, []byte("null"))
+}
+
+// parseClaudeLine projects one Claude transcript envelope: its session id moves the transcript's
+// session; an assistant record names the model and advances its response's usage; a user turn
+// ends the response it follows; every record extends the branch of the response it follows; tool
+// blocks feed the reference extractors.
 func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int, cfg ReferenceConfig) []*Candidate {
 	ts := probe.probeTime()
 	var out []*Candidate
-	if probe.SessionIDCamel != "" && !st.claudeSessionEmitted {
-		st.claudeSessionEmitted = true
-		out = append(out, sessionLifecycleCandidate(probe.SessionIDCamel, claudeProvider, st.claudeModel, ts, lineNo))
+	if probe.SessionIDCamel != "" {
+		out = st.enterClaudeSession(probe.SessionIDCamel, ts, lineNo)
 	}
-	if len(probe.Message) > 0 {
-		var m struct {
-			ID      string          `json:"id"`
-			Usage   *claudeUsage    `json:"usage"`
-			Content json.RawMessage `json:"content"`
+	var m claudeRecordMessage
+	hasMessage := len(probe.Message) > 0 && json.Unmarshal(probe.Message, &m) == nil
+	var blocks []claudeContentBlock
+	if hasMessage {
+		blocks = claudeBlocks(m.Content)
+	}
+	// The record this one follows. A compaction boundary starts a new chain (parentUuid null) and
+	// names the record it continues as logicalParentUuid instead.
+	parent := probe.ParentUUID
+	if parent == "" {
+		parent = probe.LogicalParentUUID
+	}
+	switch {
+	case hasMessage && probe.Type == "assistant":
+		out = append(out, st.claudeAssistant(probe.UUID, parent, m, ts, lineNo)...)
+	case hasMessage && probe.Type == "user" && !probe.IsMeta && !hasToolResult(blocks):
+		// A turn the user took — or Claude Code took for them, recording an interruption — after a
+		// response: that response is complete. A record Claude Code injects (isMeta: a skill body,
+		// an image note, a hook message) is not a turn, and tool results continue the tool loop.
+		out = append(out, st.closeClaudeBranch(parent, lineNo)...)
+	}
+	st.extendClaudeLineage(probe.UUID, parent)
+	if !hasMessage {
+		return out
+	}
+	return append(out, st.attribute(st.claudeToolCandidates(blocks, cfg, ts, lineNo))...)
+}
+
+// enterClaudeSession moves the transcript to the session a record names. Records of a new session
+// end every response of the previous one, which are counted under it; the new session then waits
+// for its own model to start, unless the transcript started it before (a return to an earlier
+// session). Until the start goes out, the session's earliest record time is kept as its start time.
+func (st *parseState) enterClaudeSession(id string, ts time.Time, lineNo int) []*Candidate {
+	s := &st.carry.session
+	var out []*Candidate
+	if s.NativeID != id {
+		if s.NativeID != "" {
+			out = st.closeClaudeMessages(lineNo)
 		}
-		if json.Unmarshal(probe.Message, &m) == nil {
-			if m.Usage != nil && m.Usage.hasTokens() {
-				out = append(out, m.Usage.candidate(ts, lineNo, m.ID))
-			}
-			out = append(out, st.claudeToolCandidates(m.Content, cfg, ts, lineNo)...)
-		}
+		s.enter(id, claudeProvider)
+	}
+	if !s.Started && !ts.IsZero() && (s.StartedAt.IsZero() || ts.Before(s.StartedAt)) {
+		s.StartedAt = ts
 	}
 	return out
+}
+
+// claudeAssistant starts the session at the first record that names its model and advances the
+// record's response: a new response ends the response whose branch it continues (the record
+// follows parent), the record joins its response's branch, its usage replaces the response's, and
+// a stop_reason counts it. A record without a message.id cannot be collapsed with any other, so its
+// usage is counted as it comes.
+func (st *parseState) claudeAssistant(uuid, parent string, m claudeRecordMessage, ts time.Time, lineNo int) []*Candidate {
+	var out []*Candidate
+	if isClaudeModel(m.Model) {
+		out = append(out, st.startSession(m.Model, ts, lineNo)...)
+	}
+	if m.ID == "" {
+		if m.Usage != nil && m.Usage.hasTokens() {
+			out = append(out, st.attribute([]*Candidate{m.Usage.candidate(ts, lineNo, "")})...)
+		}
+		return out
+	}
+	key := idHash(m.ID)
+	if st.carry.claude.Counted.has(key) {
+		return out
+	}
+	i := st.claudeOpenIndex(key)
+	if i < 0 {
+		// A new response is the next request of the branch it follows, which Claude Code sends only
+		// once the branch's previous response finished.
+		out = append(out, st.closeClaudeBranch(parent, lineNo)...)
+		if len(st.carry.claude.Open) == maxOpenClaudeMessages {
+			out = append(out, st.closeClaudeMessage(0, lineNo)...)
+		}
+		st.carry.claude.Open = append(st.carry.claude.Open, claudeMessage{Key: key, ID: joinKeyID(m.ID)})
+		i = len(st.carry.claude.Open) - 1
+	}
+	msg := &st.carry.claude.Open[i]
+	if uuid != "" {
+		msg.Lineage.add(uuid)
+	}
+	if m.Usage != nil {
+		msg.Usage = *m.Usage
+		if !ts.IsZero() {
+			msg.OccurredAt = ts
+		}
+	}
+	if m.finished() {
+		out = append(out, st.closeClaudeMessage(i, lineNo)...)
+	}
+	return out
+}
+
+// hasToolResult reports whether a user record carries tool results: the tool loop continuing, not a
+// turn.
+func hasToolResult(blocks []claudeContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
+// extendClaudeLineage adds a record to the branch of the open response it follows, so the records
+// written after that response (its tool results, their attachments) keep pointing back to it.
+func (st *parseState) extendClaudeLineage(uuid, parent string) {
+	if uuid == "" || parent == "" {
+		return
+	}
+	for i := range st.carry.claude.Open {
+		if msg := &st.carry.claude.Open[i]; msg.Lineage.has(parent) {
+			msg.Lineage.add(uuid)
+		}
+	}
+}
+
+// closeClaudeBranch counts the open response whose branch the record following parent continues.
+// A record that follows no open response's records (a conversation's first record, or one on a
+// concurrent branch) closes nothing.
+func (st *parseState) closeClaudeBranch(parent string, lineNo int) []*Candidate {
+	if parent == "" {
+		return nil
+	}
+	var out []*Candidate
+	for i := 0; i < len(st.carry.claude.Open); {
+		if st.carry.claude.Open[i].Lineage.has(parent) {
+			out = append(out, st.closeClaudeMessage(i, lineNo)...)
+			continue
+		}
+		i++
+	}
+	return out
+}
+
+// claudeOpenIndex returns the index of the open response whose message id hashes to key, or -1.
+func (st *parseState) claudeOpenIndex(key uint64) int {
+	for i, msg := range st.carry.claude.Open {
+		if msg.Key == key {
+			return i
+		}
+	}
+	return -1
+}
+
+// closeClaudeMessages counts every open response, oldest first.
+func (st *parseState) closeClaudeMessages(lineNo int) []*Candidate {
+	var out []*Candidate
+	for len(st.carry.claude.Open) > 0 {
+		out = append(out, st.closeClaudeMessage(0, lineNo)...)
+	}
+	return out
+}
+
+// closeClaudeMessage counts the open response at index i: its id is remembered as counted, and its
+// usage — the last its records reported — becomes one USAGE, at the time of the record that
+// reported it, delivered with the record at lineNo that closed it. A response already counted is
+// not counted again: only damaged cursor state can hold a response that is both open and counted,
+// and its usage went out when it was counted.
+func (st *parseState) closeClaudeMessage(i, lineNo int) []*Candidate {
+	c := &st.carry.claude
+	msg := c.Open[i]
+	c.Open = append(c.Open[:i], c.Open[i+1:]...)
+	if len(c.Open) == 0 {
+		c.Open = nil
+	}
+	if !c.count(msg.Key) || !msg.Usage.hasTokens() {
+		return nil
+	}
+	return st.attribute([]*Candidate{msg.Usage.candidate(msg.OccurredAt, lineNo, msg.ID)})
 }
 
 // claudeContentBlock is one entry of a Claude message.content array. tool_use carries the tool name
@@ -112,11 +282,9 @@ type claudeContentBlock struct {
 	Content   json.RawMessage `json:"content"`     // tool_result (string | content-block array)
 }
 
-// claudeToolCandidates projects a Claude message's tool_use / tool_result content blocks onto the
-// reference-extraction surfaces. message.content is a string for plain turns (no tool blocks) and an
-// array only when the turn carries tools, so a failed array decode is the common no-tool case and
-// yields nothing.
-func (st *parseState) claudeToolCandidates(content json.RawMessage, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
+// claudeBlocks decodes a message.content. It is a string for a plain turn (no blocks) and an array
+// when the turn carries blocks, so a failed array decode is the common plain case and yields none.
+func claudeBlocks(content json.RawMessage) []claudeContentBlock {
 	if len(content) == 0 {
 		return nil
 	}
@@ -124,6 +292,12 @@ func (st *parseState) claudeToolCandidates(content json.RawMessage, cfg Referenc
 	if json.Unmarshal(content, &blocks) != nil {
 		return nil
 	}
+	return blocks
+}
+
+// claudeToolCandidates projects a Claude message's tool_use / tool_result content blocks onto the
+// reference-extraction surfaces.
+func (st *parseState) claudeToolCandidates(blocks []claudeContentBlock, cfg ReferenceConfig, ts time.Time, lineNo int) []*Candidate {
 	var out []*Candidate
 	for _, b := range blocks {
 		switch b.Type {
@@ -179,12 +353,13 @@ func claudeResultText(raw json.RawMessage) string {
 }
 
 // claudeUsage is a Claude message.usage block. Claude splits input into fresh input plus two cache
-// counters; the mapping to the USAGE observation is direct field-for-field.
+// counters; the mapping to the USAGE observation is direct field-for-field. It is persisted with
+// the cursor while its response is open (counts only).
 type claudeUsage struct {
-	InputTokens              *int64 `json:"input_tokens"`
-	OutputTokens             *int64 `json:"output_tokens"`
-	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+	InputTokens              *int64 `json:"input_tokens,omitempty"`
+	OutputTokens             *int64 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens,omitempty"`
 }
 
 // hasTokens reports whether the block carries any real token count, so a metadata-only usage stub
@@ -196,8 +371,8 @@ func (u *claudeUsage) hasTokens() bool {
 
 // candidate projects the block to a PROVIDER_REPORTED USAGE candidate. messageID is the assistant
 // record's provider message.id (msg_…), carried through as the exact-lane spend-join key; it is
-// empty when the record omitted an id (a tail-only or non-standard record), and an empty id stays
-// absent on the observation rather than being fabricated.
+// empty when the record omitted an id, and an empty id stays absent on the observation rather than
+// being fabricated.
 func (u *claudeUsage) candidate(ts time.Time, lineNo int, messageID string) *Candidate {
 	return &Candidate{
 		Kind:       KindUsage,

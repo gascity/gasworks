@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"slices"
 	"sync"
 	"time"
 
@@ -67,14 +69,36 @@ type sessionRunResolver interface {
 	LookupSessionRun(nativeSessionID string) (runID string, found bool)
 }
 
-// transcriptSession is the per-transcript session-threading state.
+// transcriptSession is the per-transcript session-threading state, and what this sink already
+// appended for the transcript. The watcher re-delivers a whole transcript line after a delivery
+// failure part way through it, so the line's leading candidates arrive twice; the appended records
+// let the sink recognize a start or a usage it already made durable, and skip it.
 type transcriptSession struct {
 	nativeID string
 	provider string
-	// emitted is true once a SESSION_LIFECYCLE for nativeID has been appended, so a later duplicate
-	// STARTED for the same session — Claude re-synthesizes the session record on every poll because
-	// its native session id recurs on every envelope — is threaded but not re-appended.
-	emitted bool
+	// started holds the sessions whose SESSION_LIFECYCLE this sink appended for the transcript. It
+	// is set only once the append succeeded, so a start whose append failed is appended on the retry
+	// — the start is the only record that carries the session's model.
+	started map[string]bool
+	// usage holds the message ids of the last usageMemory USAGE observations this sink appended for
+	// the transcript, as hashes. A message id names one response, which the parser counts once per
+	// transcript, so a second USAGE with the same id is that response re-delivered.
+	usage []uint64
+}
+
+// usageMemory bounds the appended usage message ids kept per transcript. A re-delivery repeats at
+// most one transcript line's candidates, which never hold more than a few usage atoms.
+const usageMemory = 32
+
+// usageKey hashes a USAGE candidate's message id; ok is false for usage without one (a legacy
+// Codex token_count, a record without an id), which can never be recognized as re-delivered.
+func usageKey(cand *codex.Candidate) (key uint64, ok bool) {
+	if cand.Kind != codex.KindUsage || cand.Usage == nil || cand.Usage.MessageID == "" {
+		return 0, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(cand.Usage.MessageID))
+	return h.Sum64(), true
 }
 
 // transcriptIdentity keys the per-transcript session-threading state by filesystem identity
@@ -144,11 +168,11 @@ func (a *CandidateSinkAdapter) DeliverCandidates(ctx context.Context, ref codex.
 		if cand == nil {
 			continue
 		}
-		native, provider, suppress := a.resolveSession(ref, cand)
-		if suppress {
-			// A duplicate SESSION_LIFECYCLE re-synthesized for an already-recorded native session
-			// (Claude emits its session record on every poll). It is threaded but not re-appended;
-			// re-reading the batch would only re-suppress it, so it is safely treated as delivered.
+		native, provider, appended := a.resolveSession(ref, cand)
+		if appended {
+			// A start or usage this sink already made durable, re-delivered with a line re-read after
+			// a partial delivery failure. Re-reading the batch would only skip it again, so it is
+			// safely treated as delivered.
 			continue
 		}
 		if provider == "" {
@@ -179,21 +203,47 @@ func (a *CandidateSinkAdapter) DeliverCandidates(ctx context.Context, ref codex.
 		if _, err := a.client.CaptureObservation(ctx, res.Observation); err != nil {
 			return fmt.Errorf("observer daemon: deliver candidate to daemon: %w", err)
 		}
+		a.recordAppended(ref, cand, native)
 	}
 	return nil
 }
 
+// recordAppended remembers a start or a usage that was just made durable for the transcript (see
+// transcriptSession).
+func (a *CandidateSinkAdapter) recordAppended(ref codex.TranscriptRef, cand *codex.Candidate, native string) {
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	s := a.sessions[transcriptIdentity{device: ref.Device, inode: ref.Inode}]
+	if s == nil {
+		return
+	}
+	if cand.Kind == codex.KindSessionLifecycle && native != "" {
+		if s.started == nil {
+			s.started = map[string]bool{}
+		}
+		s.started[native] = true
+	}
+	if key, ok := usageKey(cand); ok {
+		s.usage = append(s.usage, key)
+		if len(s.usage) > usageMemory {
+			s.usage = s.usage[len(s.usage)-usageMemory:]
+		}
+	}
+}
+
 // resolveSession resolves the native session id and provider to stamp onto one candidate, and
-// reports whether the candidate is a duplicate SESSION_LIFECYCLE to suppress. A SESSION_LIFECYCLE
+// reports whether the candidate was already appended (see transcriptSession). A SESSION_LIFECYCLE
 // candidate carries its own id and provider: they are recorded for the transcript and returned so
-// the session observation itself is stamped — unless the same native id was already appended for
-// this transcript, in which case suppress is true (a re-synthesized STARTED, e.g. Claude's per-poll
-// session record). Every other candidate from the same transcript inherits the recorded id and
-// provider, so a USAGE record (which has neither field) resolves to the same SyntheticRunID as the
-// session and its tokens sum into that run's totals. A candidate delivered before the transcript's
-// session record has been seen — or a watcher-scoped diagnostic on a zero-value ref — resolves to
-// empty strings and is stamped unchanged (provider then falls back to the sink default).
-func (a *CandidateSinkAdapter) resolveSession(ref codex.TranscriptRef, cand *codex.Candidate) (native, provider string, suppress bool) {
+// the session observation itself is stamped. A candidate the parser attributed to a session
+// (codex.Candidate.Session, from the transcript's persisted parse state) is stamped with it and
+// records it for the transcript, so attribution holds after a daemon restart, when this threading
+// starts empty while the cursor resumes past the session's start. Every other candidate from the
+// same transcript inherits the recorded id and provider, so a USAGE record without a session of its
+// own resolves to the same SyntheticRunID as the session and its tokens sum into that run's totals.
+// A candidate delivered before the transcript's session record has been seen — or a
+// watcher-scoped diagnostic on a zero-value ref — resolves to empty strings and is stamped
+// unchanged (provider then falls back to the sink default).
+func (a *CandidateSinkAdapter) resolveSession(ref codex.TranscriptRef, cand *codex.Candidate) (native, provider string, appended bool) {
 	key := transcriptIdentity{device: ref.Device, inode: ref.Inode}
 	a.sessionMu.Lock()
 	defer a.sessionMu.Unlock()
@@ -202,19 +252,22 @@ func (a *CandidateSinkAdapter) resolveSession(ref codex.TranscriptRef, cand *cod
 		s = &transcriptSession{}
 		a.sessions[key] = s
 	}
+	if h, ok := usageKey(cand); ok && slices.Contains(s.usage, h) {
+		return s.nativeID, s.provider, true
+	}
 	if cand.Kind == codex.KindSessionLifecycle && cand.SessionLifecycle != nil && cand.SessionLifecycle.NativeSessionID != "" {
 		id := cand.SessionLifecycle.NativeSessionID
-		prov := cand.SessionLifecycle.Provider
-		if s.emitted && s.nativeID == id {
-			// Same session, already appended: thread the recorded values but suppress the re-append.
-			return id, orString(prov, s.provider), true
-		}
 		s.nativeID = id
-		if prov != "" {
+		if prov := cand.SessionLifecycle.Provider; prov != "" {
 			s.provider = prov
 		}
-		s.emitted = true
-		return id, s.provider, false
+		return id, s.provider, s.started[id]
+	}
+	if attributed := cand.Session; attributed != nil && attributed.NativeID != "" {
+		if s.nativeID != attributed.NativeID {
+			s.nativeID, s.provider = attributed.NativeID, attributed.Provider
+		}
+		return attributed.NativeID, orString(attributed.Provider, s.provider), false
 	}
 	return s.nativeID, s.provider, false
 }
