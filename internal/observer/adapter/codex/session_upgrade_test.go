@@ -4,10 +4,12 @@ package codex
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -169,5 +171,63 @@ func TestCursorUpgradeMidOverflowStillRecoversTheSession(t *testing.T) {
 	usages := usageCands(cands)
 	if len(usages) != 1 || usages[0].Session == nil || usages[0].Session.NativeID != claudeTestSession {
 		t.Fatalf("usages = %s, want msg_B attributed to %s", describeUsages(usages), claudeTestSession)
+	}
+}
+
+// TestWatcherPersistsTheUpgradeDerivationOfAQuietTranscript covers the transcripts an upgrade meets
+// most: finished ones the earlier build consumed whole and nobody writes again. Their derived
+// session state must reach disk on the first start, or every later daemon start re-reads each of
+// them to the end. Two starts over the same earlier-build cursor: the first derives and persists,
+// and the second finds nothing left to derive.
+func TestWatcherPersistsTheUpgradeDerivationOfAQuietTranscript(t *testing.T) {
+	root, state := t.TempDir(), t.TempDir()
+	p := filepath.Join(root, "session.jsonl")
+	data := claudeStreamedSession()
+	writeFileString(t, p, data)
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	dev, ino, _ := fileIdentityOf(info)
+	seedSessionlessCursor(t, state, dev, ino, []byte(data), len(data), false)
+	// The earlier build persisted the live mtime it observed; nothing has written the file since.
+	raw, err := os.ReadFile(cursorStatePath(state, dev, ino))
+	if err != nil {
+		t.Fatalf("read seed: %v", err)
+	}
+	var seed persistedCursor
+	if err := json.Unmarshal(raw, &seed); err != nil {
+		t.Fatalf("decode seed: %v", err)
+	}
+	seed.ModNanos = info.ModTime().UnixNano()
+	if raw, err = json.Marshal(seed); err != nil {
+		t.Fatalf("encode seed: %v", err)
+	}
+	if err := os.WriteFile(cursorStatePath(state, dev, ino), raw, 0o600); err != nil {
+		t.Fatalf("rewrite seed: %v", err)
+	}
+
+	for start := 1; start <= 2; start++ {
+		sink := &recordingSink{}
+		w := mustWatcher(t, WatchConfig{ApprovedRoots: []string{root}, StateDir: state, Sink: sink})
+		if err := w.Poll(context.Background()); err != nil {
+			t.Fatalf("start %d: Poll: %v", start, err)
+		}
+		if n := len(sink.all()); n != 0 {
+			t.Fatalf("start %d delivered %d candidates for a transcript the earlier build consumed whole", start, n)
+		}
+		c, err := LoadCursor(state, dev, ino, info.Size(), info.ModTime().UnixNano(), 0)
+		if err != nil {
+			t.Fatalf("start %d: LoadCursor: %v", start, err)
+		}
+		if c.NeedsCarryDerivation() {
+			t.Fatalf("after start %d the derived state is not on disk: the next start re-reads all %d consumed bytes", start, len(data))
+		}
+		if c.carry.session.NativeID != claudeTestSession || !c.carry.session.Started {
+			t.Fatalf("after start %d the persisted session is %+v, want %s started", start, c.carry.session, claudeTestSession)
+		}
+		if !c.carry.claude.Counted.has(idHash("msg_A")) || !c.carry.claude.Counted.has(idHash("msg_B")) {
+			t.Fatalf("after start %d the responses the earlier build counted are not persisted as counted", start)
+		}
 	}
 }

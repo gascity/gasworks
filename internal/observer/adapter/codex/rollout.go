@@ -200,14 +200,16 @@ func foldUpgradeLine(line []byte, fold *upgradeFold, metaSeen *bool, withRollout
 	}
 	if probe.SessionIDCamel != "" && len(probe.Payload) == 0 {
 		if fold.session.NativeID != probe.SessionIDCamel {
-			fold.session = sessionCarry{NativeID: probe.SessionIDCamel, Provider: claudeProvider, Started: true}
+			// The earlier build emitted a start each time its buffers moved to another session.
+			fold.session.enter(probe.SessionIDCamel, claudeProvider)
+			fold.session.markStarted()
 		}
 		if probe.Type == "assistant" && len(probe.Message) > 0 {
 			var m struct {
 				ID string `json:"id"`
 			}
 			if json.Unmarshal(probe.Message, &m) == nil && m.ID != "" {
-				fold.counted.add(idHash(m.ID))
+				_ = fold.counted.add(idHash(m.ID))
 			}
 		}
 	}
@@ -222,7 +224,8 @@ func foldUpgradeLine(line []byte, fold *upgradeFold, metaSeen *bool, withRollout
 			return
 		}
 		*metaSeen = true
-		fold.session = sessionCarry{NativeID: meta.ID, Provider: rolloutProvider, StartedAt: probe.probeTime(), Started: true}
+		fold.session = sessionCarry{NativeID: meta.ID, Provider: rolloutProvider, StartedAt: probe.probeTime()}
+		fold.session.markStarted()
 		if withRollout && writesUsageRecords(meta.CLIVersion) {
 			carry.RecordMode = true
 		}

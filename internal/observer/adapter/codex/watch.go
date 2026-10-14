@@ -939,7 +939,7 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 // The floor removal is only marked dirty here; flushPolicyControls persists it once per root per
 // poll instead of once per identity.
 func (w *Watcher) releaseTracked(key identityKey, tf *trackedFile) {
-	_ = os.Remove(tf.cursor.StatePath())
+	removeCursorState(tf.cursor.StatePath())
 	if tf.policy != nil && tf.forwardBaseline {
 		// Orphan any live fence still NAMING this identity before its floor is dropped. Releasing the
 		// identity frees its inode number, and a fence that kept naming that number would grant a later,
@@ -988,7 +988,7 @@ func (w *Watcher) sweepActivationBaselines(policy *rootPolicyState, scan *rootSc
 		// The evicted identity is corroborated gone, so nothing live loses a cursor here; dropping it on
 		// the same evidence as the floor keeps a reused inode number from resuming a stranger's sealed
 		// position instead of being captured from its own byte zero.
-		_ = os.Remove(cursorStatePath(scopedDir, id.dev, id.ino))
+		removeCursorState(cursorStatePath(scopedDir, id.dev, id.ino))
 	}
 }
 
@@ -1349,10 +1349,15 @@ func (w *Watcher) drain(ctx context.Context, tf *trackedFile) error {
 		}
 	}
 
-	// A cursor resumed from a pre-#91 state has an offset but no usage carry: derive it from the
-	// consented bytes it already consumed before parsing past them.
+	// A cursor resumed from an older release's state lacks part of its carry: derive it from the
+	// consented bytes it already consumed before parsing past them, and persist it at once. A
+	// transcript that is never written again commits nothing else, and without this save every
+	// later daemon start would derive it again.
 	if tf.cursor.NeedsCarryDerivation() {
 		if err := w.deriveUpgradeCarry(f, tf); err != nil {
+			return err
+		}
+		if err := tf.cursor.Save(); err != nil {
 			return err
 		}
 	}

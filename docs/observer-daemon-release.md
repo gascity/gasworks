@@ -322,8 +322,18 @@ response's usage a little later than before. A session that stopped mid-response
 its transcript has been quiet for an hour.
 
 On the first drain after rolling forward, the daemon reads the bytes each tracked transcript
-already consumed, once. For Codex it reads only up to the first `session_meta`. Expect a burst of
-read I/O proportional to the tracked Claude transcripts.
+already consumed, once, and saves what it derived. For Codex it reads only up to the first
+`session_meta`. Expect a burst of read I/O on the first start, proportional to the tracked Claude
+transcripts. Later starts do not repeat it.
+
+The cursor directory gains a `codex-cursor-<dev>-<ino>.counted` file next to each Claude
+transcript's cursor. It holds the counted response ids: 8 bytes per response, appended as
+responses are counted. Keep it with its cursor. Deleting both restarts that transcript from byte
+zero, as deleting a cursor always did.
+
+A transcript that never names a model and never reports usage is no longer content-uploaded. Its
+observations name no session to key the snapshot by. A new transcript is uploaded after its first
+model record, a few seconds later than before.
 
 See [observer-usage-message-id.md](./observer-usage-message-id.md) for the exact rules and the
 one-time effects on transcripts captured before the roll.

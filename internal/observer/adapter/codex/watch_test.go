@@ -477,8 +477,9 @@ func TestWatcherInPlaceRewriteGrowsPastOffsetReReads(t *testing.T) {
 	}
 }
 
-// TestWatcherStateFileGCdOnDeparture proves the durable state file is removed when its identity
-// leaves the roots, so a later file reusing that (device,inode) cannot resurrect a stale cursor.
+// TestWatcherStateFileGCdOnDeparture proves the durable state files — the cursor and its
+// counted-id sidecar — are removed when their identity leaves the roots, so a later file reusing
+// that (device,inode) cannot resurrect a stale cursor.
 func TestWatcherStateFileGCdOnDeparture(t *testing.T) {
 	ctx := context.Background()
 	root, state := t.TempDir(), t.TempDir()
@@ -486,15 +487,17 @@ func TestWatcherStateFileGCdOnDeparture(t *testing.T) {
 	sink := &recordingSink{}
 	w := mustWatcher(t, WatchConfig{ApprovedRoots: []string{root}, StateDir: state, Sink: sink})
 
-	writeFileString(t, p, msgLine("a")+"\n")
+	writeFileString(t, p, claudeAssistant(claudeTestSession, at(0), "msg_A", "claude-opus-5-5", "end_turn", claudeUsageJSON{2, 9, 50, 0}, "text"))
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("poll 1: %v", err)
 	}
 	info, _ := os.Stat(p)
 	dev, ino, _ := fileIdentityOf(info)
 	sp := cursorStatePath(state, dev, ino)
-	if _, err := os.Stat(sp); err != nil {
-		t.Fatalf("state file should exist after tracking: %v", err)
+	for _, f := range []string{sp, countedPath(sp)} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("state file should exist after tracking: %v", err)
+		}
 	}
 
 	if err := os.Remove(p); err != nil {
@@ -511,8 +514,10 @@ func TestWatcherStateFileGCdOnDeparture(t *testing.T) {
 	if err := w.Poll(ctx); err != nil {
 		t.Fatalf("poll 3: %v", err)
 	}
-	if _, err := os.Stat(sp); !os.IsNotExist(err) {
-		t.Fatalf("departed identity's state file must be GC'd; stat err=%v", err)
+	for _, f := range []string{sp, countedPath(sp)} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Fatalf("departed identity's state file %s must be GC'd; stat err=%v", filepath.Base(f), err)
+		}
 	}
 }
 

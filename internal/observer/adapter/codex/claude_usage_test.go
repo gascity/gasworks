@@ -609,3 +609,28 @@ func TestClaudeCompactionBoundaryContinuesTheBranch(t *testing.T) {
 		linked(claudeAssistant(claudeTestSession, at(time.Minute+time.Second), "msg_B", "claude-opus-5-5", "", claudeUsageJSON{2, 3, 4000, 0}, "thinking"), "r3", "c1")
 	assertClaudeUsages(t, "compaction", ingestPolls(t, []string{data}, false), []claudeUsageWant{{"msg_A", 2, 4, 500, 9000}})
 }
+
+// TestClaudeReturningToASessionDoesNotStartItAgain covers a transcript that moves to another session
+// and back (A, then B, then A): A was already started in this transcript, so the return emits no
+// second start for it — across poll splits and daemon restarts, when the sink no longer remembers
+// having appended it — while its usage stays attributed to A.
+func TestClaudeReturningToASessionDoesNotStartItAgain(t *testing.T) {
+	const other = "5e551011-0000-4000-8000-0000000000bb"
+	data := claudeAssistant(claudeTestSession, at(0), "msg_A1", "claude-opus-5-5", "end_turn", claudeUsageJSON{2, 9, 50, 0}, "text") +
+		claudeAssistant(other, at(time.Minute), "msg_B1", "claude-haiku-5", "end_turn", claudeUsageJSON{1, 4, 0, 50}, "text") +
+		claudeAssistant(claudeTestSession, at(2*time.Minute), "msg_A2", "claude-opus-5-5", "end_turn", claudeUsageJSON{2, 7, 0, 60}, "text")
+	for _, restart := range []bool{false, true} {
+		for _, polls := range everySplit(data) {
+			label := fmt.Sprintf("split at %d (restart=%v)", len(polls[0]), restart)
+			cands := ingestPolls(t, polls, restart)
+			starts := sessionStarts(cands)
+			if len(starts) != 2 || starts[0].SessionLifecycle.NativeSessionID != claudeTestSession || starts[1].SessionLifecycle.NativeSessionID != other {
+				t.Fatalf("%s: %d starts, want one for each session", label, len(starts))
+			}
+			usages := usageCands(cands)
+			if len(usages) != 3 || usages[2].Usage.MessageID != "msg_A2" || usages[2].Session == nil || usages[2].Session.NativeID != claudeTestSession {
+				t.Fatalf("%s: usages = %s, want msg_A2 attributed to the session it returned to", label, describeUsages(usages))
+			}
+		}
+	}
+}

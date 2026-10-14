@@ -31,6 +31,7 @@ type transcriptCarry struct {
 // and its commit runs.
 func (c transcriptCarry) clone() transcriptCarry {
 	c.claude = c.claude.clone()
+	c.session.Sessions = slices.Clone(c.session.Sessions)
 	return c
 }
 
@@ -47,6 +48,31 @@ type sessionCarry struct {
 	StartedAt time.Time `json:"started_at,omitzero"`
 	// Started is set once the session's SESSION_LIFECYCLE start was emitted.
 	Started bool `json:"started,omitempty"`
+	// Sessions are the sessions whose start this transcript emitted, NativeID's included, oldest
+	// first: a transcript that moves to another session and back does not start the first again.
+	Sessions []string `json:"started_sessions,omitempty"`
+}
+
+// maxStartedSessions bounds sessionCarry.Sessions. A transcript names more than two sessions only
+// when a conversation is resumed into it repeatedly.
+const maxStartedSessions = 16
+
+// enter moves the transcript to session id of provider. A session it started before resumes
+// started; any other waits for its own start.
+func (s *sessionCarry) enter(id, provider string) {
+	*s = sessionCarry{NativeID: id, Provider: provider, Started: slices.Contains(s.Sessions, id), Sessions: s.Sessions}
+}
+
+// markStarted records that the current session's start went out.
+func (s *sessionCarry) markStarted() {
+	s.Started = true
+	if slices.Contains(s.Sessions, s.NativeID) {
+		return
+	}
+	s.Sessions = append(s.Sessions, s.NativeID)
+	if len(s.Sessions) > maxStartedSessions {
+		s.Sessions = slices.Delete(s.Sessions, 0, len(s.Sessions)-maxStartedSessions)
+	}
 }
 
 // SessionRef names the native session a candidate belongs to.
@@ -80,8 +106,12 @@ type claudeCarry struct {
 	Open []claudeMessage `json:"open,omitempty"`
 	// Counted holds every message id the transcript has already counted, so no later record of a
 	// counted response — a trailing content block, or a copy of the whole history that a resumed
-	// agent writes back into its transcript — is counted again.
-	Counted messageIDSet `json:"counted,omitempty"`
+	// agent writes back into its transcript — is counted again. It grows with the transcript, so the
+	// cursor keeps it out of its state file, in an append-only sidecar (see Cursor.Save).
+	Counted messageIDSet `json:"-"`
+	// Unsaved are the ids Counted gained since the cursor last saved, in the order they were
+	// counted: what the next save appends to the sidecar.
+	Unsaved []uint64 `json:"-"`
 }
 
 func (c claudeCarry) clone() claudeCarry {
@@ -93,7 +123,16 @@ func (c claudeCarry) clone() claudeCarry {
 	if len(open) == 0 {
 		open = nil
 	}
-	return claudeCarry{Open: open, Counted: slices.Clone(c.Counted)}
+	return claudeCarry{Open: open, Counted: slices.Clone(c.Counted), Unsaved: slices.Clone(c.Unsaved)}
+}
+
+// count records a response as counted, reporting whether it was not yet.
+func (c *claudeCarry) count(key uint64) bool {
+	if !c.Counted.add(key) {
+		return false
+	}
+	c.Unsaved = append(c.Unsaved, key)
+	return true
 }
 
 // claudeMessage is one Claude response (one message.id) whose usage is not counted yet.
@@ -133,24 +172,13 @@ func (s messageIDSet) has(key uint64) bool {
 	return found
 }
 
-func (s *messageIDSet) add(key uint64) {
-	if i, found := slices.BinarySearch(*s, key); !found {
+// add inserts key, reporting whether it was not in the set yet.
+func (s *messageIDSet) add(key uint64) bool {
+	i, found := slices.BinarySearch(*s, key)
+	if !found {
 		*s = slices.Insert(*s, i, key)
 	}
-}
-
-// MarshalJSON persists the set as base64 of its big-endian hashes.
-func (s messageIDSet) MarshalJSON() ([]byte, error) { return marshalHashes(s) }
-
-// UnmarshalJSON restores a set persisted by MarshalJSON.
-func (s *messageIDSet) UnmarshalJSON(data []byte) error {
-	set, err := unmarshalHashes(data)
-	if err != nil {
-		return fmt.Errorf("counted message ids: %w", err)
-	}
-	slices.Sort(set)
-	*s = slices.Compact(set)
-	return nil
+	return !found
 }
 
 // recordTrail is a bounded list of record uuids, kept as their hashes, newest last.
@@ -217,7 +245,7 @@ func (st *parseState) startSession(model string, ts time.Time, lineNo int) []*Ca
 	if s.Started || s.NativeID == "" {
 		return nil
 	}
-	s.Started = true
+	s.markStarted()
 	at := s.StartedAt
 	if at.IsZero() {
 		at = ts

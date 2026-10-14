@@ -57,3 +57,15 @@ func TestWatcherSettlesOpenClaudeUsageOnceTheTranscriptGoesQuiet(t *testing.T) {
 		t.Fatalf("a late record of a settled message was counted again: %s", describeUsages(got))
 	}
 }
+
+// TestOpenUsageSettleOutlastsAStreamingResponse pins the floor under openUsageSettle. A response
+// is counted at the settle with the usage it has, and nothing after that can correct it, so the
+// settle must outlast the longest wait between two records of one streaming response — the longest
+// seen across 230k such gaps in real transcripts was 7m49s. Thirty minutes keeps a wide margin; the
+// settle test above only advances the fake clock by the constant, so it would pass any value.
+func TestOpenUsageSettleOutlastsAStreamingResponse(t *testing.T) {
+	const longestObservedGap = 7*time.Minute + 49*time.Second
+	if floor := 30 * time.Minute; openUsageSettle < floor {
+		t.Fatalf("openUsageSettle = %v; a response still streaming (gaps up to %v seen) would be counted with partial usage — keep it at least %v", openUsageSettle, longestObservedGap, floor)
+	}
+}

@@ -126,8 +126,8 @@ func (st *parseState) parseClaudeLine(probe formatProbe, lineNo int, cfg Referen
 
 // enterClaudeSession moves the transcript to the session a record names. Records of a new session
 // end every response of the previous one, which are counted under it; the new session then waits
-// for its own model to start. Until the start goes out, the session's earliest record time is kept
-// as its start time.
+// for its own model to start, unless the transcript started it before (a return to an earlier
+// session). Until the start goes out, the session's earliest record time is kept as its start time.
 func (st *parseState) enterClaudeSession(id string, ts time.Time, lineNo int) []*Candidate {
 	s := &st.carry.session
 	var out []*Candidate
@@ -135,7 +135,7 @@ func (st *parseState) enterClaudeSession(id string, ts time.Time, lineNo int) []
 		if s.NativeID != "" {
 			out = st.closeClaudeMessages(lineNo)
 		}
-		*s = sessionCarry{NativeID: id, Provider: claudeProvider}
+		s.enter(id, claudeProvider)
 	}
 	if !s.Started && !ts.IsZero() && (s.StartedAt.IsZero() || ts.Before(s.StartedAt)) {
 		s.StartedAt = ts
@@ -261,7 +261,7 @@ func (st *parseState) closeClaudeMessage(i, lineNo int) []*Candidate {
 	if len(c.Open) == 0 {
 		c.Open = nil
 	}
-	c.Counted.add(msg.Key)
+	c.count(msg.Key)
 	if !msg.Usage.hasTokens() {
 		return nil
 	}

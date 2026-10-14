@@ -142,9 +142,18 @@ hook message) is not a turn. A record on another branch, such as the first
 record of a history that a resumed agent copies back into its transcript,
 does not close the response either.
 
-Each counted `message.id` is remembered for the transcript (as an 8-byte
-hash in the cursor state), so no record of a counted response is counted
-again. This includes a resumed agent's copy of its whole history.
+Each counted `message.id` is remembered for the transcript, so no record of a
+counted response is counted again. This includes a resumed agent's copy of its
+whole history. The ids are kept as 8-byte hashes in a sidecar next to the
+transcript's cursor (`codex-cursor-<dev>-<ino>.counted`). Each save appends
+only the ids counted since the previous save, then writes the cursor state,
+which records how many of them it owns. If the daemon stops between the two,
+the cursor resumes from its previous offset with its previous count, so the
+counted set always matches the bytes the cursor has consumed. As before, a
+stop between delivering a poll and saving it re-delivers that poll. The set
+grows with the transcript. On the largest local transcripts (a few thousand
+responses each), rewriting the whole set with every save wrote about 16 times
+as much as appending does.
 
 A record without a `message.id` cannot be collapsed. Its usage is emitted as
 it comes, without `message_id`. An id that is too long or malformed to carry
@@ -180,11 +189,24 @@ If usage does arrive before any record named the model, the start is emitted
 right before it, without a model, and the platform withholds that session's
 price rather than guess the model.
 
+A transcript that moves to another `sessionId` and back (A, then B, then A)
+starts each session once. The cursor remembers which sessions it started, so a
+return to A emits no second start, even across a restart.
+
+The content side channel keys a transcript's snapshot by the session its
+observations name, so it learns a transcript only once that transcript has
+emitted something. Two consequences:
+
+- A transcript that never names a model and never reports usage is not
+  uploaded. Earlier builds uploaded it under a start without a model.
+- A new transcript's content is uploaded once its first model record has been
+  read, a few seconds after its first records.
+
 Every observation parsed out of a transcript after its start also carries the
-session from the cursor's persisted state, diagnostics included. A daemon restart therefore keeps
-attributing a transcript's later usage to its session. Before, the restarted
-daemon re-emitted Claude starts (often without a model) and left Codex usage
-without a session.
+session from the cursor's persisted state, diagnostics included. A daemon
+restart therefore keeps attributing a transcript's later usage to its session.
+Before, the restarted daemon re-emitted Claude starts (often without a model)
+and left Codex usage without a session.
 
 Observations parsed out of a transcript carry `provenance.parser_version`
 (`codex-transcript-v2` from this change). The Codex SessionStart hook's start
@@ -203,7 +225,9 @@ consumed, once. It never reads before a forward-only floor.
 
 It takes the transcript's session as already started, because the earlier
 build emitted its start. The earlier build also counted every Claude record it
-consumed, so every response in those bytes is marked as counted.
+consumed, so every response in those bytes is marked as counted. The derived
+state is saved straight away, so a finished transcript that is never written
+again is read once, not on every later start.
 
 The effects are confined to transcripts captured before the upgrade:
 
