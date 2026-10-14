@@ -127,8 +127,8 @@ func TestSinkThreadsProviderPerTranscript(t *testing.T) {
 }
 
 // TestSinkDeDupsSessionLifecycle proves the sink appends a transcript's SESSION_LIFECYCLE exactly
-// once even when the parser re-synthesizes it every poll (Claude's session id recurs on every
-// envelope, so its STARTED record is re-emitted). Duplicates are threaded but not re-appended.
+// once even when the same STARTED record is delivered again (a batch re-read after a partial
+// delivery failure re-delivers its line's start). Duplicates are threaded but not re-appended.
 func TestSinkDeDupsSessionLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	w := newSpoolWriter(t, dir)
@@ -138,7 +138,7 @@ func TestSinkDeDupsSessionLifecycle(t *testing.T) {
 
 	const nativeID = "claude-sess-dedup"
 	ref := codex.TranscriptRef{Locator: "projects/claude.jsonl", Device: 9, Inode: 91}
-	// The same STARTED session record delivered across three "polls".
+	// The same STARTED session record delivered three times.
 	deliver(t, sink, ref, sessionCandidateProvider(nativeID, "claude", "claude-opus-4-8"))
 	deliver(t, sink, ref, sessionCandidateProvider(nativeID, "claude", "claude-opus-4-8"))
 	deliver(t, sink, ref, sessionCandidateProvider(nativeID, "claude", "claude-opus-4-8"))
@@ -167,6 +167,50 @@ func TestSinkDeDupsSessionLifecycle(t *testing.T) {
 	}
 	if usages != 1 {
 		t.Fatalf("USAGE observations = %d, want 1", usages)
+	}
+}
+
+// TestSinkStampsTheParsersSessionWithoutThreading is the restart half of the attribution fix: after a
+// daemon restart the sink's in-memory threading is empty while the cursor resumes mid-transcript,
+// past the session's start. The parser stamps each candidate with the session from the cursor's
+// persisted state, and the sink must take it as provenance — and record it for the content side
+// channel — without having appended that session's start itself.
+func TestSinkStampsTheParsersSessionWithoutThreading(t *testing.T) {
+	dir := t.TempDir()
+	w := newSpoolWriter(t, dir)
+	srv := startDaemonServer(t, dir, w, NewRegistry("src_test", "ws_main"))
+	sink := newSink(t, local.NewClient(srv.SocketPath())) // fresh: nothing threaded, default provider codex
+
+	ref := codex.TranscriptRef{Locator: "projects/p/agent.jsonl", Device: 8, Inode: 82}
+	usage := usageCandidate(700, 90)
+	usage.Session = &codex.SessionRef{NativeID: "claude-sess-resumed", Provider: "claude"}
+	deliver(t, sink, ref, usage)
+
+	usages := decodeUsageObservations(t, dir)
+	if len(usages) != 1 {
+		t.Fatalf("USAGE observations = %d, want 1", len(usages))
+	}
+	if nativeOf(usages[0]) != "claude-sess-resumed" || usages[0].Provenance.Provider == nil || *usages[0].Provenance.Provider != "claude" {
+		t.Fatalf("usage provenance = %q/%v, want claude-sess-resumed/claude", nativeOf(usages[0]), usages[0].Provenance.Provider)
+	}
+	if native, provider, ok := sink.SessionFor(8, 82); !ok || native != "claude-sess-resumed" || provider != "claude" {
+		t.Fatalf("SessionFor = %q/%q/%v, want the parser's session for the content side channel", native, provider, ok)
+	}
+
+	// The sink never appended this session's start, so a start it is later handed is appended.
+	deliver(t, sink, ref, sessionCandidateProvider("claude-sess-resumed", "claude", "claude-opus-5-5"))
+	starts := 0
+	for _, fr := range readWAL(t, dir) {
+		var obs wire.Observation
+		if err := obs.UnmarshalJSON(fr.Payload); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if kind, _ := obs.Discriminator(); kind == string(wire.ObservationEnvelopeKindSESSIONLIFECYCLE) {
+			starts++
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("SESSION_LIFECYCLE observations = %d, want 1", starts)
 	}
 }
 
@@ -230,5 +274,73 @@ func TestRegistryBindSessionLookup(t *testing.T) {
 	reg.BindSession("sess-b", "")
 	if _, ok := reg.LookupSessionRun("sess-b"); ok {
 		t.Fatalf("empty run bound a session; want ignored")
+	}
+}
+
+// TestSinkRedeliveredLineAppendsEachRecordOnce covers the watcher's retry after a delivery failure
+// part way through one transcript line: it re-delivers the whole line, so the line's leading
+// candidates arrive twice. Each start and each usage must end up durable exactly once — including a
+// start whose own append failed, which carries the session's model and must not be lost.
+func TestSinkRedeliveredLineAppendsEachRecordOnce(t *testing.T) {
+	usage := func(session, messageID string, input int64) *codex.Candidate {
+		c := usageCandidate(input, 1)
+		c.Usage.MessageID = messageID
+		c.Session = &codex.SessionRef{NativeID: session, Provider: "claude"}
+		return c
+	}
+	cases := map[string]struct {
+		line                   []*codex.Candidate
+		failAppend             int
+		wantStarts, wantUsages int
+	}{
+		"the start's own append failed": {
+			line:       []*codex.Candidate{sessionCandidateProvider("sess-S", "claude", "claude-opus-5-5"), usage("sess-S", "msg_1", 10)},
+			failAppend: 1, wantStarts: 1, wantUsages: 1,
+		},
+		"failure between two usage atoms of one line": {
+			line:       []*codex.Candidate{usage("sess-S", "msg_A", 10), usage("sess-S", "msg_B", 20)},
+			failAppend: 2, wantStarts: 0, wantUsages: 2,
+		},
+		"a session switch line": {
+			line:       []*codex.Candidate{usage("sess-X", "msg_X", 10), sessionCandidateProvider("sess-Y", "claude", "claude-opus-5-5"), usage("sess-Y", "msg_Y", 20)},
+			failAppend: 3, wantStarts: 1, wantUsages: 2,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			spool := &failOnNthSpool{inner: newSpoolWriter(t, dir), n: tc.failAppend}
+			srv := startDaemonServer(t, dir, spool, NewRegistry("src_test", "ws_main"))
+			sink := NewPartialCandidateSinkAdapter(newSink(t, local.NewClient(srv.SocketPath())))
+			ref := codex.TranscriptRef{Locator: "projects/p/s.jsonl", Device: 5, Inode: 55}
+			if _, err := sink.DeliverCandidatesPartial(context.Background(), ref, tc.line); err == nil {
+				t.Fatal("the injected append failure was not reported")
+			}
+			if n, err := sink.DeliverCandidatesPartial(context.Background(), ref, tc.line); err != nil || n != len(tc.line) {
+				t.Fatalf("re-delivery = %d, %v; want the whole line delivered", n, err)
+			}
+			starts, usages := 0, map[string]int{}
+			for _, fr := range readWAL(t, dir) {
+				var obs wire.Observation
+				if err := obs.UnmarshalJSON(fr.Payload); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				switch kind, _ := obs.Discriminator(); kind {
+				case string(wire.ObservationEnvelopeKindSESSIONLIFECYCLE):
+					starts++
+				case string(wire.ObservationEnvelopeKindUSAGE):
+					u, _ := obs.AsUsageObservation()
+					usages[*u.Usage.MessageId]++
+				}
+			}
+			if starts != tc.wantStarts || len(usages) != tc.wantUsages {
+				t.Fatalf("durable: %d starts, usages %v; want %d starts and %d distinct usages", starts, usages, tc.wantStarts, tc.wantUsages)
+			}
+			for id, n := range usages {
+				if n != 1 {
+					t.Fatalf("usage %s appended %d times", id, n)
+				}
+			}
+		})
 	}
 }

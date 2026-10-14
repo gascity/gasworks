@@ -311,6 +311,23 @@ always-on content guard (secret-filename denylist, per-provider transcript-shape
 PEM/PKCS key sniff) working as designed, but it can refuse a file that previously uploaded.
 Read the refusals on day one.
 
+New with `parser_version` `codex-transcript-v2`:
+
+- USAGE atoms are one per Claude response, not one per transcript record.
+- Codex `input_tokens` excludes cached input.
+- A transcript's start carries its model.
+
+A Claude response's usage is emitted when the response finishes, so a session shows its latest
+response's usage a little later than before. A session that stopped mid-response shows it once
+its transcript has been quiet for an hour.
+
+On the first drain after rolling forward, the daemon reads the bytes each tracked transcript
+already consumed, once. For Codex it reads only up to the first `session_meta`. Expect a burst of
+read I/O proportional to the tracked Claude transcripts.
+
+See [observer-usage-message-id.md](./observer-usage-message-id.md) for the exact rules and the
+one-time effects on transcripts captured before the roll.
+
 **The spool is advancing.** `acknowledged_through` should climb:
 
 ```sh

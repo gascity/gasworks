@@ -62,7 +62,12 @@ A rollout's usage comes from one source only, chosen per file:
 
 Both modes map fields the same way:
 
-- `input_tokens` becomes `input_tokens`. It includes cached input.
+- `input_tokens` less `cached_input_tokens` (clamped at zero) becomes
+  `input_tokens`: fresh input, the same meaning Claude's `input_tokens` has.
+  Codex's own `input_tokens` includes the cached input. Before
+  `parser_version` `codex-transcript-v2` the observer copied it unchanged, so
+  older Codex atoms count cached input twice when `input_tokens` and
+  `cache_read_tokens` are both priced (gascity/gasworks#95).
 - `cached_input_tokens` becomes `cache_read_tokens`.
 - `output_tokens` becomes `output_tokens`. It already includes
   `reasoning_output_tokens`, so reasoning is not added again.
@@ -96,6 +101,121 @@ resumes. So an upgrade neither re-counts a response the old daemon counted
   `session_id` inside Claude Code's `metadata.user_id` request field, which
   Manifold records.
 - `message_id` = the assistant record's `message.id` (`msg_…`). This equals the
-  Anthropic `message_start.message.id` that Manifold records. Claude Code
-  splits one API message into several transcript records that share this id.
-  The reader counts each matched spend row only once.
+  Anthropic `message_start.message.id` that Manifold records.
+
+## Claude USAGE token source
+
+Claude Code writes one transcript record per content block of an API response
+(thinking, text, each tool_use). Every record repeats the response's
+`message.id` and its `usage`, as Claude Code knew it when it wrote the block.
+A block written while the response still streams carries partial counts: the
+input and cache counts are final, but `output_tokens` is a handful. The block
+written after the response finished carries the final usage and a
+`stop_reason`. Records of one response can be interleaved with other
+responses' records, because Claude Code can stream several requests into one
+transcript at once.
+
+The observer emits **one USAGE atom per `message.id`, with the usage of the
+response's last record**. Taking the first record would keep a partial output
+count. Taking each field's maximum would be wrong too: a proxied model's last
+record can move input into cache reads. The atom is emitted as soon as
+nothing can change it:
+
+- At the response's first record with a `stop_reason`. No later record of a
+  response reports different usage.
+- When the response's branch continues. Each record names the record it
+  follows (`uuid`, `parentUuid`; a compaction boundary names it as
+  `logicalParentUuid`). A new response or a user turn that follows from the
+  response's records (its blocks, its tool results, their attachments) is
+  only written after the response finished. About 3% of
+  responses never get a `stop_reason`: Claude Code wrote their last block
+  (a tool_use) before the response finished. They are counted here, with the
+  usage they have. The transcript never records their final output count.
+- When the transcript moves to another `sessionId`.
+- Once the transcript has gone an hour without a write. This covers a session
+  that ended mid-response. It also covers a response whose branch was cut
+  (a rewind, or a following record too long to parse). Such a response waits
+  until the transcript goes quiet, however long the session keeps writing.
+
+A user record Claude Code injects (`isMeta`: a skill body, an image note, a
+hook message) is not a turn. A record on another branch, such as the first
+record of a history that a resumed agent copies back into its transcript,
+does not close the response either.
+
+Each counted `message.id` is remembered for the transcript (as an 8-byte
+hash in the cursor state), so no record of a counted response is counted
+again. This includes a resumed agent's copy of its whole history.
+
+A record without a `message.id` cannot be collapsed. Its usage is emitted as
+it comes, without `message_id`. An id that is too long or malformed to carry
+as `message_id` still collapses its response's records. The atom then has no
+`message_id`.
+
+The watcher retries a transcript line whose delivery failed part way. The
+daemon recognizes a start or a USAGE it already made durable (by session id
+and by `message_id`) and does not append it twice.
+
+Before `parser_version` `codex-transcript-v2` every record became an atom.
+Across a sample of local transcripts that summed to about 3x the fresh input,
+1.3x the output and 2x the cache tokens of one atom per response.
+
+## SESSION_LIFECYCLE start and model
+
+The platform prices a session's usage at the model on its transcripts'
+starts, and withholds the price when a transcript's start has no model. So a
+transcript's start is emitted once a record names the model:
+
+- **Claude:** at the first assistant record whose `message.model` is a model.
+  Claude Code's `<synthetic>` placeholder records (API errors, interruptions)
+  are not. The start's `occurred_at` is the session's earliest record time
+  seen before it, which is the transcript's start (its first records, such as
+  the queued prompt, come seconds before the first model record).
+- **Codex:** at the first `turn_context` that names a model. The rollout's
+  first `session_meta` names the session, and its time becomes the start's
+  `occurred_at`. A forked rollout's copy of its parent's `session_meta` is
+  ignored.
+
+A transcript that never reports usage and never names a model emits no start.
+If usage does arrive before any record named the model, the start is emitted
+right before it, without a model, and the platform withholds that session's
+price rather than guess the model.
+
+Every observation parsed out of a transcript after its start also carries the
+session from the cursor's persisted state, diagnostics included. A daemon restart therefore keeps
+attributing a transcript's later usage to its session. Before, the restarted
+daemon re-emitted Claude starts (often without a model) and left Codex usage
+without a session.
+
+Observations parsed out of a transcript carry `provenance.parser_version`
+(`codex-transcript-v2` from this change). The Codex SessionStart hook's start
+reads no transcript and carries none; the platform uses that to tell the two
+apart.
+
+## Upgrading from an earlier companion
+
+A cursor state written by an earlier build has no session state. On the first
+drain after the upgrade, the daemon reads the bytes that cursor already
+consumed, once. It never reads before a forward-only floor.
+
+- **Codex:** the daemon reads up to the first `session_meta`.
+- **Claude:** the daemon reads to the end of the consumed bytes. It decodes
+  only the records that can hold a response.
+
+It takes the transcript's session as already started, because the earlier
+build emitted its start. The earlier build also counted every Claude record it
+consumed, so every response in those bytes is marked as counted.
+
+The effects are confined to transcripts captured before the upgrade:
+
+- A Claude response whose records straddle the upgrade keeps what the earlier
+  build counted for its earlier records. Its later records are not counted.
+  A resumed agent's later copy of the transcript's history counts nothing.
+- A transcript whose start the earlier build emitted without a model keeps
+  that start. The platform keeps withholding that session's price. Sessions
+  that start after the upgrade carry their model.
+
+You can roll back. An earlier build ignores the new cursor fields and resumes
+at the persisted offset with its own per-record counting. A Claude response
+still waiting for its final record at the rollback is counted only from the
+records the earlier build reads after that point. Rolling forward again reads
+each transcript's consumed bytes once more, as above.
