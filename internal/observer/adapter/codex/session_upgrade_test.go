@@ -231,3 +231,20 @@ func TestWatcherPersistsTheUpgradeDerivationOfAQuietTranscript(t *testing.T) {
 		}
 	}
 }
+
+// TestCursorUpgradeRemembersTheSessionsTheEarlierBuildStarted pins that the upgrade records every
+// session it finds in the consumed bytes as started — the earlier build emitted a start each time
+// its reads moved to another session — so a transcript that returns to an earlier session after the
+// upgrade does not start it again.
+func TestCursorUpgradeRemembersTheSessionsTheEarlierBuildStarted(t *testing.T) {
+	consumed := []byte(sessionsAnswered(1, 2, 0))
+	back := sessionsAnswered(1, 1, time.Hour)
+	cands, _ := resumeUpgraded(t, append(consumed, back...), len(consumed), false)
+	if starts := sessionStarts(cands); len(starts) != 0 {
+		t.Fatalf("the return to session 1 started it again after the upgrade: %d starts", len(starts))
+	}
+	usages := usageCands(cands)
+	if len(usages) != 1 || usages[0].Session == nil || usages[0].Session.NativeID != claudeSession(1) {
+		t.Fatalf("usages = %s, want the returned session's response attributed to it", describeUsages(usages))
+	}
+}

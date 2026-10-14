@@ -150,7 +150,11 @@ only the ids counted since the previous save, then writes the cursor state,
 which records how many of them it owns. If the daemon stops between the two,
 the cursor resumes from its previous offset with its previous count, so the
 counted set always matches the bytes the cursor has consumed. As before, a
-stop between delivering a poll and saving it re-delivers that poll. The set
+stop between delivering a poll and saving it re-delivers that poll. A sidecar
+damaged outside the daemon (shortened or deleted) keeps the ids it still
+holds. The next save writes the ids the cursor knows after the count the
+saved state claims, never below it, and zero-fills the gap. A save cut short
+can therefore never make the saved state claim ids it did not own. The set
 grows with the transcript. On the largest local transcripts (a few thousand
 responses each), rewriting the whole set with every save wrote about 16 times
 as much as appending does.
@@ -191,7 +195,11 @@ price rather than guess the model.
 
 A transcript that moves to another `sessionId` and back (A, then B, then A)
 starts each session once. The cursor remembers which sessions it started, so a
-return to A emits no second start, even across a restart.
+return to A emits no second start, even across a restart. It remembers the 16
+sessions the transcript started most recently. When a 17th starts, the oldest
+is forgotten. A return to a forgotten session emits its start again. While the
+daemon runs it drops that start, because it remembers every start it appended
+for the transcript. After a restart, the start gets through once.
 
 The content side channel keys a transcript's snapshot by the session its
 observations name, so it learns a transcript only once that transcript has
@@ -225,9 +233,13 @@ consumed, once. It never reads before a forward-only floor.
 
 It takes the transcript's session as already started, because the earlier
 build emitted its start. The earlier build also counted every Claude record it
-consumed, so every response in those bytes is marked as counted. The derived
-state is saved straight away, so a finished transcript that is never written
-again is read once, not on every later start.
+consumed, so every response in those bytes is marked as counted. Every
+session found in those bytes is remembered as started. The derived state is
+saved straight away, so a finished transcript that is never written again is
+read once, not on every later start. That first start writes a cursor and a
+sidecar for every tracked transcript, a few fsyncs each. With many tracked
+transcripts this can take minutes on macOS, where fsync is slow, but it
+happens once.
 
 The effects are confined to transcripts captured before the upgrade:
 

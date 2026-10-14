@@ -253,7 +253,9 @@ func (st *parseState) closeClaudeMessages(lineNo int) []*Candidate {
 
 // closeClaudeMessage counts the open response at index i: its id is remembered as counted, and its
 // usage — the last its records reported — becomes one USAGE, at the time of the record that
-// reported it, delivered with the record at lineNo that closed it.
+// reported it, delivered with the record at lineNo that closed it. A response already counted is
+// not counted again: only damaged cursor state can hold a response that is both open and counted,
+// and its usage went out when it was counted.
 func (st *parseState) closeClaudeMessage(i, lineNo int) []*Candidate {
 	c := &st.carry.claude
 	msg := c.Open[i]
@@ -261,8 +263,7 @@ func (st *parseState) closeClaudeMessage(i, lineNo int) []*Candidate {
 	if len(c.Open) == 0 {
 		c.Open = nil
 	}
-	c.count(msg.Key)
-	if !msg.Usage.hasTokens() {
+	if !c.count(msg.Key) || !msg.Usage.hasTokens() {
 		return nil
 	}
 	return st.attribute([]*Candidate{msg.Usage.candidate(msg.OccurredAt, lineNo, msg.ID)})

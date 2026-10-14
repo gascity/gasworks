@@ -634,3 +634,57 @@ func TestClaudeReturningToASessionDoesNotStartItAgain(t *testing.T) {
 		}
 	}
 }
+
+// claudeSession is the id of the i-th session of a multi-session test transcript.
+func claudeSession(i int) string { return fmt.Sprintf("5e551011-0000-4000-8000-%012d", i) }
+
+// sessionsAnswered is a transcript in which sessions from..to each answer one response, in order.
+func sessionsAnswered(from, to int, base time.Duration) string {
+	var b strings.Builder
+	for i := from; i <= to; i++ {
+		b.WriteString(claudeAssistant(claudeSession(i), at(base+time.Duration(i)*time.Minute), fmt.Sprintf("msg_s%d_%d", i, base/time.Hour), "claude-opus-5-5", "end_turn", claudeUsageJSON{1, 2, 0, 3}, "text"))
+	}
+	return b.String()
+}
+
+// TestClaudeStartedSessionsKeepTheMostRecent pins the bound on remembered sessions: a transcript
+// remembers the 16 sessions it started most recently. Returning to one of them starts nothing; a
+// session evicted when a later one started (the oldest first) starts again on its return — across
+// a restart too.
+func TestClaudeStartedSessionsKeepTheMostRecent(t *testing.T) {
+	head := sessionsAnswered(1, 17, 0) // 17 starts: session 1 is evicted when 17 starts
+	returns := sessionsAnswered(2, 2, time.Hour) + sessionsAnswered(1, 1, 2*time.Hour) + sessionsAnswered(17, 17, 3*time.Hour)
+	for _, restart := range []bool{false, true} {
+		var got []string
+		for _, s := range sessionStarts(ingestPolls(t, []string{head, returns}, restart)) {
+			got = append(got, strings.TrimLeft(s.SessionLifecycle.NativeSessionID[24:], "0"))
+		}
+		want := "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 1"
+		if strings.Join(got, " ") != want {
+			t.Fatalf("restart=%v: sessions started %v, want %s (only the evicted session 1 starts again)", restart, got, want)
+		}
+	}
+}
+
+// TestClaudeFailedDeliveryOfAStartIsRetried covers a poll whose delivery fails after it started a
+// session, once the transcript remembers a full list of started sessions: the retry re-reads the same
+// bytes from the committed state, so it must start that session again — the failed attempt may not
+// have changed the committed list it parsed from.
+func TestClaudeFailedDeliveryOfAStartIsRetried(t *testing.T) {
+	c, err := LoadCursor(t.TempDir(), 13, 13, testBigSize, testBigMtime, 0)
+	if err != nil {
+		t.Fatalf("LoadCursor: %v", err)
+	}
+	cfg := defaultRefConfig()
+	_, commit := c.Ingest([]byte(sessionsAnswered(1, 17, 0)), cfg)
+	commit()
+	next := []byte(sessionsAnswered(18, 18, time.Hour))
+	if cands, _ := c.Ingest(next, cfg); len(sessionStarts(cands)) != 1 { // delivery fails: never committed
+		t.Fatalf("first attempt started %d sessions, want 1", len(sessionStarts(cands)))
+	}
+	cands, commit := c.Ingest(next, cfg)
+	commit()
+	if n := len(sessionStarts(cands)); n != 1 {
+		t.Fatalf("the retry started %d sessions, want session 18 once (its first attempt was never delivered)", n)
+	}
+}

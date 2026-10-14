@@ -146,7 +146,7 @@ func TestCursorCountedSidecarIgnoresWhatACrashedSaveAppended(t *testing.T) {
 
 // TestCursorCountedSidecarSurvivesLosingItsTail covers a sidecar that lost ids it held (a damaged or
 // truncated file): the cursor keeps the ids that are left, and the next save writes its whole set
-// again instead of appending after a gap.
+// again — after the count the saved state claims, zero-filling the gap, never below it.
 func TestCursorCountedSidecarSurvivesLosingItsTail(t *testing.T) {
 	dir := t.TempDir()
 	cfg := defaultRefConfig()
@@ -177,39 +177,112 @@ func TestCursorCountedSidecarSurvivesLosingItsTail(t *testing.T) {
 	if err := c.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if got := fileSize(t, sidecar); got != 2*8 {
-		t.Fatalf("sidecar holds %d bytes, want the cursor's whole set of 2 ids rewritten", got)
+	if got := fileSize(t, sidecar); got != (3+2)*8 {
+		t.Fatalf("sidecar holds %d bytes, want the claimed 3 positions zero-filled and the cursor's 2 ids after them", got)
 	}
 	if c, err = LoadCursor(dir, 33, 33, testBigSize, testBigMtime, 0); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if !c.carry.claude.Counted.has(idHash("msg_0000")) || !c.carry.claude.Counted.has(idHash("msg_0003")) {
-		t.Fatal("the rewritten sidecar must hold every id the cursor had")
+	if !c.carry.claude.Counted.has(idHash("msg_0000")) || !c.carry.claude.Counted.has(idHash("msg_0003")) || len(c.carry.claude.Counted) != 2 {
+		t.Fatalf("the rewritten sidecar must hold every id the cursor had and nothing else, got %d", len(c.carry.claude.Counted))
 	}
 }
 
-// TestCursorResetForgetsCountedIDs pins that a rewritten transcript, which the cursor re-reads from
-// byte zero, starts with nothing counted: the ids of the old content stay in the sidecar file until
-// the next append cuts them, but the saved state no longer claims them.
+// TestCursorResetForgetsCountedIDs pins that a transcript the cursor starts over on — rewritten
+// (Reset, re-read from byte zero) or sealed at a forward-only floor (SealAt) — keeps nothing
+// counted: the ids of the old content stay in the sidecar file until the next append cuts them, but
+// the saved state no longer claims them.
 func TestCursorResetForgetsCountedIDs(t *testing.T) {
+	for name, startOver := range map[string]func(*Cursor){
+		"reset":  func(c *Cursor) { c.Reset() },
+		"sealed": func(c *Cursor) { c.SealAt(1 << 20) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := LoadCursor(dir, 34, 34, testBigSize, testBigMtime, 0)
+			if err != nil {
+				t.Fatalf("LoadCursor: %v", err)
+			}
+			_, commit := c.Ingest([]byte(strings.Join(finishedResponses(0, 2), "")), defaultRefConfig())
+			commit()
+			if err := c.Save(); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			startOver(c)
+			if err := c.Save(); err != nil {
+				t.Fatalf("Save: %v", err)
+			}
+			if c, err = LoadCursor(dir, 34, 34, testBigSize, testBigMtime, 0); err != nil {
+				t.Fatalf("reload: %v", err)
+			}
+			if len(c.carry.claude.Counted) != 0 {
+				t.Fatalf("the cursor reloaded %d counted ids after starting over", len(c.carry.claude.Counted))
+			}
+		})
+	}
+}
+
+// TestCursorCountedSidecarDoubleFault covers a sidecar that lost ids outside the daemon, followed
+// by a crash between appending to it and writing the cursor state. The saved state must never come
+// to own ids appended after it: here, a response still open in the saved state, which would then be
+// both open and counted — skipped on the replay and counted again, with its partial usage, by the
+// settle. Instead the replay re-delivers the poll the crash interrupted, with the response's final
+// usage (the at-least-once retry of an unsaved poll), and the settle finds nothing left to count.
+func TestCursorCountedSidecarDoubleFault(t *testing.T) {
 	dir := t.TempDir()
-	c, err := LoadCursor(dir, 34, 34, testBigSize, testBigMtime, 0)
+	cfg := defaultRefConfig()
+	c, err := LoadCursor(dir, 35, 35, testBigSize, testBigMtime, 0)
 	if err != nil {
 		t.Fatalf("LoadCursor: %v", err)
 	}
-	_, commit := c.Ingest([]byte(strings.Join(finishedResponses(0, 2), "")), defaultRefConfig())
+	opening := claudeAssistant(claudeTestSession, at(time.Minute), "msg_X", "claude-opus-5-5", "", claudeUsageJSON{2, 3, 10, 100}, "thinking")
+	_, commit := c.Ingest([]byte(strings.Join(finishedResponses(0, 2), "")+opening), cfg)
 	commit()
 	if err := c.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	c.Reset()
-	if err := c.Save(); err != nil {
-		t.Fatalf("Save: %v", err)
+	if err := os.Truncate(countedPath(c.StatePath()), 8); err != nil { // lost one of its two ids
+		t.Fatalf("truncate: %v", err)
 	}
-	if c, err = LoadCursor(dir, 34, 34, testBigSize, testBigMtime, 0); err != nil {
+	if c, err = LoadCursor(dir, 35, 35, testBigSize, testBigMtime, 0); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if len(c.carry.claude.Counted) != 0 {
-		t.Fatalf("a reset cursor reloaded %d counted ids", len(c.carry.claude.Counted))
+	final := claudeAssistant(claudeTestSession, at(time.Minute+time.Second), "msg_X", "claude-opus-5-5", "end_turn", claudeUsageJSON{2, 900, 10, 100}, "text")
+	cands, commit := c.Ingest([]byte(final), cfg)
+	assertClaudeUsages(t, "before the crash", cands, []claudeUsageWant{{"msg_X", 2, 900, 10, 100}})
+	commit()
+	if _, err := c.saveCounted(); err != nil { // the save is cut short after its sidecar append
+		t.Fatalf("saveCounted: %v", err)
+	}
+
+	if c, err = LoadCursor(dir, 35, 35, testBigSize, testBigMtime, 0); err != nil {
+		t.Fatalf("reload after the crash: %v", err)
+	}
+	cands, commit = c.Ingest([]byte(final), cfg)
+	commit()
+	assertClaudeUsages(t, "replay of the unsaved poll", cands, []claudeUsageWant{{"msg_X", 2, 900, 10, 100}})
+	flushed, commitFlush := c.FlushOpenUsage()
+	commitFlush(len(flushed))
+	if got := usageCands(flushed); len(got) != 0 {
+		t.Fatalf("the settle counted msg_X again: %s", describeUsages(got))
+	}
+}
+
+// TestCursorFlushDoesNotRecountAnOpenCountedResponse pins the guard behind the double fault: a
+// response that is both open and counted — reachable only from damaged cursor state — closes
+// without a second USAGE, because its usage went out when it was counted.
+func TestCursorFlushDoesNotRecountAnOpenCountedResponse(t *testing.T) {
+	c, err := LoadCursor(t.TempDir(), 36, 36, testBigSize, testBigMtime, 0)
+	if err != nil {
+		t.Fatalf("LoadCursor: %v", err)
+	}
+	opening := claudeAssistant(claudeTestSession, at(0), "msg_X", "claude-opus-5-5", "", claudeUsageJSON{2, 3, 10, 100}, "thinking")
+	_, commit := c.Ingest([]byte(opening), defaultRefConfig())
+	commit()
+	c.carry.claude.Counted.add(idHash("msg_X"))
+	flushed, commitFlush := c.FlushOpenUsage()
+	commitFlush(len(flushed))
+	if got := usageCands(flushed); len(got) != 0 || c.HasOpenUsage() {
+		t.Fatalf("an open, counted response was counted again (%s) or left open", describeUsages(got))
 	}
 }

@@ -323,8 +323,13 @@ its transcript has been quiet for an hour.
 
 On the first drain after rolling forward, the daemon reads the bytes each tracked transcript
 already consumed, once, and saves what it derived. For Codex it reads only up to the first
-`session_meta`. Expect a burst of read I/O on the first start, proportional to the tracked Claude
-transcripts. Later starts do not repeat it.
+`session_meta`. Expect a burst on the first start:
+
+- read I/O proportional to the tracked Claude transcripts;
+- a cursor and a counted-id file written for every tracked transcript, a few fsyncs each.
+
+With many transcripts this can take minutes on macOS, where fsync is slow. Later starts do not
+repeat it.
 
 The cursor directory gains a `codex-cursor-<dev>-<ino>.counted` file next to each Claude
 transcript's cursor. It holds the counted response ids: 8 bytes per response, appended as

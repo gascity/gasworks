@@ -95,8 +95,8 @@ type Cursor struct {
 	// were carried, whose daemon kept the transcript's session in memory. DeriveCarry recovers it
 	// from the head of the consumed bytes, so the rest of the transcript stays attributed to it.
 	sessionKnown bool
-	// countedSaved is how many of the hashes at the head of the counted-id sidecar belong to the
-	// saved state (see Save).
+	// countedSaved is how many of the hashes at the head of the counted-id sidecar the saved state
+	// claims (see Save).
 	countedSaved int
 
 	maxPartialLine int
@@ -160,7 +160,8 @@ func cursorStatePath(stateDir string, dev, ino uint64) string {
 
 // countedPath is the counted-id sidecar of the cursor whose state file is statePath: the 8-byte
 // big-endian hashes of the Claude message ids the transcript has counted, appended as they are
-// counted. Only the first ClaudeCounted of them belong to the saved state.
+// counted. Only the first ClaudeCounted of them belong to the saved state; zero hashes are filler
+// (see saveCounted).
 func countedPath(statePath string) string {
 	return strings.TrimSuffix(statePath, ".json") + ".counted"
 }
@@ -252,9 +253,12 @@ func loadCursor(stateDir string, dev, ino uint64, liveSize, liveModNanos int64, 
 		if err != nil {
 			return nil, err
 		}
-		// A sidecar shorter than the state claims lost ids it held: keep the ones left. A response
-		// they named could be counted again by a later copy of the transcript's history.
-		c.countedSaved = len(hashes)
+		// A sidecar shorter than the state claims lost ids it held: keep the ones left (a response
+		// they named could be counted again by a later copy of the transcript's history), but keep
+		// the claim, which no later write may reach below (see saveCounted). Zero hashes are the
+		// filler such a write leaves.
+		c.countedSaved = p.ClaudeCounted
+		hashes = slices.DeleteFunc(hashes, func(h uint64) bool { return h == 0 })
 		slices.Sort(hashes)
 		c.carry.claude.Counted = slices.Compact(hashes)
 	}
@@ -579,9 +583,12 @@ func (c *Cursor) Save() error {
 }
 
 // saveCounted makes the ids counted since the last save durable in the sidecar and returns how
-// many of its hashes the state now owns. The ids go right after the countedSaved the state already
-// owns; anything beyond those (left by a save that crashed before its state file was written) is
-// cut first. A sidecar that lost hashes the state owned is rewritten with the whole set.
+// many of its hashes the state now claims. The ids go right after the countedSaved the saved state
+// claims; anything beyond those (left by a save that crashed before its state file was written) is
+// cut first. Nothing is ever written below that claim: if this save is cut short, the saved state
+// must still own exactly what it owned, never ids appended after it. So a sidecar that lost hashes
+// the saved state claims is zero-filled up to the claim, and every id the cursor knows is written
+// after it.
 func (c *Cursor) saveCounted() (int, error) {
 	unsaved := c.carry.claude.Unsaved
 	if len(unsaved) == 0 {
@@ -595,7 +602,7 @@ func (c *Cursor) saveCounted() (int, error) {
 			return 0, fmt.Errorf("stat codex cursor counted ids %s: %w", path, err)
 		}
 		if err != nil || info.Size() < int64(8*keep) {
-			keep, hashes = 0, c.carry.claude.Counted
+			hashes = c.carry.claude.Counted
 		}
 	}
 	if err := writeCounted(path, keep, hashes); err != nil {
@@ -605,30 +612,40 @@ func (c *Cursor) saveCounted() (int, error) {
 }
 
 // writeCounted writes hashes into the sidecar at path right after its first keep hashes, cutting
-// whatever followed them, and fsyncs it.
+// whatever followed them (or zero-filling up to them, when the file is shorter), and fsyncs it. A
+// sidecar it creates is made durable in its directory too.
 func writeCounted(path string, keep int, hashes []uint64) error {
-	if err := ensureCursorDir(filepath.Dir(path)); err != nil {
+	dir := filepath.Dir(path)
+	if err := ensureCursorDir(dir); err != nil {
 		return err
 	}
+	_, statErr := os.Stat(path)
+	created := os.IsNotExist(statErr)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, cursorFileMode)
 	if err != nil {
 		return fmt.Errorf("opening codex cursor counted ids %s: %w", path, err)
 	}
-	defer f.Close()
 	b := make([]byte, 0, 8*len(hashes))
 	for _, h := range hashes {
 		b = binary.BigEndian.AppendUint64(b, h)
 	}
-	if err := f.Truncate(int64(8 * keep)); err != nil {
-		return fmt.Errorf("cutting codex cursor counted ids %s: %w", path, err)
+	err = f.Truncate(int64(8 * keep))
+	if err == nil {
+		_, err = f.WriteAt(b, int64(8*keep))
 	}
-	if _, err := f.WriteAt(b, int64(8*keep)); err != nil {
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		return fmt.Errorf("writing codex cursor counted ids %s: %w", path, err)
 	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("fsync codex cursor counted ids %s: %w", path, err)
+	if created {
+		return fsyncCursorDir(dir)
 	}
-	return f.Close()
+	return nil
 }
 
 // readCounted reads the first n hashes of the sidecar at path; fewer when it holds fewer.

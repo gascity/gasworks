@@ -54,7 +54,8 @@ type sessionCarry struct {
 }
 
 // maxStartedSessions bounds sessionCarry.Sessions. A transcript names more than two sessions only
-// when a conversation is resumed into it repeatedly.
+// when a conversation is resumed into it repeatedly. The session started longest ago is forgotten
+// first, and a return to a forgotten session starts it again.
 const maxStartedSessions = 16
 
 // enter moves the transcript to session id of provider. A session it started before resumes
