@@ -27,6 +27,35 @@ func TestFromEnvDefaults(t *testing.T) {
 	}
 }
 
+// TestFromEnvDefaultOIDCEndpointsStayInCustomerRealm guards the complete native-CLI
+// OIDC surface, not just the issuer field.  A partial realm rollback would otherwise
+// leave one grant (for example device auth or revoke) talking to the old gascity realm
+// while login appears correctly configured.
+func TestFromEnvDefaultOIDCEndpointsStayInCustomerRealm(t *testing.T) {
+	for _, k := range []string{"GASWORKS_STS_URL", "GASWORKS_STS_CANONICAL_URL", "GASWORKS_OIDC_ISSUER", "GASWORKS_CLIENT_ID", "GASWORKS_LOOPBACK_PORT"} {
+		t.Setenv(k, "")
+	}
+	cfg := FromEnv()
+	const issuer = "https://auth.gascity.com/realms/gasworks-customers"
+	want := map[string]string{
+		"device":    issuer + "/protocol/openid-connect/auth/device",
+		"authorize": issuer + "/protocol/openid-connect/auth",
+		"token":     issuer + "/protocol/openid-connect/token",
+		"revoke":    issuer + "/protocol/openid-connect/revoke",
+	}
+	got := map[string]string{
+		"device":    cfg.DeviceAuthURL(),
+		"authorize": cfg.AuthorizeURL(),
+		"token":     cfg.OIDCTokenURL(),
+		"revoke":    cfg.RevokeURL(),
+	}
+	for name, wantURL := range want {
+		if got[name] != wantURL {
+			t.Errorf("%s endpoint = %q, want customer-realm endpoint %q", name, got[name], wantURL)
+		}
+	}
+}
+
 func TestNarrowedConfigsPreserveCanonicalOriginRole(t *testing.T) {
 	c := Config{STSCanonical: "https://api.gascity.com", STSBase: "https://works.gascity.com"}
 	assertEndpoints := func(name string, got, want []string) {
