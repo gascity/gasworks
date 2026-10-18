@@ -104,14 +104,15 @@ build you are rolling to (today: `1`), §4 does not apply and the upgrade is a d
 binary swap.
 
 `consent-ledger.json` is written by a daemon run with `-root-policy-file`. It lists the
-sequences withheld after a consent withdrawal; a withheld sequence is uploaded as a placeholder,
-and the collector binds a sequence to the first payload it receives. A daemon of this build
-honors the ledger whether or not it is given `-root-policy-file`. But while the ledger lists
-sequences above `acknowledged_through`, **do not delete it and do not roll back to a build
-without it**: either re-sends those sequences as captured, which is both an upload of withdrawn
-evidence and a 409 hold that wedges the batch lane. A daemon refuses to start on a ledger that
-fails its checksum. Drain first (`acknowledged_through` past every withheld range) and both
-become safe.
+sequences withheld after a consent withdrawal (a withheld sequence is uploaded only as a
+content-free placeholder, and the collector binds a sequence to the first payload it receives),
+plus a shutdown record of what the last run captured but had not sent. A daemon of this build
+honors the ledger whether or not it is given `-root-policy-file`; started without one it can
+confirm no consent, so it also withholds everything the shutdown record names. While the spool
+owes the collector anything, **do not delete the ledger and do not roll back to a build without
+it** (§6): either sends the withheld observations as captured, and a sequence whose placeholder
+already reached the collector then wedges the batch lane in a 409 hold (§4a). A ledger that fails
+its checksum stops the daemon from starting (§4d). Drain first and both become safe.
 
 ## 3. Canary order
 
@@ -287,6 +288,38 @@ Recovery then finds an empty `wal/`, reads `acknowledged_through` from the survi
 resumes at `ack + 1` — the same sequence, in a freshly created segment. It recurs on the next
 restart until the fixed binary is in place.
 
+### 4d. `consent ledger <state>/consent-ledger.json fails its checksum`
+
+```
+observer daemon: consent ledger <state>/consent-ledger.json fails its checksum
+```
+
+The same stop applies to `... is unreadable`, `... has unsupported version`, and `... has a
+malformed ...`. The daemon refuses to start rather than guess which owed observations were
+withheld after a consent withdrawal; systemd restart-loops it every `RestartSec`.
+
+Do not hand-edit the ledger to make it load. Its checksum covers every field, and a guessed
+`withheld` list fails either way: a withdrawn observation left off it is uploaded as captured,
+and a sequence whose placeholder already reached the collector, sent again as captured, holds
+the batch lane with a 409 that does not clear on its own (§4a).
+
+1. **Nothing owed:** if the unit had drained before the ledger went bad — its `ack` had stopped
+   advancing while it ran, and its journal showed no `upload drain:` errors (the same test as
+   §4a) — the ledger guards nothing. Move it aside, keep it, and start:
+
+   ```sh
+   systemctl --user stop <unit>.service
+   mkdir -p "$STATE-consent-ledger-corrupt"
+   mv "$STATE/consent-ledger.json" "$STATE-consent-ledger-corrupt/"
+   systemctl --user start <unit>.service
+   ```
+
+2. **Something owed:** the withheld set is lost, and nothing local can rebuild it. Moving the
+   ledger aside as above makes every owed observation upload as captured — including any whose
+   consent the owner withdrew — and any of them whose placeholder the collector already holds
+   then wedges the lane in a 409 hold. Do that only if both are acceptable; otherwise keep the
+   unit stopped and escalate: the owed range can only be retired on the collector side.
+
 ## 5. Verification
 
 **Journal.** Watch the unit for 60 seconds after restart:
@@ -424,6 +457,14 @@ contiguity and recovery refuses with `segment first_sequence N breaks contiguity
 Rolling back discards anything the new build wrote above `acknowledged_through`, so drain
 before you roll back if the daemon has been running for a while.
 
+**A unit run with `-root-policy-file` must be drained before it rolls back** to a build older
+than the live consent policy. Such a build never reads `consent-ledger.json`: it uploads every
+owed observation the ledger withholds as captured — evidence whose consent the owner withdrew —
+and for any owed sequence whose placeholder the collector already holds, that re-send is a 409
+that holds the batch lane until an operator intervenes (§4a). The same goes for deleting the
+ledger on any build. Once the unit has drained (`ack` no longer advancing while it runs, no
+`upload drain:` errors), the ledger guards nothing and both are safe.
+
 ## 7. Checklist
 
 - [ ] Built from a clean clone at a named commit with `CGO_ENABLED=0 -mod=vendor -trimpath -ldflags="-s -w"`
@@ -441,6 +482,8 @@ before you roll back if the daemon has been running for a while.
 - [ ] Run availability chips correct in the UI
 - [ ] Content-guard refusals reviewed
 - [ ] Rollback rehearsed on paper: which drop-in, which segment directory
+- [ ] With `-root-policy-file`: `consent-ledger.json` preserved, and the unit drained before any
+      rollback to a build older than the live consent policy (§6)
 
 ## 8. Known gaps
 

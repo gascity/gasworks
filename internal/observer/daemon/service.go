@@ -70,9 +70,11 @@ type Service struct {
 
 	// consent is the live consent policy (nil: the static configuration). Under it the watcher is
 	// built from the policy and rebuilt whenever its shape changes, and fence keeps every captured
-	// observation inside the consent it was captured under through upload.
-	consent *consent.Source
-	fence   *consentFence
+	// observation inside the consent it was captured under through upload. consentInterval is the
+	// cadence of the dedicated consent loop.
+	consent         *consent.Source
+	consentInterval time.Duration
+	fence           *consentFence
 	// watchCfg and sink are kept to rebuild the watcher; watchShape is the shape the current
 	// watcher was built for (valid when watchShapeSet), and watchBuildErr de-duplicates the log of a
 	// policy the watcher cannot be built for.
@@ -111,6 +113,10 @@ const (
 	// watchRestartBackoff paces the next watcher pass after a transient poll/sink failure so a
 	// persistent failure does not busy-spin the poll loop.
 	watchRestartBackoff = 250 * time.Millisecond
+	// DefaultConsentInterval is how often the live consent policy is re-checked on its own, apart
+	// from the checks before every content upload, observation batch, and transcript poll: it bounds
+	// how long a narrowing waits while every other loop is busy.
+	DefaultConsentInterval = 250 * time.Millisecond
 	// dirLockFilename is the advisory-lock file under the state directory. The held flock — never
 	// the file's mere existence — is the live-writer proof.
 	dirLockFilename = "daemon.lock"
@@ -147,10 +153,14 @@ type ServiceConfig struct {
 	// Consent, when non-nil, is the live consent policy and requires Watch. The watcher's roots come
 	// from it (Watch.ApprovedRoots and Watch.RootPolicies must be empty), content upload follows its
 	// content consent, and it is re-checked before every observation batch, every content upload,
-	// and every transcript poll: a narrowing stops capture and upload of what it withdraws at once
-	// (queued content is dropped, queued observations are withheld), and a widening takes effect at
-	// the next poll. nil keeps the static configuration.
+	// and every transcript poll, and on its own every ConsentInterval: a narrowing stops capture and
+	// upload of what it withdraws at once (queued content is dropped, an upload in flight cancelled,
+	// queued observations withheld), and a widening takes effect at the next poll. nil keeps the
+	// static configuration.
 	Consent *consent.Source
+	// ConsentInterval is the cadence of the dedicated consent check under Consent; 0 selects
+	// DefaultConsentInterval.
+	ConsentInterval time.Duration
 
 	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects the native
 	// Linux or Darwin credential API.
@@ -291,6 +301,8 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		log:      cfg.Log,
 		lock:     lock,
 		consent:  cfg.Consent,
+
+		consentInterval: durationOr(cfg.ConsentInterval, DefaultConsentInterval),
 	}
 
 	// 3b. Under a live consent policy, load the consent fence for the spool as recovered: it must
@@ -567,6 +579,13 @@ func (s *Service) Start() error {
 			s.runContentLoop(s.loopCtx)
 		}()
 	}
+	if s.consent != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.runConsentLoop(s.loopCtx)
+		}()
+	}
 	s.ready = true
 	return nil
 }
@@ -620,29 +639,34 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.wg.Wait()
 		close(drained)
 	}()
-	loopsStopped := false
 	select {
 	case <-drained:
-		loopsStopped = true
 	case <-ctx.Done():
 	}
 
 	// Withdraw the socket and drain any in-flight durable appends.
 	srvErr := s.server.Shutdown(ctx)
 
+	// Hand the next start the consent origins of what this run captured but has not sent, so a
+	// withdrawal written while the daemon is stopped still withholds it. The record is written before
+	// the final drain, so a collector that hangs the drain until the process is killed cannot lose
+	// it, and every send of the drain keeps it exact.
+	if s.fence != nil {
+		if err := s.recordShutdownConsent(); err != nil {
+			s.logf("record consent origins at shutdown: %v", err)
+		}
+	}
 	// Final best-effort flush of freshly-durable frames (the uploader reads the WAL and the ack
 	// sidecar directly, not the now-closed socket), then close the spool.
 	if s.upload != nil && ctx.Err() == nil {
 		if err := s.upload.drain(ctx); err != nil {
 			s.logf("final upload drain: %v", err)
 		}
-	}
-	// Hand the consent origins of what this run captured but did not send to the next start, so a
-	// withdrawal written while the daemon is stopped still withholds it. Only once every loop has
-	// stopped: the record must follow this run's last upload attempt.
-	if s.fence != nil && loopsStopped {
-		if err := s.recordShutdownConsent(); err != nil {
-			s.logf("record consent origins at shutdown: %v", err)
+		if s.fence != nil {
+			// Rewrite the record without what the drain got acknowledged.
+			if err := s.recordShutdownConsent(); err != nil {
+				s.logf("record consent origins after the final drain: %v", err)
+			}
 		}
 	}
 	closeErr := s.spool.Close()
@@ -750,6 +774,24 @@ func (s *Service) runContentLoop(ctx context.Context) {
 			return
 		case <-t.C:
 			s.TickContentUploads(ctx)
+		}
+	}
+}
+
+// runConsentLoop re-checks the live consent policy on its own cadence until ctx is cancelled, so a
+// narrowing reaches what does not wait for the next batch, upload, or poll — an upload in flight is
+// cancelled and queued content dropped (the content uploader's subscription), and every later
+// watcher append is refused — within one interval even while every other loop is busy: a long
+// transcript pass, or a batch being retried against a failing collector.
+func (s *Service) runConsentLoop(ctx context.Context) {
+	t := time.NewTicker(s.consentInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.consent.Current()
 		}
 	}
 }

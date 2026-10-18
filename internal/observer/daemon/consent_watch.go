@@ -15,8 +15,10 @@ import (
 // watchShape is everything the transcript watcher is built from under a live consent policy: the
 // capturable consent records (active roots and tombstones) and whether transcript content is
 // observed for upload. A policy change that leaves the shape alone — a rewrite with identical
-// consent, a fail-closed report while content was already off — keeps the running watcher.
+// consent, the same records in another order, a fail-closed report while content was already off —
+// keeps the running watcher.
 type watchShape struct {
+	// records are in document order: the order a static configuration hands the watcher its roots.
 	records []rootpolicy.Record
 	content bool
 }
@@ -24,21 +26,28 @@ type watchShape struct {
 // shapeOf derives the watcher shape a policy calls for. contentWired reports whether this daemon
 // can upload content at all (it has a collector).
 func shapeOf(p consent.Policy, contentWired bool) watchShape {
-	records := append([]rootpolicy.Record(nil), p.Roots...)
-	sort.Slice(records, func(i, j int) bool { return records[i].Path < records[j].Path })
-	return watchShape{records: records, content: p.ContentUpload && contentWired}
+	return watchShape{records: append([]rootpolicy.Record(nil), p.Roots...), content: p.ContentUpload && contentWired}
 }
 
+// equal reports whether two shapes build the same watcher; record order does not matter.
 func (a watchShape) equal(b watchShape) bool {
 	if a.content != b.content || len(a.records) != len(b.records) {
 		return false
 	}
-	for i := range a.records {
-		if a.records[i] != b.records[i] {
+	x, y := sortedByPath(a.records), sortedByPath(b.records)
+	for i := range x {
+		if x[i] != y[i] {
 			return false
 		}
 	}
 	return true
+}
+
+// sortedByPath returns a copy of records ordered by path.
+func sortedByPath(records []rootpolicy.Record) []rootpolicy.Record {
+	out := append([]rootpolicy.Record(nil), records...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
 }
 
 // generations maps every active consent root to its generation.
@@ -114,8 +123,8 @@ func (s *Service) noteUnavailableContentLocked(p consent.Policy) {
 	s.contentUnavailableNoted = granted
 }
 
-// recordShutdownConsent writes the consent fence's graceful-shutdown record against the spool's
-// final durable ceiling.
+// recordShutdownConsent writes (or rewrites) the consent fence's shutdown record against the spool's
+// durable ceiling.
 func (s *Service) recordShutdownConsent() error {
 	snap, err := s.spool.Health()
 	if err != nil {

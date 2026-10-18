@@ -277,3 +277,24 @@ func TestContentConsentWideningAppliesToTheNextObservation(t *testing.T) {
 		t.Fatalf("uploads after content consent was granted = %d, want 1", h.sender.count())
 	}
 }
+
+// TestContentConsentIsCheckedRightBeforeEveryPOST: a narrowing written while a transcript is being
+// read — and observed by nothing else — is caught by the check right before the request: the upload
+// is never sent.
+func TestContentConsentIsCheckedRightBeforeEveryPOST(t *testing.T) {
+	root := t.TempDir()
+	gens := map[string]uint64{root: 1}
+	h := newConsentContent(t, consentPolicyBody(true, consentRoot{root, 1, true}), &fakeContentSender{})
+	h.transcript(1, 1, "body\n")
+	h.observe(gens, root, 1, 1, 5)
+	read := h.u.read
+	h.u.read = func(root, locator string, dev, ino uint64, maxBytes int64) ([]byte, int64, int64, error) {
+		// Only the file changes: no daemon loop checks it before the request would go out.
+		writePolicyAtomic(t, h.policyPath, consentPolicyBody(false, consentRoot{root, 1, true}))
+		return read(root, locator, dev, ino, maxBytes)
+	}
+	h.settleAndTick()
+	if h.sender.count() != 0 {
+		t.Fatalf("an upload was sent although content consent was withdrawn before its request (%d uploads)", h.sender.count())
+	}
+}

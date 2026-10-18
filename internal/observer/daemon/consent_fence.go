@@ -42,13 +42,13 @@ import (
 //
 // Origins: the fence learns which consent each watcher append was captured under from the append
 // itself (the sink records the sequence). That knowledge is in memory; a graceful shutdown records
-// what is still undecided in the ledger, and the next run applies it until its first send, so a
-// withdrawal written while the daemon is stopped still withholds what the previous run captured but
-// had not sent. Two kinds of frame carry no origin and upload as captured: what a run that crashed
-// had queued, and an append whose acknowledgement never reached the sink (it timed out) — the
-// watcher re-delivers that candidate, and the re-delivery is attributed. Observations appended by
-// other local producers (the run wrapper, the provider hook) are not tied to a watched root and
-// are never withheld.
+// what is still undecided in the ledger (before its final upload drain, and kept exact by every send
+// of that drain), and the next run applies it until its first send, so a withdrawal written while
+// the daemon is stopped still withholds what the previous run captured but had not sent. Two kinds
+// of frame carry no origin and upload as captured: what a run that crashed had queued, and an
+// append whose acknowledgement never reached the sink (it timed out) — the watcher re-delivers that
+// candidate, and the re-delivery is attributed. Observations appended by other local producers (the
+// run wrapper, the provider hook) are not tied to a watched root and are never withheld.
 
 // errConsentWithdrawn refuses a watcher append whose consent root is no longer consented at the
 // generation the watcher was built for. The watcher does not advance past the refused candidate,
@@ -195,10 +195,10 @@ func (s *seqSet) prune(through int64) {
 // beforeSend, and acknowledged; Shutdown calls recordShutdown.
 //
 // A daemon started without a live policy over a state directory that has a consent ledger runs a
-// passive fence (src nil): it makes no new decisions, but every sequence the ledger withholds is
-// still uploaded only as its placeholder, and the shutdown record is still retired at the first
-// send — so dropping -root-policy-file can neither upload withdrawn evidence nor send a sequence
-// twice with different payloads.
+// passive fence (src nil). It can confirm no consent at all, so it fails closed: every sequence the
+// ledger withholds is still uploaded only as its placeholder, and everything a policy run recorded
+// as captured but not sent is withheld as well — dropping -root-policy-file can neither upload
+// evidence whose consent it cannot check nor send a sequence twice with different payloads.
 type consentFence struct {
 	dir string
 	src *consent.Source // nil for a passive fence
@@ -217,18 +217,20 @@ type consentFence struct {
 	// has been sent at least once (or predates this run without a recorded origin), so it is uploaded
 	// exactly as it was first decided and is never newly withheld.
 	attempted int64
-	// applied is the policy the upload lane last applied; appliedSet is false until the first refresh.
+	// applied is the policy last applied to the whole backlog (see applyLocked); appliedSet is false
+	// until the first application.
 	applied    consent.Policy
 	appliedSet bool
 	// dirty marks withheld decisions not yet recorded in the ledger. A batch is never sent while
 	// its decisions are dirty.
 	dirty bool
-	// pending is the previous run's graceful-shutdown record, applied at load. It stays in the
-	// ledger, carried through every rewrite, until this run's first send: a start that fails before
-	// sending anything leaves it for the next start. The first send clears it first.
-	pending *consentLedgerShutdown
-	// closed is set once this run's shutdown record is written: no send may follow that record.
-	closed bool
+	// pending is the shutdown record on disk, carried through every rewrite of the ledger. Until
+	// recorded is set it is the previous run's, applied at load and retired by this run's first send
+	// (a start that fails before sending anything leaves it for the next start). Once this run writes
+	// its own (recorded), every later send rewrites it with the new attempted-through mark before
+	// sending, so the record on disk is exact whenever the process stops.
+	pending  *consentLedgerShutdown
+	recorded bool
 }
 
 // consentLedger is the durable half of the fence: the withheld sequences, and — only from a
@@ -294,13 +296,19 @@ func newConsentFence(dir string, src *consent.Source, highestDurable int64, log 
 		return f, nil
 	}
 	f.attempted = sh.AttemptedThrough
-	if src != nil {
-		// A passive fence has no policy to judge origins against; it only keeps the record pending.
-		for _, o := range sh.Origins {
-			f.origins.addRun(max(o.First, f.attempted+1), min(o.Last, sh.HighestDurable), consentOrigin{root: o.Root, generation: o.Generation})
-		}
+	for _, o := range sh.Origins {
+		f.origins.addRun(max(o.First, f.attempted+1), min(o.Last, sh.HighestDurable), consentOrigin{root: o.Root, generation: o.Generation})
 	}
 	f.pending = sh
+	if src == nil {
+		// Passive: no policy can confirm the consent those frames were captured under, so they are
+		// withheld — recorded before anything is sent.
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if err := f.applyAndRecordLocked(f.latest()); err != nil {
+			return nil, err
+		}
+	}
 	return f, nil
 }
 
@@ -317,11 +325,19 @@ func ledgerExists(dir string) (bool, error) {
 	return true, nil
 }
 
+// latest is the newest published consent policy. A passive fence consents to nothing.
+func (f *consentFence) latest() consent.Policy {
+	if f.src == nil {
+		return consent.Policy{}
+	}
+	return f.src.Latest()
+}
+
 // admit checks a watcher append against the live consent policy and, when it is still consented,
 // holds the gate until release is called after the append's origin is recorded.
 func (f *consentFence) admit(o consentOrigin) (release func(), err error) {
 	f.gate.RLock()
-	if !o.allowedBy(f.src.Latest()) {
+	if !o.allowedBy(f.latest()) {
 		f.gate.RUnlock()
 		return nil, errConsentWithdrawn
 	}
@@ -337,7 +353,7 @@ func (f *consentFence) recordAppend(seq int64, o consentOrigin) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.origins.record(seq, o)
-	if seq <= f.attempted || o.allowedBy(f.src.Latest()) {
+	if seq <= f.attempted || o.allowedBy(f.latest()) {
 		return
 	}
 	f.withheld.add(seq, seq)
@@ -348,46 +364,69 @@ func (f *consentFence) recordAppend(seq int64, o consentOrigin) {
 	}
 }
 
-// refresh re-checks the consent policy (the per-batch check) and, when it changed since the upload
-// lane last applied it, withholds every not-yet-sent watcher frame captured under consent that no
-// longer applies, recording the decisions before returning. It must run before every batch.
+// refresh re-checks the consent policy file (the per-batch check) and applies the newest published
+// policy to the whole backlog, recording the decisions before returning. It runs before every batch.
 func (f *consentFence) refresh() error {
-	if f.src == nil {
-		f.mu.Lock()
-		f.appliedSet = true // passive: nothing to apply, and no origin is ever recorded
-		f.mu.Unlock()
-		return nil
+	if f.src != nil {
+		f.src.Current()
 	}
-	// Check the file, then apply the newest published policy: a check racing on another loop may
-	// have published one newer than the one this check returned.
-	f.src.Current()
-	pol := f.src.Latest()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.applyAndRecordLocked(f.latest())
+}
+
+// applyLocked applies pol to the whole backlog unless it is the policy last applied: every watcher
+// frame not yet sent whose consent pol no longer covers is withheld. It returns the sequences it
+// newly withheld, counted by origin. In memory only: the caller records them. Called with f.mu held.
+func (f *consentFence) applyLocked(pol consent.Policy) map[consentOrigin]int64 {
 	if f.appliedSet && pol.Version == f.applied.Version {
 		return nil
 	}
-	var added int64
-	withdrawn := map[consentOrigin]int64{}
+	f.applied, f.appliedSet = pol, true
+	var withdrawn map[consentOrigin]int64
 	for _, run := range f.origins.runs {
 		if run.last <= f.attempted || run.origin.allowedBy(pol) {
 			continue
 		}
 		if n := f.withheld.add(max(run.first, f.attempted+1), run.last); n > 0 {
-			added += n
+			if withdrawn == nil {
+				withdrawn = map[consentOrigin]int64{}
+			}
 			withdrawn[run.origin] += n
 		}
 	}
-	f.applied, f.appliedSet = pol, true
-	if added == 0 {
+	if withdrawn != nil {
+		f.dirty = true
+	}
+	return withdrawn
+}
+
+// applyAndRecordLocked applies pol (applyLocked) and, when that withheld anything, logs and records
+// the decisions. Called with f.mu held.
+func (f *consentFence) applyAndRecordLocked(pol consent.Policy) error {
+	withdrawn := f.applyLocked(pol)
+	if withdrawn == nil {
 		return nil
 	}
-	f.dirty = true
+	f.logWithheld(withdrawn)
 	if err := f.persistLocked(); err != nil {
+		// Still dirty: beforeSend records the decisions before any batch is sent, or sends nothing.
 		return fmt.Errorf("observer daemon: record withheld observations: %w", err)
 	}
-	f.logf("consent narrowed: withholding %d queued observations not yet uploaded (%s); each uploads as a content-free placeholder", added, describeOrigins(withdrawn))
 	return nil
+}
+
+// logWithheld reports newly withheld sequences by origin.
+func (f *consentFence) logWithheld(withdrawn map[consentOrigin]int64) {
+	var total int64
+	for _, n := range withdrawn {
+		total += n
+	}
+	why := "the owner withdrew their consent"
+	if f.src == nil {
+		why = "no live consent policy can confirm their consent"
+	}
+	f.logf("consent narrowed: withholding %d queued observations not yet uploaded (%s), because %s; each uploads as a content-free placeholder", total, describeOrigins(withdrawn), why)
 }
 
 // ceiling reads the spool's highest durable sequence with the gate held exclusively, so no watcher
@@ -404,13 +443,19 @@ func (f *consentFence) frameStore(inner upload.FrameStore) upload.FrameStore {
 	return fencedFrameStore{inner: inner, fence: f}
 }
 
-// decide applies the upload decision to frames read for a batch. It refuses to decide before the
-// policy was applied (refresh), which fails the batch rather than guess.
+// decide applies the upload decision to frames read for a batch, under the newest published policy
+// — not the one the lane applied at its last refresh: a withdrawal another loop published since then
+// is applied here, to the whole backlog, before any frame of this batch is decided.
 func (f *consentFence) decide(recs []upload.Record) ([]upload.Record, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if !f.appliedSet {
-		return nil, errors.New("observer daemon: consent fence read a batch before applying the consent policy")
+	pol := f.latest()
+	if withdrawn := f.applyLocked(pol); withdrawn != nil {
+		f.logWithheld(withdrawn)
+		if err := f.persistLocked(); err != nil {
+			// Still dirty: beforeSend records the decisions before this batch is sent, or sends nothing.
+			f.logf("consent ledger: record withheld observations: %v", err)
+		}
 	}
 	out := make([]upload.Record, len(recs))
 	for i, rec := range recs {
@@ -420,7 +465,7 @@ func (f *consentFence) decide(recs []upload.Record) ([]upload.Record, error) {
 				continue
 			}
 			o, ok := f.origins.lookup(rec.Sequence)
-			if !ok || o.allowedBy(f.applied) {
+			if !ok || o.allowedBy(pol) {
 				continue
 			}
 			f.withheld.add(rec.Sequence, rec.Sequence)
@@ -436,24 +481,26 @@ func (f *consentFence) decide(recs []upload.Record) ([]upload.Record, error) {
 }
 
 // beforeSend records any new withheld decisions and marks the range's payloads final. It runs after
-// a batch is formed and before it is sent; a failure to record stops the send. The first send also
-// retires the previous run's shutdown record: from here on this run's own attempts move the
-// attempted-through mark past what that record says.
+// a batch is formed and before it is sent; a failure to record stops the send. A shutdown record on
+// disk must stay exact across the send: the previous run's is retired (this run's attempts move the
+// attempted-through mark past what it says), and this run's own is rewritten with the new mark.
 func (f *consentFence) beforeSend(r wire.SequenceRange) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.closed {
-		return errors.New("observer daemon: the consent ledger's shutdown record is written; nothing may be sent after it")
-	}
-	if f.dirty || f.pending != nil {
-		pending := f.pending
-		f.pending = nil
-		if err := f.persistLocked(); err != nil {
-			f.pending = pending
-			return fmt.Errorf("observer daemon: record withheld observations: %w", err)
-		}
-	}
+	prevAttempted, prevPending := f.attempted, f.pending
 	f.attempted = max(f.attempted, r.LastSequence)
+	switch {
+	case f.recorded:
+		f.pending = f.shutdownRecordLocked(f.pending.HighestDurable)
+	case f.pending != nil:
+		f.pending = nil
+	case !f.dirty:
+		return nil
+	}
+	if err := f.persistLocked(); err != nil {
+		f.attempted, f.pending = prevAttempted, prevPending
+		return fmt.Errorf("observer daemon: record withheld observations: %w", err)
+	}
 	return nil
 }
 
@@ -466,15 +513,28 @@ func (f *consentFence) acknowledged(through int64) {
 	f.withheld.prune(through)
 }
 
-// recordShutdown writes the graceful-shutdown record: the origins of every watcher frame this run
-// captured but had not sent, so the next start can still withhold them if consent was withdrawn in
-// between. It must run only once no upload attempt can follow it, and it closes the fence: any
-// later send fails.
+// recordShutdown writes this run's shutdown record: the origins of every watcher frame it captured
+// but has not sent, so the next start can still withhold them if consent was withdrawn in between.
+// Shutdown writes it before the final upload drain, and every send after it keeps it exact (see
+// beforeSend), so a drain that hangs until the process is killed cannot lose it.
 func (f *consentFence) recordShutdown(highestDurable int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.closed = true
-	sh := &consentLedgerShutdown{HighestDurable: highestDurable, AttemptedThrough: f.attempted, Origins: []consentLedgerOrigin{}}
+	prevPending, prevRecorded := f.pending, f.recorded
+	f.pending, f.recorded = f.shutdownRecordLocked(highestDurable), true
+	if err := f.persistLocked(); err != nil {
+		f.pending, f.recorded = prevPending, prevRecorded
+		return err
+	}
+	return nil
+}
+
+// shutdownRecordLocked describes this run to the next start: the sequence through which its uploads
+// are final and the origins of every watcher frame above it. Its durable ceiling covers both, so a
+// record taken while frames are still being appended or sent is never mistaken for one describing
+// frames the spool lost. Called with f.mu held.
+func (f *consentFence) shutdownRecordLocked(highestDurable int64) *consentLedgerShutdown {
+	sh := &consentLedgerShutdown{HighestDurable: max(highestDurable, f.attempted), AttemptedThrough: f.attempted, Origins: []consentLedgerOrigin{}}
 	for _, run := range f.origins.runs {
 		if run.last <= f.attempted {
 			continue
@@ -482,9 +542,9 @@ func (f *consentFence) recordShutdown(highestDurable int64) error {
 		sh.Origins = append(sh.Origins, consentLedgerOrigin{
 			First: max(run.first, f.attempted+1), Last: run.last, Root: run.origin.root, Generation: run.origin.generation,
 		})
+		sh.HighestDurable = max(sh.HighestDurable, run.last)
 	}
-	f.pending = sh
-	return f.persistLocked()
+	return sh
 }
 
 // persistLocked atomically rewrites the ledger with the current withheld set and the pending

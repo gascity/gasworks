@@ -226,10 +226,10 @@ func TestConsentLedgerRoundTripsAndDetectsCorruption(t *testing.T) {
 	}
 }
 
-// TestFenceRefusesToSendAfterItsShutdownRecord: once the shutdown record is written, no batch may
-// be sent — a later send would move the attempted-through mark past what the record tells the next
-// start.
-func TestFenceRefusesToSendAfterItsShutdownRecord(t *testing.T) {
+// TestASendAfterTheShutdownRecordKeepsItExact: the shutdown record is written before the final
+// drain, so every send of that drain rewrites it with the new attempted-through mark — and drops the
+// origins of what it sent — before sending: the record on disk is exact whenever the process stops.
+func TestASendAfterTheShutdownRecordKeepsItExact(t *testing.T) {
 	root := t.TempDir()
 	policyPath := filepath.Join(t.TempDir(), "root-policy.json")
 	writePolicyAtomic(t, policyPath, consentPolicyBody(false, consentRoot{root, 1, true}))
@@ -237,15 +237,27 @@ func TestFenceRefusesToSendAfterItsShutdownRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fence, err := newConsentFence(t.TempDir(), src, 0, nil)
+	dir := t.TempDir()
+	fence, err := newConsentFence(dir, src, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fence.recordShutdown(0); err != nil {
+	for seq := int64(1); seq <= 4; seq++ {
+		fence.recordAppend(seq, consentOrigin{root: root, generation: 1})
+	}
+	if err := fence.recordShutdown(4); err != nil {
 		t.Fatal(err)
 	}
-	if err := fence.beforeSend(wire.SequenceRange{FirstSequence: 1, LastSequence: 1}); err == nil {
-		t.Fatal("a batch was allowed after the shutdown record")
+	if err := fence.beforeSend(wire.SequenceRange{FirstSequence: 1, LastSequence: 2}); err != nil {
+		t.Fatalf("a send after the shutdown record failed: %v", err)
+	}
+	ledger, err := readConsentLedger(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := &consentLedgerShutdown{HighestDurable: 4, AttemptedThrough: 2, Origins: []consentLedgerOrigin{{First: 3, Last: 4, Root: root, Generation: 1}}}
+	if !reflect.DeepEqual(ledger.Shutdown, want) {
+		t.Fatalf("record after the send = %+v, want %+v", ledger.Shutdown, want)
 	}
 }
 
