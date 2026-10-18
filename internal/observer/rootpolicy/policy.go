@@ -6,8 +6,10 @@ package rootpolicy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +21,23 @@ const (
 	// SchemaV2 adds a per-root kind and the recorded provider transcript stores. Each version is
 	// decoded against its own strict shape, so a v1 document still refuses v2's fields outright.
 	SchemaV2 = "gasworks.companion.root-policy/v2"
+	// SchemaV3 is v2 plus the owner's whole-transcript content-upload consent (content_upload), so
+	// every consent the companion acts on lives in one document the daemon re-reads while it runs.
+	// content_upload is required in v3: the decision is always stated, never defaulted.
+	SchemaV3 = "gasworks.companion.root-policy/v3"
+)
+
+// ContentConsent is a policy document's decision about whole-transcript content upload.
+type ContentConsent uint8
+
+const (
+	// ContentUnstated is a v1 or v2 document, which carries no content decision; the daemon then
+	// keeps the content-upload setting it was started with.
+	ContentUnstated ContentConsent = iota
+	// ContentDenied is a v3 document with content_upload=false.
+	ContentDenied
+	// ContentGranted is a v3 document with content_upload=true.
+	ContentGranted
 )
 
 // Mode is a root's capture mode. It also fixes the cross-generation re-delivery idempotency
@@ -96,12 +115,16 @@ type Record struct {
 func (r Record) IsProject() bool { return r.Kind == Project }
 
 // Policy is one parsed policy document: the consent records plus, from v2 on, the recorded
-// provider transcript stores that project roots draw their sessions from.
+// provider transcript stores that project roots draw their sessions from, and from v3 on the
+// content-upload consent.
 type Policy struct {
 	Roots []Record
 	// Stores are the absolute, canonical provider store directories (the Claude projects dir, the
 	// Codex sessions dir). They are recorded state: only a registration verb changes them.
 	Stores []string
+	// Content is the document's whole-transcript content-upload consent: ContentUnstated for v1 and
+	// v2 documents, ContentGranted or ContentDenied for v3.
+	Content ContentConsent
 }
 
 type rawRecord struct {
@@ -127,6 +150,15 @@ type documentV2 struct {
 	Stores []string      `json:"stores"`
 }
 
+// documentV3 is v2's shape plus the required content-upload consent. The pointer is how a decode
+// tells an absent (or null) content_upload from an explicit false; v3 refuses both.
+type documentV3 struct {
+	Schema        string        `json:"schema_version"`
+	ContentUpload *bool         `json:"content_upload"`
+	Roots         []rawRecordV2 `json:"roots"`
+	Stores        []string      `json:"stores"`
+}
+
 // Load reads one strict, owner-only policy file and returns its consent records. It is the v1-era
 // entry point and stays byte-for-byte compatible; callers that need the recorded stores use
 // LoadPolicy.
@@ -138,29 +170,20 @@ func Load(path string) ([]Record, error) {
 	return policy.Roots, nil
 }
 
-// LoadPolicy reads one strict, owner-only policy file of either schema version. Symlinked policy
-// files, roots, and stores are resolved before use so the daemon's state is keyed by the stable
-// canonical path, never a caller-controlled spelling.
+// LoadPolicy reads one strict, owner-only policy file of any supported schema version. Symlinked
+// policy files, roots, and stores are resolved before use so the daemon's state is keyed by the
+// stable canonical path, never a caller-controlled spelling.
 func LoadPolicy(path string) (Policy, error) {
-	if path == "" || !filepath.IsAbs(path) {
-		return Policy{}, fmt.Errorf("root policy path must be absolute")
-	}
-	info, err := os.Lstat(path)
+	data, err := readDocument(path)
 	if err != nil {
-		return Policy{}, fmt.Errorf("stat root policy: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownerSupplied(info) {
-		return Policy{}, fmt.Errorf("root policy must be an owner-only regular file")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Policy{}, fmt.Errorf("read root policy: %w", err)
+		return Policy{}, err
 	}
 	schema, err := documentSchema(data)
 	if err != nil {
 		return Policy{}, err
 	}
 	var d documentV2
+	content := ContentUnstated
 	switch schema {
 	case Schema:
 		var v1 documentV1
@@ -175,6 +198,19 @@ func LoadPolicy(path string) (Policy, error) {
 		if err := decodeStrict(data, &d); err != nil {
 			return Policy{}, err
 		}
+	case SchemaV3:
+		var v3 documentV3
+		if err := decodeStrict(data, &v3); err != nil {
+			return Policy{}, err
+		}
+		if v3.ContentUpload == nil {
+			return Policy{}, fmt.Errorf("root policy %s must state content_upload as true or false", SchemaV3)
+		}
+		content = ContentDenied
+		if *v3.ContentUpload {
+			content = ContentGranted
+		}
+		d = documentV2{Schema: v3.Schema, Roots: v3.Roots, Stores: v3.Stores}
 	default:
 		return Policy{}, fmt.Errorf("root policy schema %q is not supported", schema)
 	}
@@ -238,7 +274,101 @@ func LoadPolicy(path string) (Policy, error) {
 	if err != nil {
 		return Policy{}, err
 	}
-	return Policy{Roots: out, Stores: stores}, nil
+	return Policy{Roots: out, Stores: stores, Content: content}, nil
+}
+
+// MaxDocumentBytes bounds a policy document; a larger file is refused.
+const MaxDocumentBytes = 1 << 20
+
+// readDocument reads a policy file under the rules every policy read applies: an absolute path, an
+// owner-only regular file owned by this user, at most MaxDocumentBytes. The checks run on the opened
+// file itself (the open refuses to follow a symlink and never blocks on a FIFO), so the path cannot
+// be swapped between the check and the read.
+func readDocument(path string) ([]byte, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("root policy path must be absolute")
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|openNoFollowNonBlock, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("stat root policy: %w", err)
+		}
+		if isSymlinkRefusal(err) {
+			return nil, fmt.Errorf("root policy must be an owner-only regular file")
+		}
+		return nil, fmt.Errorf("open root policy: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat root policy: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownerSupplied(info) {
+		return nil, fmt.Errorf("root policy must be an owner-only regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, MaxDocumentBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read root policy: %w", err)
+	}
+	if len(data) > MaxDocumentBytes {
+		return nil, fmt.Errorf("root policy exceeds %d bytes", MaxDocumentBytes)
+	}
+	return data, nil
+}
+
+// DecodeFileRecords reads a policy file under the same file rules as LoadPolicy and decodes its
+// records with DecodeRecords: for narrowing only.
+func DecodeFileRecords(path string) ([]Record, error) {
+	data, err := readDocument(path)
+	if err != nil {
+		return nil, err
+	}
+	return DecodeRecords(data)
+}
+
+// DecodeRecords decodes the consent records of a policy document of any supported schema version
+// with the same strict shape checks LoadPolicy applies, but without checking the records against the
+// filesystem (existence, canonical spelling, overlap) or resolving symlinks: paths are only cleaned.
+// It exists so a document that fails validation can still NARROW consent — a root it no longer
+// lists as active at the same generation is withdrawn. Never grant consent from its result.
+func DecodeRecords(data []byte) ([]Record, error) {
+	schema, err := documentSchema(data)
+	if err != nil {
+		return nil, err
+	}
+	var roots []rawRecordV2
+	switch schema {
+	case Schema:
+		var v1 documentV1
+		if err := decodeStrict(data, &v1); err != nil {
+			return nil, err
+		}
+		for _, r := range v1.Roots {
+			roots = append(roots, rawRecordV2{rawRecord: r})
+		}
+	case SchemaV2:
+		var v2 documentV2
+		if err := decodeStrict(data, &v2); err != nil {
+			return nil, err
+		}
+		roots = v2.Roots
+	case SchemaV3:
+		var v3 documentV3
+		if err := decodeStrict(data, &v3); err != nil {
+			return nil, err
+		}
+		roots = v3.Roots
+	default:
+		return nil, fmt.Errorf("root policy schema %q is not supported", schema)
+	}
+	out := make([]Record, 0, len(roots))
+	for i, r := range roots {
+		if r.Path == "" || !filepath.IsAbs(r.Path) || r.Generation == 0 {
+			return nil, fmt.Errorf("root policy record %d is malformed", i)
+		}
+		out = append(out, Record{Path: filepath.Clean(r.Path), Generation: r.Generation, Active: r.Active, Mode: r.Mode, Kind: r.Kind})
+	}
+	return out, nil
 }
 
 // documentSchema reads schema_version alone so the document can then be decoded against the strict

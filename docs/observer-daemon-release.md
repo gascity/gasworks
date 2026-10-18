@@ -65,6 +65,7 @@ Everything below is read-only and safe against a running daemon.
 | `$STATE/identity` | source id + WAL format version, CRC32C-checked | **preserve** |
 | `$STATE/ack` | `acknowledged_through`, CRC32C-checked | **preserve** |
 | `$STATE/reserves` | open-run terminal capacity reserves | preserve |
+| `$STATE/consent-ledger.json` | withheld-observation decisions under a live `-root-policy-file`, plus the last graceful shutdown's consent origins (CRC-32C-checked) | **preserve** — see below |
 | `$STATE/recovery/*.torn-tail` | forensic dumps of discarded bytes | safe to archive |
 | `$STATE/daemon.lock` | flock target; the held lock is the liveness proof | leave in place |
 | `$STATE/socket` | runtime AF_UNIX socket, re-created on start | leave in place |
@@ -101,6 +102,16 @@ done
 If every `fmt=` matches the identity's `fmt=` and equals `spool.CurrentFormatVersion` in the
 build you are rolling to (today: `1`), §4 does not apply and the upgrade is a drop-in
 binary swap.
+
+`consent-ledger.json` is written by a daemon run with `-root-policy-file`. It lists the
+sequences withheld after a consent withdrawal; a withheld sequence is uploaded as a placeholder,
+and the collector binds a sequence to the first payload it receives. A daemon of this build
+honors the ledger whether or not it is given `-root-policy-file`. But while the ledger lists
+sequences above `acknowledged_through`, **do not delete it and do not roll back to a build
+without it**: either re-sends those sequences as captured, which is both an upload of withdrawn
+evidence and a 409 hold that wedges the batch lane. A daemon refuses to start on a ledger that
+fails its checksum. Drain first (`acknowledged_through` past every withheld range) and both
+become safe.
 
 ## 3. Canary order
 
@@ -305,6 +316,16 @@ Expect, within a poll interval or two:
 ```
 gasworks-companion daemon: content upload: sent <locator> for session <id> (<n> bytes, gc_session_id=<id>)
 ```
+
+With `-root-policy-file`, the daemon follows the policy file live: expect one
+`consent policy <path> loaded: ...` line at start, then
+`transcript watcher applied consent policy version N: ...` (or `... consents to no transcript
+root; transcript capture is idle`), and one `consent policy <path> applied (version N): ...`
+line per consent change written while it runs.
+`consent policy <path> cannot be applied: ...; content upload is withdrawn (fail closed)` means
+the policy file is unreadable or invalid; fix the file, not the daemon.
+`consent policy version N cannot be applied to the transcript watcher: ...` means transcript
+capture is paused until a policy the watcher can apply is written.
 
 New since older builds: `content upload: refusing <locator>: <reason> guard`. That is the
 always-on content guard (secret-filename denylist, per-provider transcript-shape allowlist,

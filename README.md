@@ -245,6 +245,44 @@ The recall axis is **idle by default** and never dials until a URL, a source id,
 
 > **Raw-transcript egress — no content redaction by design.** Recall ships the full transcript bytes, which may contain anything pasted into a session (secrets, code, PII). This is an operator-acknowledged channel: the axis is disabled unless explicitly configured, scoped to the narrow per-provider subdirs, https-only, symlink-contained, and never follows redirects or leaks the bearer across a non-TLS hop.
 
+### Companion consent policy (`gasworks-companion daemon -root-policy-file`)
+
+The root policy file is the companion daemon's **live consent policy**. The daemon re-reads it while it runs — one `lstat` before every whole-transcript content upload, every observation batch, and every transcript poll, and a re-read only when the file's identity, size, mode, owner, or change/modification time moved — so a consent change applies at the daemon's next check, without a restart. (It governs `gasworks-companion` only, not `gasworks-forwarder` recall.)
+
+Schema `gasworks.companion.root-policy/v3` is v2 plus the owner's content-upload consent, which v3 requires as an explicit boolean:
+
+```json
+{
+  "schema_version": "gasworks.companion.root-policy/v3",
+  "content_upload": false,
+  "roots": [
+    {"path": "/home/me/.codex/sessions", "generation": 4, "active": true, "mode": "forward-only", "kind": "transcripts"},
+    {"path": "/home/me/.claude/projects/-home-me-app", "generation": 7, "active": false}
+  ],
+  "stores": []
+}
+```
+
+- **Write it atomically and owner-only.** Write a temporary file in the same directory and `rename` it over the policy; the file must be a regular `0600` file owned by the daemon's user (the same rules as v1/v2).
+- **Every consent decision is bound to a `(path, generation)` pair**, and evidence captured under one generation is never uploaded under another. Withdraw a root with a tombstone — its record kept with `"active": false` and a higher `generation` — and consent again (or change its mode) with a higher `generation` still. Dropping a record also withdraws the root, but consenting to it again at the generation it had would resume capture where it stopped, including bytes written while consent was withdrawn.
+- **`content_upload`** decides whole-transcript content upload, in both directions. A v1 or v2 document states no content consent, so for it the `-content-upload` flag (default from `OBSERVER_CONTENT_UPLOAD`) keeps deciding, exactly as before. A daemon without `-collector` never uploads content.
+- **Upgrade daemons before writing v3.** A daemon older than this policy schema refuses a v3 document at startup.
+
+What a change does:
+
+| Change | Effect |
+|---|---|
+| `content_upload` turned off | No further content upload: transcripts queued for upload are dropped unsent and an upload in flight is cancelled. Metadata capture continues. |
+| A root withdrawn | The root is no longer tailed. Its queued content is dropped and an in-flight upload of it cancelled. Its observations captured but not yet uploaded are **withheld**: each is uploaded only as a content-free `CAPTURE_DIAGNOSTIC` placeholder (`CAPTURE_LOSS`, `LOST`) at the same sequence, because the batch lane is gap-free and the collector binds every sequence to one payload. An observation already sent once is replayed unchanged. |
+| A root re-registered (new generation) | It is tailed again under the new generation, activated per its `mode` as at startup. What the earlier generation captured and had not uploaded is withheld, and its queued content dropped — for a `forward-only` root that backlog is below the new floor and is not captured again. |
+| A root or content consent granted | Takes effect on the next scan; a newly consented root is activated per its `mode`, exactly as at startup. |
+| The file becomes unreadable or invalid | **Fail closed:** content upload stops at once (as for `content_upload: false`) and the problem is logged loudly. Metadata capture continues under the last valid policy — narrowed by the invalid document if it can still be decoded: a root it no longer lists as active at the same generation is withdrawn (and, as for any withdrawal, its unsent backlog stays withheld even if a later valid document restores it), and nothing it adds is granted. A valid file restores it. |
+| A valid policy the watcher cannot apply (for example a generation lower than one already applied, or a root that contains the cursor directory) | All transcript capture pauses, logged once, until a policy that can be applied is written. |
+
+Each applied change is logged as one line (`consent policy <path> applied (version N): ...`, then `transcript watcher applied consent policy version N: ...`). A policy file that is invalid **at startup** still fails startup (exit 2).
+
+Withheld decisions are recorded, checksummed, in `consent-ledger.json` in the state directory (`-dir`) before the batch carrying them is sent, so they survive a restart — and they are honored even by a daemon later started without `-root-policy-file` over the same state directory; keep the ledger with the spool. A graceful shutdown also records the consent origins of everything it captured but had not sent, so a withdrawal written while the daemon is stopped still applies to that backlog at the next start. What remains outside the fence: observations queued by a run that **crashed** carry no recorded origin and upload as captured after the restart, as does an observation whose durable append outlived its sink's timeout (the watcher re-delivers it, attributed, and the re-delivery is fenced); observations the run wrapper (`gasworks-companion run`) or the provider hook append are not tied to a watched root and are not withheld by a root withdrawal; and a placeholder still reveals that an observation existed at that sequence and when it was captured.
+
 ## Verifying a release
 
 Every released artifact is keyless-signed with [cosign](https://github.com/sigstore/cosign) (Fulcio cert + Rekor transparency log). Before trusting a binary — and the pack's forwarder install stub does exactly this (M19) — verify it and **fail closed**, pinning both the signing identity (this repo) and the OIDC issuer (GitHub Actions):

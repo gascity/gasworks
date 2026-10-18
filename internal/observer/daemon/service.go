@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/consent"
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/local"
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
@@ -57,11 +58,32 @@ type Service struct {
 	upload         *uploadLoop
 	uploadInterval time.Duration
 
+	// watchMu serializes transcript-watcher passes (the watch loop and PollTranscripts) and guards
+	// the watcher fields below: the watcher is not safe for concurrent use, and under a live consent
+	// policy a pass may replace it.
+	watchMu       sync.Mutex
 	watcher       *codex.Watcher
 	watchInterval time.Duration
 
 	content         *contentUploader
 	contentInterval time.Duration
+
+	// consent is the live consent policy (nil: the static configuration). Under it the watcher is
+	// built from the policy and rebuilt whenever its shape changes, and fence keeps every captured
+	// observation inside the consent it was captured under through upload.
+	consent *consent.Source
+	fence   *consentFence
+	// watchCfg and sink are kept to rebuild the watcher; watchShape is the shape the current
+	// watcher was built for (valid when watchShapeSet), and watchBuildErr de-duplicates the log of a
+	// policy the watcher cannot be built for.
+	watchCfg      *WatchLoopConfig
+	sink          *CandidateSinkAdapter
+	watchShape    watchShape
+	watchShapeSet bool
+	watchBuildErr string
+	// contentUnavailableNoted de-duplicates the log that the policy grants content upload this daemon
+	// cannot perform (no collector).
+	contentUnavailableNoted bool
 
 	now func() time.Time
 	log func(string)
@@ -86,7 +108,7 @@ const (
 	DefaultUploadInterval = time.Second
 	// DefaultShutdownTimeout bounds Run's graceful drain when ctx is cancelled.
 	DefaultShutdownTimeout = 10 * time.Second
-	// watchRestartBackoff paces a watcher restart after a transient poll/sink failure so a
+	// watchRestartBackoff paces the next watcher pass after a transient poll/sink failure so a
 	// persistent failure does not busy-spin the poll loop.
 	watchRestartBackoff = 250 * time.Millisecond
 	// dirLockFilename is the advisory-lock file under the state directory. The held flock — never
@@ -118,8 +140,17 @@ type ServiceConfig struct {
 	// ContentUpload, when non-nil AND Watch is set, enables the whole-transcript content side
 	// channel. It reuses the watcher (for per-transcript observations + native-session lookup) and
 	// its Sender must be the same authenticated collector client the observation uploader uses.
-	// It is opt-in and never changes the metadata-only behavior when nil.
+	// It is opt-in and never changes the metadata-only behavior when nil. Under Consent it is the
+	// content channel's wiring only: whether content is uploaded follows the live policy.
 	ContentUpload *ContentUploadLoopConfig
+
+	// Consent, when non-nil, is the live consent policy and requires Watch. The watcher's roots come
+	// from it (Watch.ApprovedRoots and Watch.RootPolicies must be empty), content upload follows its
+	// content consent, and it is re-checked before every observation batch, every content upload,
+	// and every transcript poll: a narrowing stops capture and upload of what it withdraws at once
+	// (queued content is dropped, queued observations are withheld), and a widening takes effect at
+	// the next poll. nil keeps the static configuration.
+	Consent *consent.Source
 
 	// PeerUID overrides the socket peer-uid reader (a test seam). nil selects the native
 	// Linux or Darwin credential API.
@@ -259,6 +290,48 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		now:      now,
 		log:      cfg.Log,
 		lock:     lock,
+		consent:  cfg.Consent,
+	}
+
+	// 3b. Under a live consent policy, load the consent fence for the spool as recovered: it must
+	// know every withheld decision before the uploader can form a batch.
+	if cfg.Consent != nil {
+		if cfg.Watch == nil {
+			_ = sp.Close()
+			return nil, errors.New("observer daemon: a live consent policy requires the transcript watcher configuration")
+		}
+		if len(cfg.Watch.ApprovedRoots) > 0 || len(cfg.Watch.RootPolicies) > 0 {
+			_ = sp.Close()
+			return nil, errors.New("observer daemon: under a live consent policy the watcher's roots come from the policy, not the watch configuration")
+		}
+		health, err := sp.Health()
+		if err != nil {
+			_ = sp.Close()
+			return nil, fmt.Errorf("observer daemon: spool health: %w", err)
+		}
+		fence, err := newConsentFence(cfg.Dir, cfg.Consent, health.HighestDurable, s.log)
+		if err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
+		s.fence = fence
+	} else if exists, err := ledgerExists(cfg.Dir); err != nil || exists {
+		// A ledger left by a run under a live policy is honored even without one (see consentFence).
+		if err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
+		health, err := sp.Health()
+		if err != nil {
+			_ = sp.Close()
+			return nil, fmt.Errorf("observer daemon: spool health: %w", err)
+		}
+		fence, err := newConsentFence(cfg.Dir, nil, health.HighestDurable, s.log)
+		if err != nil {
+			_ = sp.Close()
+			return nil, err
+		}
+		s.fence = fence
 	}
 
 	// 4. Prepare the uploader loop.
@@ -274,6 +347,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 			sender:   cfg.Upload.Sender,
 			caps:     cfg.Upload.Caps,
 			retry:    cfg.Upload.Retry,
+			fence:    s.fence,
 		}
 		s.uploadInterval = durationOr(cfg.Upload.Interval, DefaultUploadInterval)
 	}
@@ -298,13 +372,31 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 			s.contentInterval = durationOr(cfg.ContentUpload.Interval, DefaultContentInterval)
 			obs = cu
 		}
-		w, err := s.buildWatcher(cfg.Watch, sink, obs)
-		if err != nil {
-			_ = sp.Close()
-			return nil, err
+		s.watchInterval = durationOr(cfg.Watch.Interval, codex.DefaultPollInterval)
+		if s.consent != nil {
+			// The watcher is built from the live policy, and rebuilt by every later pass whose policy
+			// changed its shape. A policy the watcher cannot be built for fails startup, as a static
+			// configuration would.
+			s.watchCfg, s.sink = cfg.Watch, sink
+			pol := s.consent.Latest()
+			if err := s.rebuildWatcherLocked(pol, shapeOf(pol, s.content != nil)); err != nil {
+				_ = sp.Close()
+				return nil, err
+			}
+		} else {
+			w, err := s.buildWatcher(cfg.Watch, NewPartialCandidateSinkAdapter(sink), obs)
+			if err != nil {
+				_ = sp.Close()
+				return nil, err
+			}
+			s.watcher = w
 		}
-		s.watcher = w
-		s.watchInterval = cfg.Watch.Interval
+	}
+
+	// A consent change cancels and drops content the new policy no longer covers, on whichever loop
+	// observes it. Subscribed last, so only a fully built service is ever notified.
+	if s.consent != nil && s.content != nil {
+		s.consent.Subscribe(s.content.onConsentChange)
 	}
 
 	ok = true
@@ -381,15 +473,15 @@ func (s *Service) buildSink(cfg *WatchLoopConfig, socketPath string) (*Candidate
 	return sink, nil
 }
 
-// buildWatcher wires the committed candidate sink (with the partial-commit refinement) onto a codex
-// watcher, plus the optional whole-file content observer (nil when content upload is disabled).
-func (s *Service) buildWatcher(cfg *WatchLoopConfig, sink *CandidateSinkAdapter, obs codex.ContentObserver) (*codex.Watcher, error) {
+// buildWatcher wires a candidate sink (with the partial-commit refinement) onto a codex watcher, plus
+// the optional whole-file content observer (nil when content upload is disabled).
+func (s *Service) buildWatcher(cfg *WatchLoopConfig, sink codex.PartialCandidateSink, obs codex.ContentObserver) (*codex.Watcher, error) {
 	w, err := codex.NewWatcher(codex.WatchConfig{
 		ApprovedRoots:   cfg.ApprovedRoots,
 		RootPolicies:    cfg.RootPolicies,
 		StateDir:        cfg.StateDir,
 		References:      cfg.References,
-		Sink:            NewPartialCandidateSinkAdapter(sink),
+		Sink:            sink,
 		ContentObserver: obs,
 		Match:           cfg.Match,
 		Interval:        cfg.Interval,
@@ -421,6 +513,7 @@ func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAda
 		read:     codex.ReadValidatedTranscript,
 		now:      s.now,
 		log:      s.log,
+		consent:  cfg.Consent,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)
@@ -458,7 +551,9 @@ func (s *Service) Start() error {
 			s.runUploadLoop(s.loopCtx)
 		}()
 	}
-	if s.watcher != nil {
+	if s.watcher != nil || s.watchCfg != nil {
+		// Under a live consent policy the loop runs even while no root is consented: a later policy
+		// can consent to one, and the loop is what applies it.
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -525,8 +620,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.wg.Wait()
 		close(drained)
 	}()
+	loopsStopped := false
 	select {
 	case <-drained:
+		loopsStopped = true
 	case <-ctx.Done():
 	}
 
@@ -538,6 +635,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	if s.upload != nil && ctx.Err() == nil {
 		if err := s.upload.drain(ctx); err != nil {
 			s.logf("final upload drain: %v", err)
+		}
+	}
+	// Hand the consent origins of what this run captured but did not send to the next start, so a
+	// withdrawal written while the daemon is stopped still withholds it. Only once every loop has
+	// stopped: the record must follow this run's last upload attempt.
+	if s.fence != nil && loopsStopped {
+		if err := s.recordShutdownConsent(); err != nil {
+			s.logf("record consent origins at shutdown: %v", err)
 		}
 	}
 	closeErr := s.spool.Close()
@@ -583,22 +688,54 @@ func (s *Service) runUploadLoop(ctx context.Context) {
 	}
 }
 
-// runWatchLoop runs the transcript watcher until ctx is cancelled, restarting it after a transient
-// poll/sink failure. The durable cursor makes a restart at-least-once-safe: it resumes from the
-// last committed offset and re-reads only the undelivered tail.
+// runWatchLoop runs a transcript-watcher pass on the poll cadence until ctx is cancelled, backing off
+// briefly after a transient poll/sink failure. The durable cursor makes a retry at-least-once-safe:
+// it resumes from the last committed offset and re-reads only the undelivered tail.
 func (s *Service) runWatchLoop(ctx context.Context) {
+	t := time.NewTicker(s.watchInterval)
+	defer t.Stop()
 	for {
-		err := s.watcher.Run(ctx)
-		if ctx.Err() != nil {
+		select {
+		case <-ctx.Done():
 			return
+		case <-t.C:
 		}
-		s.logf("watcher restart: %v", err)
+		err := s.PollTranscripts(ctx)
+		if err == nil || ctx.Err() != nil {
+			continue
+		}
+		s.logf("watcher pass failed (retrying): %v", err)
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(watchRestartBackoff):
 		}
 	}
+}
+
+// PollTranscripts runs one transcript-watcher pass now — the pass the watch loop drives. Under a
+// live consent policy it first re-checks the policy and, when the policy changed the watcher's
+// shape (its consented roots or whether content is observed), rebuilds the watcher before polling:
+// a withdrawn root is no longer tailed and a newly consented one is scanned on this very pass. It
+// is the deterministic unit for tests and an on-demand rescan.
+func (s *Service) PollTranscripts(ctx context.Context) error {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+	if s.consent != nil {
+		if err := s.applyWatchConsentLocked(s.consent.Current()); err != nil {
+			return nil // logged once by applyWatchConsentLocked; capture stays paused until it applies
+		}
+	}
+	if s.watcher == nil {
+		return nil
+	}
+	err := s.watcher.Poll(ctx)
+	if errors.Is(err, errConsentWithdrawn) {
+		// The policy changed during this pass and a transcript's consent is gone. Nothing past the
+		// refusal was appended; the next pass rebuilds the watcher without the withdrawn root.
+		return nil
+	}
+	return err
 }
 
 // runContentLoop drives the whole-transcript content side channel on a bounded ticker until ctx is
@@ -612,8 +749,17 @@ func (s *Service) runContentLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			s.content.tick(ctx)
+			s.TickContentUploads(ctx)
 		}
+	}
+}
+
+// TickContentUploads runs one content-upload pass now — the pass the content loop drives. It is the
+// deterministic unit for tests and an on-demand flush; it is a no-op when content upload is not
+// wired.
+func (s *Service) TickContentUploads(ctx context.Context) {
+	if s.content != nil {
+		s.content.tick(ctx)
 	}
 }
 
@@ -634,6 +780,8 @@ type uploadLoop struct {
 	sender   upload.Sender
 	caps     upload.Caps
 	retry    upload.RetryPolicy
+	// fence, when non-nil, applies the live consent policy before every batch (nil: no live policy).
+	fence *consentFence
 
 	// mu serializes every pass so at most one drainer touches the WAL and the ack sidecar at a
 	// time. The background ticker and an on-demand DrainUploads both funnel through it; without it,
@@ -651,16 +799,20 @@ type uploadLoop struct {
 func (u *uploadLoop) drain(ctx context.Context) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	snap, err := u.spool.Health()
+	highest, err := u.highestDurable()
 	if err != nil {
-		return fmt.Errorf("observer daemon: spool health: %w", err)
+		return err
 	}
-	ack, err := spool.LoadAckState(u.dir, snap.HighestDurable, spool.AckOptions{})
+	ack, err := spool.LoadAckState(u.dir, highest, spool.AckOptions{})
 	if err != nil {
 		return fmt.Errorf("observer daemon: load ack state: %w", err)
 	}
+	var store upload.FrameStore = upload.SpoolFrameStore{Dir: u.dir}
+	if u.fence != nil {
+		store = u.fence.frameStore(store)
+	}
 	planner := &upload.Planner{
-		Store:    upload.SpoolFrameStore{Dir: u.dir},
+		Store:    store,
 		Ack:      ack,
 		Caps:     u.caps,
 		SourceID: u.sourceID,
@@ -675,6 +827,13 @@ func (u *uploadLoop) drain(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if u.fence != nil {
+			// Re-checked before every batch: a narrowing written while this pass drains a backlog
+			// withholds the rest of it.
+			if err := u.fence.refresh(); err != nil {
+				return err
+			}
+		}
 		plan, ok, err := planner.Next()
 		if err != nil {
 			return fmt.Errorf("observer daemon: plan batch: %w", err)
@@ -682,10 +841,34 @@ func (u *uploadLoop) drain(ctx context.Context) error {
 		if !ok {
 			return nil // nothing owed
 		}
+		if u.fence != nil {
+			if err := u.fence.beforeSend(plan.Range); err != nil {
+				return err // the withheld decisions are not recorded, so nothing is sent
+			}
+		}
 		if err := deliverer.Deliver(ctx, plan); err != nil {
 			return err // hold / retries exhausted / transient: nothing advanced; retried next pass
 		}
+		if u.fence != nil {
+			u.fence.acknowledged(ack.AcknowledgedThrough())
+		}
 	}
+}
+
+// highestDurable reads the spool's highest durable sequence — under the consent fence's gate when
+// one is set, so every watcher frame at or below it already has its consent origin recorded.
+func (u *uploadLoop) highestDurable() (int64, error) {
+	read := func() (int64, error) {
+		snap, err := u.spool.Health()
+		if err != nil {
+			return 0, fmt.Errorf("observer daemon: spool health: %w", err)
+		}
+		return snap.HighestDurable, nil
+	}
+	if u.fence == nil {
+		return read()
+	}
+	return u.fence.ceiling(read)
 }
 
 // durationOr returns d when positive, else fallback.

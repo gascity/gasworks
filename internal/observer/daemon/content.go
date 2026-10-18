@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/consent"
 	"github.com/gascity/gasworks/internal/observer/contentguard"
 	"github.com/gascity/gasworks/internal/observer/upload"
 	"github.com/gascity/gasworks/internal/observer/wire"
@@ -117,6 +118,9 @@ type contentUploaderConfig struct {
 	read     transcriptReader
 	now      func() time.Time
 	log      func(string)
+	// consent, when non-nil, is the live consent policy every observation and upload is checked
+	// against (see contentUploader.consent).
+	consent *consent.Source
 }
 
 // contentUploader ships whole-transcript snapshots to the collector's content endpoint as a side
@@ -135,9 +139,22 @@ type contentUploader struct {
 	read     transcriptReader
 	now      func() time.Time
 	log      func(string)
+	// consent, when non-nil, gates every observation and every upload on the live consent policy:
+	// content upload must be consented and the transcript's consent root still consented at the
+	// generation it was observed under. The policy is re-checked before every upload; a narrowing
+	// drops the queued state it no longer covers and cancels an in-flight upload it no longer
+	// covers. nil (no -root-policy-file) keeps the static -content-upload behavior.
+	consent *consent.Source
+
+	// tickMu serializes ticks, so the content loop and an on-demand tick never upload the same
+	// snapshot twice.
+	tickMu sync.Mutex
 
 	mu    sync.Mutex
 	files map[transcriptIdentity]*contentState
+	// inflight is the upload being sent right now, if any, so a consent narrowing can cancel it.
+	// Guarded by u.mu.
+	inflight *contentFlight
 	// guardRefusals counts transcripts dropped by an always-on content guard (denylist / allowlist /
 	// PEM sniff), keyed by reason, so a refused credential/config/key file is visible and testable —
 	// counted + logged, never silent. Guarded by u.mu.
@@ -150,10 +167,20 @@ type contentUploader struct {
 	holdUntil time.Time
 }
 
+// contentFlight is one upload being sent: its consent origin, the cancel for its request, and
+// whether a consent narrowing withdrew it.
+type contentFlight struct {
+	origin    consentOrigin
+	cancel    context.CancelFunc
+	withdrawn bool
+}
+
 // contentState is the per-transcript upload bookkeeping, keyed by filesystem identity.
 type contentState struct {
 	root, locator, path string
-	size, modNanos      int64
+	// origin is the consent the transcript was observed under (zero without a live consent policy).
+	origin         consentOrigin
+	size, modNanos int64
 	// stableSince is when the current (size,modNanos) was first observed; the file is "stable" once
 	// now-stableSince >= debounce. Any size/mtime change resets it.
 	stableSince time.Time
@@ -254,6 +281,7 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 		read:     read,
 		now:      now,
 		log:      cfg.log,
+		consent:  cfg.consent,
 		files:    map[transcriptIdentity]*contentState{},
 
 		guardRefusals: map[contentguard.Reason]int{},
@@ -268,14 +296,25 @@ var _ codex.ContentObserver = (*contentUploader)(nil)
 // so a slow content upload can never stall the metadata poll. Any size/mtime change restarts the
 // stability clock; an unchanged observation lets stability accumulate toward the debounce window.
 func (u *contentUploader) ObserveContent(_ context.Context, o codex.ContentObservation) {
+	u.observe(consentOrigin{}, o)
+}
+
+// observe records one observation captured under origin. Under a live consent policy an
+// observation the policy no longer covers is not queued, and drops whatever was queued for it.
+func (u *contentUploader) observe(origin consentOrigin, o codex.ContentObservation) {
 	id := transcriptIdentity{device: o.Device, inode: o.Inode}
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if !u.allowedLocked(origin) {
+		delete(u.files, id)
+		return
+	}
 	st := u.files[id]
 	if st == nil {
 		st = &contentState{}
 		u.files[id] = st
 	}
+	st.origin = origin
 	st.root, st.locator, st.path = o.Root, o.Locator, o.Path
 	if st.gcSessionID != o.GCSessionID {
 		// Metadata can land after the transcript bytes. Re-arm this exact snapshot so it is sent
@@ -295,6 +334,9 @@ func (u *contentUploader) ObserveContent(_ context.Context, o codex.ContentObser
 // the deterministic unit the content loop drives and tests call directly. Reads and POSTs happen
 // with u.mu released so ObserveContent never blocks on content I/O.
 func (u *contentUploader) tick(ctx context.Context) {
+	u.tickMu.Lock()
+	defer u.tickMu.Unlock()
+	u.refreshConsent()
 	now := u.now()
 	u.mu.Lock()
 	if u.disabled || (!u.holdUntil.IsZero() && now.Before(u.holdUntil)) {
@@ -303,11 +345,16 @@ func (u *contentUploader) tick(ctx context.Context) {
 	}
 	type job struct {
 		id                            transcriptIdentity
+		origin                        consentOrigin
 		root, locator, path           string
 		native, provider, gcSessionID string
 	}
 	var jobs []job
 	for id, st := range u.files {
+		if !u.allowedLocked(st.origin) {
+			delete(u.files, id) // queued under consent that no longer applies: never sent
+			continue
+		}
 		u.ensureMarkerLoadedLocked(id, st)
 		if !st.observed || now.Sub(st.stableSince) < u.debounce {
 			continue // still growing or not stable long enough
@@ -345,7 +392,7 @@ func (u *contentUploader) tick(ctx context.Context) {
 			st.markEvaluated(st.size, st.modNanos, st.gcSessionID)
 			continue
 		}
-		jobs = append(jobs, job{id: id, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID})
+		jobs = append(jobs, job{id: id, origin: st.origin, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID})
 	}
 	u.mu.Unlock()
 
@@ -353,16 +400,75 @@ func (u *contentUploader) tick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Consent is re-checked before every upload: a narrowing written since this tick began drops
+		// the jobs it no longer covers before any of their bytes are read.
+		u.refreshConsent()
 		// A shed (429) or provision/auth latch (401/403/404/501) recorded while processing an earlier
 		// job in this same tick must stop the rest — re-check before each POST, not only at tick entry.
 		u.mu.Lock()
 		stop := u.disabled || (!u.holdUntil.IsZero() && u.now().Before(u.holdUntil))
+		skip := !u.allowedLocked(j.origin) || u.files[j.id] == nil
 		u.mu.Unlock()
 		if stop {
 			return
 		}
-		u.processOne(ctx, j.id, j.root, j.locator, j.path, j.native, j.provider, j.gcSessionID)
+		if skip {
+			continue
+		}
+		u.processOne(ctx, j.id, j.origin, j.root, j.locator, j.path, j.native, j.provider, j.gcSessionID)
 	}
+}
+
+// refreshConsent re-checks the live consent policy; a change runs onConsentChange.
+func (u *contentUploader) refreshConsent() {
+	if u.consent != nil {
+		u.consent.Current()
+	}
+}
+
+// allowedLocked reports whether the live consent policy still covers content captured under origin.
+// Without a live policy everything the watcher observes is covered. Called under u.mu.
+func (u *contentUploader) allowedLocked(origin consentOrigin) bool {
+	if u.consent == nil {
+		return true
+	}
+	return contentAllowedBy(u.consent.Latest(), origin)
+}
+
+// contentAllowedBy reports whether p consents to uploading content captured under origin.
+func contentAllowedBy(p consent.Policy, origin consentOrigin) bool {
+	return p.ContentUpload && origin.allowedBy(p)
+}
+
+// onConsentChange applies a consent change to content not yet sent: queued transcripts the policy no
+// longer covers are dropped, and an upload in flight that it no longer covers is cancelled. It is
+// the consent Source's subscriber, so it runs on whichever daemon loop observed the change.
+func (u *contentUploader) onConsentChange() {
+	p := u.consent.Latest()
+	u.mu.Lock()
+	dropped := 0
+	for id, st := range u.files {
+		if !contentAllowedBy(p, st.origin) {
+			delete(u.files, id)
+			dropped++
+		}
+	}
+	if f := u.inflight; f != nil && !f.withdrawn && !contentAllowedBy(p, f.origin) {
+		f.withdrawn = true
+		f.cancel() // postSnapshot logs the withdrawal when the request returns
+	}
+	u.mu.Unlock()
+	if dropped > 0 {
+		u.logf("content upload: consent narrowed; dropped %d queued transcripts without sending them", dropped)
+	}
+}
+
+// dropAll forgets every queued transcript. The daemon calls it when it rebuilds the watcher for a
+// changed consent policy; the new watcher re-observes what it still tails.
+func (u *contentUploader) dropAll() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	clear(u.files)
 }
 
 // resolveSessionLocked resolves the native session id + provider for a transcript, preferring the
@@ -382,7 +488,7 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 // the outcome. The native session id + provider are already resolved and validated by the caller, so
 // no whole-file read happens for a transcript whose session id is unknown or structurally invalid.
 // All slow work (file read, network POST) runs without u.mu held.
-func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity, root, locator, path, native, provider, gcSessionID string) {
+func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity, origin consentOrigin, root, locator, path, native, provider, gcSessionID string) {
 	content, rsize, rmod, err := u.read(root, locator, id.device, id.inode, u.maxBytes)
 	if errors.Is(err, codex.ErrTranscriptTooLarge) {
 		u.mu.Lock()
@@ -462,15 +568,31 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 	}
 	u.mu.Unlock()
 
-	u.postSnapshot(ctx, id, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, sendGC)
+	u.postSnapshot(ctx, id, origin, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, sendGC)
 }
 
 // postSnapshot POSTs one already-read, already-hashed snapshot and records the outcome. observedGC is
 // the binding the watcher read from the transcript's sidecar and is what all dedup bookkeeping is
 // keyed by; sendGC is what actually goes on the wire, which is "" once the collector has refused the
 // binding. Called with u.mu released.
-func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentity, locator, path string, content []byte, hash string, rsize, rmod int64, native, provider, observedGC, sendGC string) {
-	res, err := u.sender.PostContent(ctx, upload.ContentRequest{
+func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentity, origin consentOrigin, locator, path string, content []byte, hash string, rsize, rmod int64, native, provider, observedGC, sendGC string) {
+	// Consent is checked right before the request (the file read that precedes it can be long), and
+	// the upload is registered under the same lock a consent narrowing takes: either the narrowing
+	// is already visible here and nothing is sent, or it cancels this request.
+	u.refreshConsent()
+	postCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	u.mu.Lock()
+	if !u.allowedLocked(origin) {
+		delete(u.files, id)
+		u.mu.Unlock()
+		return
+	}
+	flight := &contentFlight{origin: origin, cancel: cancel}
+	u.inflight = flight
+	u.mu.Unlock()
+
+	res, err := u.sender.PostContent(postCtx, upload.ContentRequest{
 		NativeSessionID: native,
 		GCSessionID:     sendGC,
 		Provider:        provider,
@@ -481,6 +603,16 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 	gcSessionID := observedGC
 	now := u.now()
 	u.mu.Lock()
+	u.inflight = nil
+	if flight.withdrawn && err != nil {
+		// Consent was narrowed while this upload was in flight and the request was cancelled. That is
+		// not a collector failure: no hold, no retry; the transcript's queued state is already gone.
+		// (A request that completed before the cancellation landed is recorded as what it was.)
+		delete(u.files, id)
+		u.mu.Unlock()
+		u.logf("content upload: withdrew the in-flight upload of %s (consent narrowed)", locator)
+		return
+	}
 	st := u.files[id]
 	if err != nil {
 		u.holdUntil = now.Add(contentTransientHold)
@@ -524,7 +656,7 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 		if logIt {
 			u.logf("content upload: collector refused the gc session binding for %s (session %s)%s; re-sending without it", locator, native, serverMessage(res))
 		}
-		u.postSnapshot(ctx, id, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, "")
+		u.postSnapshot(ctx, id, origin, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, "")
 	case res.StatusCode == 409:
 		// Idempotency content mismatch: the server already holds different bytes for this
 		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.

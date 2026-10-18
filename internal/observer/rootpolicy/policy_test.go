@@ -263,7 +263,8 @@ func TestLoadPolicyV2RejectsInvalidDocuments(t *testing.T) {
 		"v2 refuses unknown field": `{"schema_version":"gasworks.companion.root-policy/v2","roots":[],"extra":true}`,
 		"v2 refuses trailing value": `{"schema_version":"gasworks.companion.root-policy/v2","roots":[]}` +
 			`{"schema_version":"gasworks.companion.root-policy/v2","roots":[]}`,
-		"unsupported schema":         `{"schema_version":"gasworks.companion.root-policy/v3","roots":[],"stores":[]}`,
+		"unsupported schema":         `{"schema_version":"gasworks.companion.root-policy/v4","roots":[],"stores":[]}`,
+		"v2 refuses content_upload":  `{"schema_version":"gasworks.companion.root-policy/v2","content_upload":true,"roots":[]}`,
 		"unknown kind":               v2(`{"path":"`+root+`","generation":1,"active":true,"mode":"forward-only","kind":"folder"}`, ""),
 		"project root without store": v2(activeProject, ""),
 		"nested project roots": v2(`{"path":"`+nestedParent+`","generation":1,"active":true,"mode":"forward-only","kind":"project"},`+
@@ -283,5 +284,112 @@ func TestLoadPolicyV2RejectsInvalidDocuments(t *testing.T) {
 				t.Fatal("LoadPolicy succeeded, want error")
 			}
 		})
+	}
+}
+
+// TestLoadPolicyV3StatesContentConsent pins the v3 contract: content_upload is the owner's
+// whole-transcript content consent, stated explicitly as true or false, and the rest of the
+// document keeps v2's roots and stores semantics. v1 and v2 documents state no content decision.
+func TestLoadPolicyV3StatesContentConsent(t *testing.T) {
+	root := t.TempDir()
+	project := t.TempDir()
+	store := t.TempDir()
+	for _, tc := range []struct {
+		flag string
+		want ContentConsent
+	}{{"true", ContentGranted}, {"false", ContentDenied}} {
+		body := `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":` + tc.flag + `,"roots":[` +
+			`{"path":"` + root + `","generation":2,"active":true,"mode":"backfill","kind":"transcripts"},` +
+			`{"path":"` + project + `","generation":3,"active":true,"mode":"forward-only","kind":"project"}],` +
+			`"stores":["` + store + `"]}`
+		policy, err := LoadPolicy(writePolicy(t, body))
+		if err != nil {
+			t.Fatalf("LoadPolicy(content_upload=%s): %v", tc.flag, err)
+		}
+		if policy.Content != tc.want {
+			t.Fatalf("content_upload=%s: Content = %v, want %v", tc.flag, policy.Content, tc.want)
+		}
+		want := []Record{
+			{Path: root, Generation: 2, Active: true, Mode: Backfill, Kind: Transcripts},
+			{Path: project, Generation: 3, Active: true, Mode: ForwardOnly, Kind: Project},
+		}
+		if len(policy.Roots) != 2 || policy.Roots[0] != want[0] || policy.Roots[1] != want[1] {
+			t.Fatalf("roots = %+v, want %+v", policy.Roots, want)
+		}
+		if len(policy.Stores) != 1 || policy.Stores[0] != store {
+			t.Fatalf("stores = %v, want [%s]", policy.Stores, store)
+		}
+	}
+
+	for _, body := range []string{
+		`{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + root + `","generation":1,"active":true,"mode":"backfill"}]}`,
+		`{"schema_version":"gasworks.companion.root-policy/v2","roots":[{"path":"` + root + `","generation":1,"active":true,"mode":"backfill"}]}`,
+	} {
+		policy, err := LoadPolicy(writePolicy(t, body))
+		if err != nil {
+			t.Fatalf("LoadPolicy: %v", err)
+		}
+		if policy.Content != ContentUnstated {
+			t.Fatalf("a pre-v3 document stated content consent %v, want ContentUnstated", policy.Content)
+		}
+	}
+}
+
+// TestLoadPolicyV3RequiresAnExplicitContentDecision: an absent, null, or non-boolean
+// content_upload is never read as either answer, and v3 stays as strict as v2 about everything else.
+func TestLoadPolicyV3RequiresAnExplicitContentDecision(t *testing.T) {
+	root := t.TempDir()
+	rootRecord := `{"path":"` + root + `","generation":1,"active":true,"mode":"forward-only"}`
+	for name, body := range map[string]string{
+		"absent":         `{"schema_version":"gasworks.companion.root-policy/v3","roots":[` + rootRecord + `]}`,
+		"null":           `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":null,"roots":[` + rootRecord + `]}`,
+		"string":         `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":"true","roots":[` + rootRecord + `]}`,
+		"number":         `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":1,"roots":[` + rootRecord + `]}`,
+		"unknown field":  `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":false,"roots":[],"metadata_only":true}`,
+		"trailing value": `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":false,"roots":[]}{}`,
+		"invalid root":   `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":false,"roots":[{"path":"relative","generation":1,"active":true,"mode":"backfill"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadPolicy(writePolicy(t, body)); err == nil {
+				t.Fatal("LoadPolicy succeeded, want error")
+			}
+		})
+	}
+}
+
+// TestDecodeRecordsReadsStructureWithoutTheFilesystem: DecodeRecords is the narrowing-only view of a
+// document LoadPolicy refuses — here because an active root's directory is gone — and it still
+// refuses a document whose shape is wrong.
+func TestDecodeRecordsReadsStructureWithoutTheFilesystem(t *testing.T) {
+	gone := filepath.Join(t.TempDir(), "deleted-project")
+	kept := t.TempDir()
+	body := `{"schema_version":"gasworks.companion.root-policy/v3","content_upload":true,"roots":[` +
+		`{"path":"` + gone + `","generation":3,"active":true,"mode":"forward-only"},` +
+		`{"path":"` + kept + `/.","generation":5,"active":false,"mode":""}]}`
+	path := writePolicy(t, body)
+	if _, err := LoadPolicy(path); err == nil {
+		t.Fatal("LoadPolicy accepted an active root whose directory is gone")
+	}
+	got, err := DecodeRecords([]byte(body))
+	if err != nil {
+		t.Fatalf("DecodeRecords: %v", err)
+	}
+	want := []Record{
+		{Path: gone, Generation: 3, Active: true, Mode: ForwardOnly},
+		{Path: kept, Generation: 5},
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("records = %+v, want %+v", got, want)
+	}
+	for _, bad := range []string{
+		`{"schema_version":"gasworks.companion.root-policy/v3","content_upload":true,"roots":[`,
+		`{"schema_version":"gasworks.companion.root-policy/v2","roots":[],"extra":1}`,
+		`{"schema_version":"gasworks.companion.root-policy/v9","roots":[]}`,
+		`{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"relative","generation":1,"active":true,"mode":"backfill"}]}`,
+		`{"schema_version":"gasworks.companion.root-policy/v1","roots":[{"path":"` + kept + `","generation":0,"active":true,"mode":"backfill"}]}`,
+	} {
+		if _, err := DecodeRecords([]byte(bad)); err == nil {
+			t.Fatalf("DecodeRecords accepted %s", bad)
+		}
 	}
 }

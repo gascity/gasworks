@@ -417,6 +417,15 @@ func fsyncDir(dir string) error {
 	return nil
 }
 
+// WriteFileAtomic replaces path with data under the same durable discipline as the identity and
+// ack sidecars, for other durable state kept beside the spool. A crash leaves either the old file
+// or the new one, plus at most one orphaned temporary file named AtomicTempPrefix(path)+"*".
+func WriteFileAtomic(path string, data []byte) error { return atomicWriteFile(path, data) }
+
+// AtomicTempPrefix is the basename prefix of the temporary files WriteFileAtomic(path, ...) creates
+// beside path, so an orphan left by a crash can be recognized and removed.
+func AtomicTempPrefix(path string) string { return ".tmp-" + filepath.Base(path) + "-" }
+
 // atomicWriteFile writes data to path via a temp file, file fsync, rename, and directory
 // fsync, leaving path either fully old or fully new across a crash. Files are owner-only
 // (0600). This is the replacement discipline the identity/ack sidecars use.
@@ -425,7 +434,7 @@ func atomicWriteFile(path string, data []byte) error {
 	if err := ensureDir(dir); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".tmp-"+filepath.Base(path)+"-*")
+	tmp, err := os.CreateTemp(dir, AtomicTempPrefix(path)+"*")
 	if err != nil {
 		return fmt.Errorf("observer spool: create temp for %s: %w", path, err)
 	}
