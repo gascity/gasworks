@@ -89,6 +89,11 @@ type TranscriptRef struct {
 	Locator string
 	Device  uint64
 	Inode   uint64
+	// ConsentRoot is the consent root the transcript was admitted under: the root policy record's
+	// path for a root-policy watcher, else the approved root it was found beneath. It ties every
+	// candidate to the consent that admitted it, so the endpoint can stop honoring that consent the
+	// moment it is withdrawn. Empty on a watcher-scoped diagnostic.
+	ConsentRoot string
 }
 
 // CandidateSink is the narrow seam the watcher hands parsed candidates to, mirroring how the hook
@@ -159,6 +164,9 @@ type ContentObservation struct {
 	// GCSessionID is the authoritative Gas City session binding from the adjacent .gcmeta sidecar.
 	// It is empty when no valid sidecar is present; it is never inferred from the native session id.
 	GCSessionID string
+	// ConsentRoot is the consent root the transcript was admitted under (see TranscriptRef). It
+	// differs from Root for a project member, whose Root is the store it lives in.
+	ConsentRoot string
 }
 
 // ContentObserver is an optional seam the watcher notifies once per tracked file per poll, right
@@ -295,7 +303,18 @@ type trackedFile struct {
 }
 
 func (tf *trackedFile) ref() TranscriptRef {
-	return TranscriptRef{Locator: tf.locator, Device: tf.dev, Inode: tf.ino}
+	return TranscriptRef{Locator: tf.locator, Device: tf.dev, Inode: tf.ino, ConsentRoot: tf.consentRoot()}
+}
+
+// consentRoot is the consent root the file is admitted under right now: for a project member, the
+// project membership routed it to (not the store it lives in); for every other file, the root it was
+// last found beneath — a transcript renamed from one root into another is captured under the
+// consent of the root it is in, not the one it came from.
+func (tf *trackedFile) consentRoot() string {
+	if tf.member && tf.policy != nil {
+		return tf.policy.record.Path
+	}
+	return tf.root
 }
 
 // discovered is one regular file a walk just canonicalized, before it becomes a trackedFile: where
@@ -310,10 +329,12 @@ type discovered struct {
 	ino     uint64
 	size    int64
 	mod     int64
+	// consentRoot is the consent root the file is being admitted under (see TranscriptRef).
+	consentRoot string
 }
 
 func (d discovered) ref() TranscriptRef {
-	return TranscriptRef{Locator: d.locator, Device: d.dev, Inode: d.ino}
+	return TranscriptRef{Locator: d.locator, Device: d.dev, Inode: d.ino, ConsentRoot: d.consentRoot}
 }
 
 // Watcher tails the approved transcript roots by bounded polling. It is not safe for concurrent
@@ -853,7 +874,7 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 					seenLocators[locator] = struct{}{}
 				}
 				cur, forwardBaseline, err := w.cursorFor(ctx, policy, discovered{
-					root: root, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod,
+					root: root, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod, consentRoot: root,
 				}, scan)
 				if err != nil {
 					return nil, fmt.Errorf("sealing %s: %w", f.path, err)
@@ -917,7 +938,7 @@ func (w *Watcher) reconcileScan(ctx context.Context, root string, policy *rootPo
 			tf.locator = locator
 			continue
 		}
-		found := discovered{root: root, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod}
+		found := discovered{root: root, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod, consentRoot: root}
 		cur, forwardBaseline, err := w.cursorFor(ctx, policy, found, scan)
 		if err != nil {
 			if errors.Is(err, errDeferTracking) {
@@ -1495,6 +1516,7 @@ func (w *Watcher) observeContent(ctx context.Context, tf *trackedFile, size, mod
 		Size:        size,
 		ModNanos:    modNanos,
 		GCSessionID: tf.gcSessionID,
+		ConsentRoot: tf.consentRoot(),
 	})
 }
 

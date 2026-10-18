@@ -165,47 +165,59 @@ var _ codex.CandidateSink = (*CandidateSinkAdapter)(nil)
 // the watcher does not advance its cursor past this batch.
 func (a *CandidateSinkAdapter) DeliverCandidates(ctx context.Context, ref codex.TranscriptRef, cands []*codex.Candidate) error {
 	for _, cand := range cands {
-		if cand == nil {
-			continue
+		if _, err := a.deliverOne(ctx, ref, cand); err != nil {
+			return err
 		}
-		native, provider, appended := a.resolveSession(ref, cand)
-		if appended {
-			// A start or usage this sink already made durable, re-delivered with a line re-read after
-			// a partial delivery failure. Re-reading the batch would only skip it again, so it is
-			// safely treated as delivered.
-			continue
-		}
-		if provider == "" {
-			provider = a.provider
-		}
-		env := evidence.PolicyEnvelope{
-			CapturedAt: a.now(),
-			Provenance: evidence.RawProvenance{
-				Provider:            provider,
-				NativeSessionID:     native,
-				ParserVersion:       a.parserVersion,
-				TransformVersion:    a.transformVersion,
-				RootRelativeLocator: ref.Locator,
-			},
-			RunContext: a.runContextFor(native),
-		}
-		res := cand.Transform(a.policy, env)
-		if res.Dropped {
-			// A consent-recorded extraction-toggle drop: nothing to append, and re-reading the batch
-			// would only re-drop it, so it is safe to treat as delivered.
-			continue
-		}
-		if !res.HasObservation() {
-			// The transform could not even build a content-free diagnostic (invalid policy or absent
-			// timestamps). Fail closed: do not advance the cursor.
-			return fmt.Errorf("observer daemon: candidate transform produced no durable observation: %w", res.Cause)
-		}
-		if _, err := a.client.CaptureObservation(ctx, res.Observation); err != nil {
-			return fmt.Errorf("observer daemon: deliver candidate to daemon: %w", err)
-		}
-		a.recordAppended(ref, cand, native)
 	}
 	return nil
+}
+
+// deliverOne transforms one candidate and durably appends the result, returning the WAL sequence
+// it was appended at. The sequence is 0 when nothing was appended: a nil candidate, a start or usage
+// this sink already made durable, or a consent-recorded extraction drop — each safely treated as
+// delivered.
+func (a *CandidateSinkAdapter) deliverOne(ctx context.Context, ref codex.TranscriptRef, cand *codex.Candidate) (int64, error) {
+	if cand == nil {
+		return 0, nil
+	}
+	native, provider, appended := a.resolveSession(ref, cand)
+	if appended {
+		// A start or usage this sink already made durable, re-delivered with a line re-read after a
+		// partial delivery failure. Re-reading the batch would only skip it again, so it is safely
+		// treated as delivered.
+		return 0, nil
+	}
+	if provider == "" {
+		provider = a.provider
+	}
+	env := evidence.PolicyEnvelope{
+		CapturedAt: a.now(),
+		Provenance: evidence.RawProvenance{
+			Provider:            provider,
+			NativeSessionID:     native,
+			ParserVersion:       a.parserVersion,
+			TransformVersion:    a.transformVersion,
+			RootRelativeLocator: ref.Locator,
+		},
+		RunContext: a.runContextFor(native),
+	}
+	res := cand.Transform(a.policy, env)
+	if res.Dropped {
+		// A consent-recorded extraction-toggle drop: nothing to append, and re-reading the batch
+		// would only re-drop it, so it is safe to treat as delivered.
+		return 0, nil
+	}
+	if !res.HasObservation() {
+		// The transform could not even build a content-free diagnostic (invalid policy or absent
+		// timestamps). Fail closed: do not advance the cursor.
+		return 0, fmt.Errorf("observer daemon: candidate transform produced no durable observation: %w", res.Cause)
+	}
+	ack, err := a.client.CaptureObservation(ctx, res.Observation)
+	if err != nil {
+		return 0, fmt.Errorf("observer daemon: deliver candidate to daemon: %w", err)
+	}
+	a.recordAppended(ref, cand, native)
+	return ack.Sequence, nil
 }
 
 // recordAppended remembers a start or a usage that was just made durable for the transcript (see

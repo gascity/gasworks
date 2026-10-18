@@ -324,7 +324,7 @@ func (w *Watcher) trackStoreMember(ctx context.Context, store string, scan *root
 		}
 		w.releaseTracked(key, tf)
 	}
-	found := discovered{root: store, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod}
+	found := discovered{root: store, path: f.path, locator: locator, dev: f.dev, ino: f.ino, size: f.size, mod: f.mod, consentRoot: policy.record.Path}
 	cur, forwardBaseline, err := w.cursorFor(ctx, policy, found, scan)
 	if err != nil {
 		if errors.Is(err, errDeferTracking) {

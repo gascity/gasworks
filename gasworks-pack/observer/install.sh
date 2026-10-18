@@ -62,9 +62,12 @@ Endpoint configuration:
   --workspace NAME          registry workspace scope
   --ceiling-bytes N         spool byte ceiling
   --approved-root DIR       an approved transcript root (repeatable; enables the watcher)
-  --root-policy-file PATH   owner-supplied companion root policy (mutually exclusive with --approved-root)
+  --root-policy-file PATH   owner-supplied companion root policy (mutually exclusive with --approved-root);
+                            placed as <config-dir>/root-policy.json, which the daemon re-reads while it
+                            runs: rewrite it atomically to change consent without a restart
   --content-upload          upload whole raw transcripts to the collector content endpoint (opt-in;
-                            requires --collector and a root/--root-policy-file)
+                            requires --collector and a root/--root-policy-file); a v3 root policy's
+                            content_upload decides instead
   --allow-loopback-http     permit a plain-http loopback collector (dev only)
 
 Paths (all owner-only; default under $HOME, no elevated privileges):
@@ -272,7 +275,10 @@ write_config() {
   fi
   if [ -n "$root_policy_file" ]; then
     [ -f "$root_policy_file" ] || die "root policy file not found: $root_policy_file"
-    install -m 0600 "$root_policy_file" "$config_dir/root-policy.json"
+    # Replace atomically: a running daemon re-reads this file, and a half-written policy would read
+    # as invalid (content upload withdrawn until the next valid write).
+    install -m 0600 "$root_policy_file" "$config_dir/.root-policy.json.new.$$"
+    mv -f "$config_dir/.root-policy.json.new.$$" "$config_dir/root-policy.json"
     log "placed root policy (0600)"
   fi
 

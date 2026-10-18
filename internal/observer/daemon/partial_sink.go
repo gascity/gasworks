@@ -39,8 +39,8 @@ func (a *PartialCandidateSinkAdapter) DeliverCandidates(ctx context.Context, ref
 // adapter and returns how many leading candidates were durably delivered (or safely dropped)
 // before the first failure. A nil error means every candidate was delivered.
 func (a *PartialCandidateSinkAdapter) DeliverCandidatesPartial(ctx context.Context, ref codex.TranscriptRef, cands []*codex.Candidate) (int, error) {
-	for i := range cands {
-		if err := a.inner.DeliverCandidates(ctx, ref, cands[i:i+1]); err != nil {
+	for i, cand := range cands {
+		if _, err := a.inner.deliverOne(ctx, ref, cand); err != nil {
 			return i, err
 		}
 	}

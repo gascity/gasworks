@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/consent"
 	"github.com/gascity/gasworks/internal/observer/daemon"
 	"github.com/gascity/gasworks/internal/observer/evidence"
 	"github.com/gascity/gasworks/internal/observer/prefixmap"
@@ -50,11 +51,16 @@ func runDaemon(args []string) int {
 	// Content upload (Phase 1b) is opt-in and OFF by default: with it off the daemon is metadata-only,
 	// exactly as before. It reuses the -collector base + -token-file credential (no second endpoint or
 	// credential) and requires an explicitly configured watcher. OBSERVER_CONTENT_UPLOAD=1 sets the default.
-	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and an explicit root policy/root)")
+	// With -root-policy-file the flag is only the starting point: a v3 policy states content consent
+	// itself, and the daemon follows the policy file live.
+	contentUpload := fs.Bool("content-upload", envTrue("OBSERVER_CONTENT_UPLOAD"), "upload whole raw transcripts to the collector content endpoint (opt-in; requires -collector and an explicit root policy/root); with -root-policy-file a v3 policy's content_upload decides instead, live")
 
 	var approvedRoots multiFlag
 	fs.Var(&approvedRoots, "approved-root", "an approved transcript root (repeatable); enables the watcher")
-	rootPolicyFile := fs.String("root-policy-file", "", "owner-supplied companion transcript root policy (mutually exclusive with -approved-root)")
+	// -root-policy-file is the live consent policy: the daemon re-reads it before every content
+	// upload, every observation batch, and every transcript poll, so a consent change written to it
+	// (atomically: temp file + rename) applies without a restart.
+	rootPolicyFile := fs.String("root-policy-file", "", "owner-supplied companion transcript root policy, re-read while the daemon runs so consent changes apply without a restart (mutually exclusive with -approved-root)")
 	cursorDir := fs.String("cursor-dir", "", "transcript cursor state dir (required with -approved-root)")
 	// The watcher re-walks and stats every file under the approved roots on each poll (change
 	// detection is a bounded poll, not fsnotify), so its steady-state CPU is O(files under the roots)
@@ -105,18 +111,17 @@ func runDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -bead-prefix-map-file is mutually exclusive with -bead-prefix/-beads-project")
 		return 2
 	}
-	var policy rootpolicy.Policy
-	var policyRecords []rootpolicy.Record
+	logf := func(s string) { fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", s) }
+	var policySource *consent.Source
 	if *rootPolicyFile != "" {
-		var err error
-		policy, err = rootpolicy.LoadPolicy(*rootPolicyFile)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
-			return 2
-		}
-		policyRecords = capturableRoots(policy.Roots)
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -cursor-dir is required with -root-policy-file")
+			return 2
+		}
+		var err error
+		policySource, err = openConsentPolicy(*rootPolicyFile, *contentUpload, logf)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 			return 2
 		}
 	}
@@ -138,7 +143,7 @@ func runDaemon(args []string) int {
 		Capacity:          defaultCapacity(*ceiling),
 		RegistrySource:    *sourceID,
 		RegistryWorkspace: *workspace,
-		Log:               func(s string) { fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", s) },
+		Log:               logf,
 	}
 
 	if *collector != "" {
@@ -148,15 +153,20 @@ func runDaemon(args []string) int {
 			return 2
 		}
 		cfg.Upload = &daemon.UploadLoopConfig{Sender: client}
-		if *contentUpload {
-			if len(approvedRoots) == 0 && len(policyRecords) == 0 {
-				fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
-			} else {
-				// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
-				cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
-			}
+		switch {
+		case policySource != nil:
+			// Under the live policy the content channel is always wired, reusing the SAME collector
+			// client (base URL + source-bound bearer); the policy decides, before every upload,
+			// whether anything is sent.
+			cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
+		case *contentUpload && len(approvedRoots) == 0:
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
+		case *contentUpload:
+			// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
+			cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
 		}
-	} else if *contentUpload {
+	} else if *contentUpload && policySource == nil {
+		// Under the live policy the daemon itself reports a content grant it cannot act on.
 		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -collector; running metadata-only")
 	}
 	// Build the extraction configuration once and hand the same value to whichever watcher config is
@@ -171,15 +181,12 @@ func runDaemon(args []string) int {
 		}
 		references.PrefixMap = prefixMap
 	}
-	if *rootPolicyFile != "" {
-		// A policy whose every root is a project root leaves the watcher nothing to tail, and a
-		// rootless watcher fails construction, so the daemon runs metadata-only until the
-		// membership engine lands. Any other policy keeps its v1 wiring exactly.
-		if len(policyRecords) == 0 && len(policy.Roots) > 0 {
-			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: root policy carries only project roots; transcript capture is idle")
-		} else {
-			cfg.Watch = newPolicyWatchLoopConfig(policyRecords, *cursorDir, *pollInterval, references)
-		}
+	if policySource != nil {
+		// The watcher's roots come from the live policy, applied before every poll: a policy with no
+		// capturable root (only project roots, until the membership engine lands) leaves capture idle
+		// until it consents to one.
+		cfg.Consent = policySource
+		cfg.Watch = newConsentWatchLoopConfig(*cursorDir, *pollInterval, references)
 	} else if len(approvedRoots) > 0 {
 		if *cursorDir == "" {
 			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -cursor-dir is required with -approved-root")
@@ -320,33 +327,33 @@ func newWatchLoopConfig(roots []string, cursorDir string, interval time.Duration
 // engine's job, together with the store-side session selection.
 const captureProjectRoots = false
 
-// capturableRoots drops the records the watcher must not see yet. It is a silent filter by design:
-// a project root is a valid, accepted registration, not a fault, so it earns no per-poll diagnostic.
-func capturableRoots(records []rootpolicy.Record) []rootpolicy.Record {
-	if captureProjectRoots {
-		return records
-	}
-	out := make([]rootpolicy.Record, 0, len(records))
-	for _, r := range records {
-		if r.IsProject() {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out
+// capturableRecord reports whether the watcher may see a record yet. It is a silent filter by
+// design: a project root is a valid, accepted registration, not a fault, so it earns no per-poll
+// diagnostic.
+func capturableRecord(r rootpolicy.Record) bool {
+	return captureProjectRoots || !r.IsProject()
 }
 
-// newPolicyWatchLoopConfig keeps companion consent records intact until the watcher, where the
-// generation fence and root-local baseline are applied. It intentionally does not infer any
-// provider home/root; every path arrived explicitly in the owner policy.
-func newPolicyWatchLoopConfig(records []rootpolicy.Record, cursorDir string, interval time.Duration, references codex.ReferenceConfig) *daemon.WatchLoopConfig {
+// openConsentPolicy opens the live consent policy: the root policy file, re-read while the daemon
+// runs. contentDefault is the -content-upload flag (default OBSERVER_CONTENT_UPLOAD); it decides
+// content upload only for a v1/v2 document, which states no content consent, while a v3 document's
+// content_upload always decides. Records the watcher cannot act on yet are filtered out.
+func openConsentPolicy(path string, contentDefault bool, log func(string)) (*consent.Source, error) {
+	return consent.Open(consent.Config{Path: path, ContentDefault: contentDefault, Capturable: capturableRecord, Log: log})
+}
+
+// newConsentWatchLoopConfig is the watcher configuration under the live consent policy: everything
+// but the roots, which the daemon takes from the policy (and keeps taking from it) with their
+// explicit per-root consent records — generation, mode, tombstones — intact, so the generation
+// fence and root-local baseline apply in the watcher. It intentionally does not infer any provider
+// home/root; every path arrives explicitly in the owner policy.
+func newConsentWatchLoopConfig(cursorDir string, interval time.Duration, references codex.ReferenceConfig) *daemon.WatchLoopConfig {
 	return &daemon.WatchLoopConfig{
-		RootPolicies: records,
-		StateDir:     cursorDir,
-		References:   references,
-		Policy:       watcherPolicy(),
-		Match:        transcriptNameMatch,
-		Interval:     interval,
+		StateDir:   cursorDir,
+		References: references,
+		Policy:     watcherPolicy(),
+		Match:      transcriptNameMatch,
+		Interval:   interval,
 	}
 }
 

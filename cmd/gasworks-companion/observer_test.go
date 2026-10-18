@@ -26,7 +26,8 @@ import (
 
 // TestMain mirrors main's shim guard: when the wrapper re-execs THIS test binary as the same-PID
 // identity shim (RUNWRAP_SHIM set), it dispatches to runwrap.RunShim before running any test, so the
-// real subprocess run tests exercise the production re-exec path.
+// real subprocess run tests exercise the production re-exec path. With companionMainEnv set it runs
+// the command line exactly as main does, so a test can drive a real daemon process.
 func TestMain(m *testing.M) {
 	if os.Getenv(shimEnvVar) != "" {
 		if err := runwrap.RunShim(); err != nil {
@@ -35,8 +36,14 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv(companionMainEnv) != "" {
+		os.Exit(dispatch(os.Args[1:]))
+	}
 	os.Exit(m.Run())
 }
+
+// companionMainEnv makes the test binary run as the companion command (see TestMain).
+const companionMainEnv = "GASWORKS_COMPANION_TEST_MAIN"
 
 func permissiveCap() spool.CapacityConfig {
 	return spool.CapacityConfig{
