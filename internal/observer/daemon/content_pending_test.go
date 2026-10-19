@@ -5,8 +5,11 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -485,5 +488,97 @@ func TestServiceWithoutAContentChannelFollowsConsentForQueuedContent(t *testing.
 	d.poll()
 	if left := pendingRecords(t, d.cursorDir); len(left) != 0 {
 		t.Fatalf("content consent was withdrawn but the queued content is kept: %v", left)
+	}
+}
+
+// TestSweepContentPendingContinuesPastAFailedDelete: a pending record the sweep cannot delete does not
+// stop it. Every other record it should delete goes, the one it keeps stays, and the failure is
+// reported. A non-empty directory under a record's name cannot be deleted whatever the privileges.
+func TestSweepContentPendingContinuesPastAFailedDelete(t *testing.T) {
+	dir := t.TempDir()
+	stuck := filepath.Join(dir, contentPendingName(1, 1))
+	if err := os.MkdirAll(filepath.Join(stuck, "occupied"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := func(dev, ino uint64, root string) string {
+		t.Helper()
+		data, err := json.Marshal(contentPending{
+			Version: contentPendingVersion, Device: dev, Inode: ino, NativeSessionID: "s", Provider: "codex",
+			ConsentRoot: root, ConsentGeneration: 1, Locator: "rollout-x.jsonl",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeStateFile(dir, contentPendingName(dev, ino), contentPendingTempPrefix, data); err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(dir, contentPendingName(dev, ino))
+	}
+	withdrawn := record(2, 2, "/withdrawn")
+	kept := record(3, 3, "/kept")
+
+	n, err := sweepContentPending(dir, func(o consentOrigin) bool { return o.root == "/kept" })
+	if n != 1 {
+		t.Fatalf("deleted %d records, want the 1 withdrawn one", n)
+	}
+	if err == nil || !strings.Contains(err.Error(), contentPendingName(1, 1)) {
+		t.Fatalf("sweep error = %v, want it to report the record it could not delete", err)
+	}
+	if _, err := os.Stat(withdrawn); !os.IsNotExist(err) {
+		t.Fatalf("a failed delete stopped the sweep before the withdrawn record: %v", err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("the sweep deleted a record it should keep: %v", err)
+	}
+}
+
+// TestContentOwedBetweenUploadsIsRecordedOncePerInterval: between the uploads of one tick, owed
+// content is recorded at most once per content interval — the content loop's configured cadence, not
+// a fixed one — so a long burst neither replans after every upload nor records later than one
+// interval.
+func TestContentOwedBetweenUploadsIsRecordedOncePerInterval(t *testing.T) {
+	var h *contentHarness
+	var recordedAtStart []bool
+	sender := &fakeContentSender{respond: func(n int, _ upload.ContentRequest) (*upload.ContentResult, error) {
+		if n == 0 {
+			// A transcript is first owed while the first upload is in flight.
+			h.sessions.set(9, 9, "s9", "codex")
+			h.reader.set(9, 9, "late", 1)
+			h.observe(9, 9, testCodexPath, 4, 1)
+		}
+		_, err := os.Stat(filepath.Join(h.stateDir, contentPendingName(9, 9)))
+		recordedAtStart = append(recordedAtStart, err == nil)
+		h.clock.advance(time.Minute) // each upload takes a minute
+		return &upload.ContentResult{StatusCode: 201}, nil
+	}}
+	h = newContentHarness(t, contentUploaderConfig{sender: sender, interval: 2 * time.Minute})
+	for i := uint64(1); i <= 3; i++ {
+		body := strings.Repeat("x", int(i))
+		h.sessions.set(i, i, fmt.Sprintf("s%d", i), "codex")
+		h.reader.set(i, i, body, 1)
+		h.observe(i, i, testCodexPath, int64(len(body)), 1)
+	}
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	// The plan ran at the start; one minute later the interval has not passed, two minutes later it has.
+	if want := []bool{false, false, true}; !slices.Equal(recordedAtStart, want) {
+		t.Fatalf("pending record present at the start of each upload = %v, want %v", recordedAtStart, want)
+	}
+}
+
+// TestServiceGivesTheContentChannelItsConfiguredInterval: what paces recording owed content between
+// uploads is the content loop's configured cadence, handed to the content channel by the service.
+func TestServiceGivesTheContentChannelItsConfiguredInterval(t *testing.T) {
+	svc, err := NewService(ServiceConfig{
+		Dir: t.TempDir(), SourceID: testSourceID, Capacity: permissiveCapacity(), PeerUID: euidPeer,
+		Watch:         &WatchLoopConfig{ApprovedRoots: []string{t.TempDir()}, StateDir: t.TempDir(), Policy: serviceWatchPolicy(), Interval: time.Hour},
+		ContentUpload: &ContentUploadLoopConfig{Sender: &fakeContentSender{}, Interval: 2 * time.Minute},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Shutdown(context.Background()) })
+	if got := svc.content.interval; got != 2*time.Minute {
+		t.Fatalf("content channel paced by %s, want the configured 2m0s", got)
 	}
 }

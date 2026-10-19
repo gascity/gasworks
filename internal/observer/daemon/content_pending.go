@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/gascity/gasworks/internal/observer/consent"
 )
@@ -25,17 +24,18 @@ import (
 // restart.
 //
 // A pending record keeps it: one small owner-only file per such transcript, written by the content
-// loop the first time its content is owed under a session no marker records — at each plan, after
-// each upload, and once more as the daemon stops — naming that session and the consent the content
-// was queued under. After a restart the record keys the transcript's content once the watcher
-// observes it again, under that same consent and name. The record is deleted when the collector
-// accepts the content or rejects it for good, and when the watcher drops the transcript; and —
-// consent wins over retry — as soon as the live consent policy no longer covers the content, at the
-// start of a run whose policy no longer does, and at the start of a run with -content-upload off
+// loop the first time its content is owed under a session no marker records — at each plan (every
+// tick, and between uploads at most once per content interval) and once more as the daemon stops —
+// naming that session and the consent the content was queued under. After a restart the record keys
+// the transcript's content once the watcher observes it again, under that same consent and name. The
+// record is deleted when the collector accepts the content or rejects it for good, and when the
+// watcher drops the transcript; and — consent wins over retry — as soon as the live consent policy no
+// longer covers the content, at the start of a run whose policy no longer does, and, in the static
+// configuration (no live policy), at the start of a run with -content-upload off
 // (DiscardQueuedContent). There is at most one record per transcript with content owed; like a
 // marker or a cursor, a record whose transcript is deleted while the daemon is stopped stays until
 // its identity is reused or the state dir is cleaned. A record holds metadata only (a session id, a
-// provider, a consent root and generation, a name, a size and a time), never transcript content.
+// provider, a consent root and generation, a name and a size), never transcript content.
 
 // contentPendingVersion is the pending record's on-disk schema version.
 const contentPendingVersion = 1
@@ -64,9 +64,8 @@ type contentPending struct {
 	Locator string `json:"locator"`
 	// Size / ModNanos are the transcript's stat when the record was written. A transcript only grows,
 	// so a file smaller or older than that is not the one the record names either.
-	Size     int64  `json:"observed_size"`
-	ModNanos int64  `json:"observed_mtime_nanos"`
-	QueuedAt string `json:"queued_at"`
+	Size     int64 `json:"observed_size"`
+	ModNanos int64 `json:"observed_mtime_nanos"`
 }
 
 // origin is the consent the content was queued under.
@@ -122,7 +121,7 @@ func (p contentPending) names(st *contentState) bool {
 // pendingRecord returns the record a transcript whose content is now owed under native/provider
 // needs, or ok=false when a restart could already key it: by its marker (an accepted upload of the
 // same session) or by the record it has. Called under u.mu.
-func (st *contentState) pendingRecord(id transcriptIdentity, native, provider string, now time.Time) (rec contentPending, ok bool) {
+func (st *contentState) pendingRecord(id transcriptIdentity, native, provider string) (rec contentPending, ok bool) {
 	if st.uploaded && st.markerNative == native && st.markerProvider == provider {
 		return contentPending{}, false
 	}
@@ -140,16 +139,14 @@ func (st *contentState) pendingRecord(id transcriptIdentity, native, provider st
 		Locator:           st.locator,
 		Size:              st.size,
 		ModNanos:          st.modNanos,
-		QueuedAt:          now.UTC().Format(time.RFC3339Nano),
 	}, true
 }
 
 // pendingSave is one pending record a tick found owed.
 type pendingSave struct {
-	id      transcriptIdentity
-	st      *contentState
-	locator string
-	rec     contentPending
+	id  transcriptIdentity
+	st  *contentState
+	rec contentPending
 }
 
 // savePending writes the pending records a plan found owed. It runs outside u.mu, so the watcher's
@@ -189,7 +186,7 @@ func (u *contentUploader) savePendingRecord(s pendingSave) {
 	}
 	u.mu.Unlock()
 	if logIt {
-		u.logf("content upload: record the queued content of %s: %v (retried every tick; not logged again until it succeeds)", s.locator, err)
+		u.logf("content upload: record the queued content of %s: %v (retried every tick; not logged again until it succeeds)", s.rec.Locator, err)
 	}
 }
 
@@ -252,8 +249,10 @@ func (u *contentUploader) sweepPending() {
 	}
 }
 
-// sweepContentPending deletes the pending records in stateDir that keep rejects, and any it cannot
-// read, returning how many it deleted. An absent state dir holds none.
+// sweepContentPending deletes the pending records in stateDir that keep rejects, and anything under a
+// record's name that cannot be read as one, returning how many it deleted. A record it cannot delete
+// does not stop it: it deletes every other one it should, and reports each failure in the error. An
+// absent state dir holds none.
 func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, error) {
 	entries, err := os.ReadDir(stateDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -263,28 +262,35 @@ func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, e
 		return 0, fmt.Errorf("read %s: %w", stateDir, err)
 	}
 	removed := 0
+	var failed []error
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasPrefix(name, contentPendingPrefix) || !strings.HasSuffix(name, ".json") {
+		if !strings.HasPrefix(name, contentPendingPrefix) || !strings.HasSuffix(name, ".json") {
 			continue
 		}
 		path := filepath.Join(stateDir, name)
 		if p, ok := readContentPending(path); ok && keep(p.origin()) {
 			continue
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return removed, fmt.Errorf("delete %s: %w", name, err)
+		switch err := os.Remove(path); {
+		case err == nil:
+			removed++
+		case errors.Is(err, os.ErrNotExist):
+			// Deleted meanwhile (the transcript was forgotten or accepted).
+		default:
+			failed = append(failed, fmt.Errorf("delete %s: %w", name, err))
 		}
-		removed++
 	}
-	return removed, nil
+	return removed, errors.Join(failed...)
 }
 
 // DiscardQueuedContent deletes the content an earlier run queued for upload and never had accepted,
 // in the content state dir stateDir (the watcher's cursor dir unless ContentUploadLoopConfig.StateDir
-// says otherwise), and returns how many transcripts' queued content it discarded. A daemon started
-// with -content-upload off calls it: switching content upload off withdraws consent for that queue,
-// so a later run that uploads content again must not send it.
+// says otherwise), and returns how many transcripts' queued content it discarded; a record it cannot
+// delete is reported in the error without stopping it. A daemon started in the static configuration
+// (no live consent policy, which decides content consent itself) with -content-upload off calls it:
+// switching content upload off withdraws consent for that queue, so a later run that uploads content
+// again must not send it.
 func DiscardQueuedContent(stateDir string) (int, error) {
 	return sweepContentPending(stateDir, func(consentOrigin) bool { return false })
 }

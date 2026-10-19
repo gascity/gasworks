@@ -536,6 +536,7 @@ func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAda
 		log:       s.log,
 		consent:   cfg.Consent,
 		tokenFile: cfg.ContentUpload.TokenFile,
+		interval:  durationOr(cfg.ContentUpload.Interval, DefaultContentInterval),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)

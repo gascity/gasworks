@@ -128,6 +128,8 @@ type contentUploaderConfig struct {
 	consent *consent.Source
 	// tokenFile is the bearer token file the sender reads its credential from ("" when unknown).
 	tokenFile string
+	// interval is the content loop's cadence; 0 selects DefaultContentInterval.
+	interval time.Duration
 }
 
 // contentUploader ships whole-transcript snapshots to the collector's content endpoint as a side
@@ -153,8 +155,10 @@ type contentUploader struct {
 	// covers. nil (no -root-policy-file) keeps the static -content-upload behavior.
 	consent *consent.Source
 	// tokenFile is the bearer token file the sender reads its credential from ("" when unknown).
-	// While the collector refuses content upload, a change to it retries at once (contentRefusal).
+	// While the collector refuses content upload, a renewal of it retries at once (contentRefusal).
 	tokenFile string
+	// interval is the content loop's cadence, which also paces recordOwedIfStale.
+	interval time.Duration
 
 	// tickMu serializes ticks, so the content loop and an on-demand tick never upload the same
 	// snapshot twice.
@@ -295,6 +299,10 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 	if debounce <= 0 {
 		debounce = DefaultContentDebounce
 	}
+	interval := cfg.interval
+	if interval <= 0 {
+		interval = DefaultContentInterval
+	}
 	// Sweep any orphaned marker temp files left by a crash mid-persist, so they cannot accumulate
 	// across restarts. The state dir is shared with the watcher's cursor files; we only touch our
 	// own distinctly-prefixed temp files.
@@ -310,17 +318,21 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 		log:       cfg.log,
 		consent:   cfg.consent,
 		tokenFile: cfg.tokenFile,
+		interval:  interval,
 		files:     map[transcriptIdentity]*contentState{},
 
 		guardRefusals: map[contentguard.Reason]int{},
 	}
 	// Content an earlier run queued under consent that no longer applies — withdrawn or re-registered
 	// while the daemon was stopped — is discarded before anything can key it.
-	if n, err := sweepContentPending(u.stateDir, u.pendingConsented); err != nil {
-		u.logf("content upload: discard content queued under withdrawn consent: %v", err)
-	} else if n > 0 {
+	n, err := sweepContentPending(u.stateDir, u.pendingConsented)
+	if n > 0 {
 		u.logf("content upload: discarded the queued content of %d transcripts: the consent it was queued under no longer applies", n)
 	}
+	if err != nil {
+		u.logf("content upload: discard content queued under withdrawn consent: %v", err)
+	}
+	u.logTokenFile()
 	return u, nil
 }
 
@@ -415,11 +427,12 @@ func (u *contentUploader) recordOwed() {
 	u.savePending(saves)
 }
 
-// recordOwedIfStale runs recordOwed unless a plan ran within the last DefaultContentInterval, so a
-// long upload burst spends one plan per interval on its bookkeeping rather than one per upload.
+// recordOwedIfStale runs recordOwed unless a plan ran within the last content interval (the content
+// loop's configured cadence), so a long upload burst spends one plan per interval on its bookkeeping
+// rather than one per upload.
 func (u *contentUploader) recordOwedIfStale() {
 	u.mu.Lock()
-	stale := u.now().Sub(u.lastPlanned) >= DefaultContentInterval
+	stale := u.now().Sub(u.lastPlanned) >= u.interval
 	u.mu.Unlock()
 	if stale {
 		u.recordOwed()
@@ -492,8 +505,8 @@ func (u *contentUploader) plan(now time.Time) ([]contentJob, []pendingSave) {
 		}
 		// The content is owed from here on, settled or not: one the daemon stops before it settles
 		// is owed after the restart too.
-		if rec, owed := st.pendingRecord(id, native, provider, now); owed {
-			saves = append(saves, pendingSave{id: id, st: st, locator: st.locator, rec: rec})
+		if rec, owed := st.pendingRecord(id, native, provider); owed {
+			saves = append(saves, pendingSave{id: id, st: st, rec: rec})
 		}
 		if now.Sub(st.stableSince) < u.debounce {
 			continue // still growing or not stable long enough

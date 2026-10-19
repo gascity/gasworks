@@ -259,12 +259,11 @@ func discardWithdrawnContent(contentConsented bool, watch *daemon.WatchLoopConfi
 		return
 	}
 	n, err := daemon.DiscardQueuedContent(watch.StateDir)
-	if err != nil {
-		log(fmt.Sprintf("content upload is off: discard the content an earlier run queued: %v", err))
-		return
-	}
 	if n > 0 {
 		log(fmt.Sprintf("content upload is off: discarded the queued content of %d transcripts an earlier run had not sent", n))
+	}
+	if err != nil {
+		log(fmt.Sprintf("content upload is off: discard the content an earlier run queued: %v", err))
 	}
 }
 

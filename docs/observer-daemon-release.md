@@ -345,8 +345,11 @@ Treat any of these as a failed roll:
   this source (404/501). The line carries the collector's own message; read it. Content
   upload is held, not switched off: every queued transcript is kept — including the ones
   first seen during the refusal, and across a restart — and retried after a back-off (15s,
-  doubling to 5 minutes), or at once when the `-token-file` changes. Renewing the token
-  file is enough; no restart is needed. One
+  doubling to 5 minutes), or at once when the `-token-file` is renewed. A token file that is
+  missing or empty, as in the middle of a non-atomic rotation, is no renewal and waits for the
+  back-off. Renewing the token file is enough; no restart is needed. At start, the line
+  `content upload: a refused credential is retried as soon as the token file <path> is renewed`
+  names the file followed. One
   `content upload: the collector accepted content upload again (status N); resuming` line
   marks the recovery, after which each queued transcript is uploaded once. (Older builds
   logged `…; disabling content upload for this run` here and stayed off until restarted.)
@@ -406,12 +409,15 @@ for each transcript whose content is queued but has never been accepted: a refus
 shed, or a transcript still settling when the daemon stops. It names the session, the transcript's
 name, and the consent the content was queued under (no content), so the queue survives a restart
 even though the restarted daemon never parses a fully consumed transcript again. It is written as
-soon as the content is owed, after every upload, and once more on a graceful stop; only a crash
+soon as the content is owed: checked on every content-loop tick (every 5 seconds), at most once per
+tick interval between the uploads of a long burst, and once more on a graceful stop; only a crash
 can lose the content owed since the last of those. It is deleted once the collector accepts that
-content or rejects it for good, when the transcript goes away, as soon as the live policy no
-longer consents to it (including while the policy file is unreadable or invalid), and at the start
-of a run with `-content-upload` off — switching content upload off discards the queue; starting
-without `-collector` does not. Older builds ignore these files.
+content or rejects it for good, when the transcript goes away, and as soon as the content is no
+longer consented. With `-root-policy-file` the live policy decides that — a v3 policy's
+`content_upload`, not the flag — including while the policy file is unreadable or invalid, and
+including in a run without `-collector`. With `-approved-root` the `-content-upload` flag
+decides: a start with it off discards the queue, while starting without `-collector` does not.
+Older builds ignore these files.
 
 See [observer-usage-message-id.md](./observer-usage-message-id.md) for the exact rules and the
 one-time effects on transcripts captured before the roll.

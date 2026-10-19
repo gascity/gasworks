@@ -127,7 +127,8 @@ func TestContentRefusalBacksOffAndResumes(t *testing.T) {
 // TestContentRefusalFollowsTheTokenFile walks a refusal through every transition the token file
 // drives. The collector client reads the token file on every attempt, so a renewed credential is
 // what ends a credential refusal: while the file is unchanged content upload waits out its back-off,
-// while a file rewritten in place or atomically replaced is retried on the very next tick. Each
+// while a file rewritten in place or atomically replaced is retried on the very next tick. A token
+// file missing or empty — a rotation in progress — is no renewal: it waits out the back-off too. Each
 // transition — the first refusal, a different refusing status, a renewed credential refused too,
 // the resumption — is logged exactly once.
 func TestContentRefusalFollowsTheTokenFile(t *testing.T) {
@@ -174,6 +175,14 @@ func TestContentRefusalFollowsTheTokenFile(t *testing.T) {
 	writeTokenInPlace(t, tokenFile, "another-expired-token")
 	step("token rewritten in place, still refused", 0, 4, 3, 0)
 	step("token unchanged again", 0, 4, 3, 0)
+	if err := os.Remove(tokenFile); err != nil {
+		t.Fatal(err)
+	}
+	step("token file missing", 0, 4, 3, 0)
+	if err := os.WriteFile(tokenFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	step("token file empty", 0, 4, 3, 0)
 	writeTokenAtomically(t, tokenFile, "renewed-token")
 	step("token replaced with a renewed credential", 0, 5, 3, 1)
 	if got := string(h.sender.at(4).Body); got != "aaa" {

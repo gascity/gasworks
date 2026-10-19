@@ -215,6 +215,7 @@ func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness 
 		base.debounce = cfg.debounce
 	}
 	base.tokenFile = cfg.tokenFile
+	base.interval = cfg.interval
 	if cfg.sender != nil {
 		base.sender = cfg.sender
 		h.sender = cfg.sender.(*fakeContentSender)
