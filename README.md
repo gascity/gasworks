@@ -272,7 +272,7 @@ What a change does:
 
 | Change | Effect |
 |---|---|
-| `content_upload` turned off | No further content upload: transcripts queued for upload are dropped unsent and an upload in flight is cancelled. Metadata capture continues. |
+| `content_upload` turned off | No further content upload: transcripts queued for upload — including those held while the collector refuses the companion's credential — are dropped unsent, and an upload in flight is cancelled. Metadata capture continues. |
 | A root withdrawn | The root is no longer tailed. Its queued content is dropped and an in-flight upload of it cancelled. Its observations captured but not yet uploaded are **withheld**: each is uploaded only as a content-free `CAPTURE_DIAGNOSTIC` placeholder (`CAPTURE_LOSS`, `LOST`) at the same sequence, because the batch lane is gap-free and the collector binds every sequence to one payload. An observation already sent once is replayed unchanged. |
 | A root re-registered (new generation) | It is tailed again under the new generation, activated per its `mode` as at startup. What the earlier generation captured and had not uploaded is withheld, and its queued content dropped — for a `forward-only` root that backlog is below the new floor and is not captured again. |
 | A root or content consent granted | Takes effect on the next scan; a newly consented root is activated per its `mode`, exactly as at startup. |

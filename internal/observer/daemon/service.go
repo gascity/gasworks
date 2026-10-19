@@ -198,6 +198,10 @@ type ContentUploadLoopConfig struct {
 	Debounce time.Duration
 	// Interval is the content-loop ticker cadence; 0 selects DefaultContentInterval.
 	Interval time.Duration
+	// TokenFile is the rotating bearer token file Sender reads its credential from (the daemon's
+	// -token-file). While the collector refuses content upload, a change to it — a renewed or rotated
+	// credential — retries at once instead of waiting out the back-off. "" relies on the back-off.
+	TokenFile string
 }
 
 // WatchLoopConfig configures the Codex transcript watcher and its candidate sink.
@@ -410,6 +414,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if s.consent != nil && s.content != nil {
 		s.consent.Subscribe(s.content.onConsentChange)
 	}
+	// Without a content channel (no collector) this run uploads no content, but the content an
+	// earlier run queued still follows the live policy.
+	if s.consent != nil && s.content == nil && cfg.Watch != nil {
+		followQueuedContentConsent(s.consent, cfg.Watch.StateDir, s.log)
+	}
 
 	ok = true
 	return s, nil
@@ -517,15 +526,17 @@ func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAda
 		stateDir = cfg.Watch.StateDir
 	}
 	cu, err := newContentUploader(contentUploaderConfig{
-		sender:   cfg.ContentUpload.Sender,
-		sessions: sink,
-		stateDir: stateDir,
-		maxBytes: cfg.ContentUpload.MaxBytes,
-		debounce: cfg.ContentUpload.Debounce,
-		read:     codex.ReadValidatedTranscript,
-		now:      s.now,
-		log:      s.log,
-		consent:  cfg.Consent,
+		sender:    cfg.ContentUpload.Sender,
+		sessions:  sink,
+		stateDir:  stateDir,
+		maxBytes:  cfg.ContentUpload.MaxBytes,
+		debounce:  cfg.ContentUpload.Debounce,
+		read:      codex.ReadValidatedTranscript,
+		now:       s.now,
+		log:       s.log,
+		consent:   cfg.Consent,
+		tokenFile: cfg.ContentUpload.TokenFile,
+		interval:  durationOr(cfg.ContentUpload.Interval, DefaultContentInterval),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)
@@ -642,6 +653,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	select {
 	case <-drained:
 	case <-ctx.Done():
+	}
+
+	// Record the content still owed for upload, so the next start resumes it: content first owed since
+	// the content loop last planned would otherwise be lost, as the next start never parses a
+	// transcript this run consumed to its end again.
+	if s.content != nil {
+		s.content.recordOwed()
 	}
 
 	// Withdraw the socket and drain any in-flight durable appends.

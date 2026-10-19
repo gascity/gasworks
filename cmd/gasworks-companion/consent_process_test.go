@@ -120,6 +120,8 @@ func TestCompanionDaemonCommandFollowsThePolicyFileLive(t *testing.T) {
 	deadline := time.After(20 * time.Second)
 	p.waitFor(t, "loaded: content upload off (stated by the policy)", deadline)
 	p.waitFor(t, "applied consent policy version 1: tailing 1 consented roots; content upload off", deadline)
+	// The content channel, wired whatever the policy says, follows the collector client's -token-file.
+	p.waitFor(t, "a refused credential is retried as soon as the token file "+tokenFile+" is renewed", deadline)
 
 	writePolicy(t, policy, e2ePolicy(true, e2eRoot{root, 1, true}))
 	p.waitFor(t, "applied consent policy version 2: tailing 1 consented roots; content upload on", deadline)

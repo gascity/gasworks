@@ -158,12 +158,12 @@ func runDaemon(args []string) int {
 			// Under the live policy the content channel is always wired, reusing the SAME collector
 			// client (base URL + source-bound bearer); the policy decides, before every upload,
 			// whether anything is sent.
-			cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
+			cfg.ContentUpload = newContentUploadLoopConfig(client, *tokenFile)
 		case *contentUpload && len(approvedRoots) == 0:
 			fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -approved-root or -root-policy-file; running metadata-only")
 		case *contentUpload:
 			// Reuse the SAME collector client (base URL + source-bound bearer) for content upload.
-			cfg.ContentUpload = &daemon.ContentUploadLoopConfig{Sender: client}
+			cfg.ContentUpload = newContentUploadLoopConfig(client, *tokenFile)
 		}
 	} else if *contentUpload && policySource == nil {
 		// Under the live policy the daemon itself reports a content grant it cannot act on.
@@ -200,6 +200,9 @@ func runDaemon(args []string) int {
 		fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
 		return 1
 	}
+	// A live policy decides content consent itself (and the daemon applies it); otherwise the
+	// -content-upload flag is the consent.
+	discardWithdrawnContent(policySource != nil || *contentUpload, cfg.Watch, logf)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -238,6 +241,30 @@ func buildCollectorClient(endpoint, sourceID, tokenFile string, allowLoopbackHTT
 		return nil, fmt.Errorf("build collector client: %w", err)
 	}
 	return client, nil
+}
+
+// newContentUploadLoopConfig wires the whole-transcript content channel over the shared collector
+// client. It follows the client's -token-file, so while the collector refuses content upload a
+// renewed credential is retried at once rather than after the back-off.
+func newContentUploadLoopConfig(client *upload.Client, tokenFile string) *daemon.ContentUploadLoopConfig {
+	return &daemon.ContentUploadLoopConfig{Sender: client, TokenFile: tokenFile}
+}
+
+// discardWithdrawnContent drops the content an earlier run queued for upload and never had accepted
+// when this run has no content consent. Switching content upload off withdraws consent for that
+// queue, so a later run that uploads content again must not send it. A run that has consent — or
+// that cannot upload for want of a -collector, which withdraws nothing — keeps it.
+func discardWithdrawnContent(contentConsented bool, watch *daemon.WatchLoopConfig, log func(string)) {
+	if contentConsented || watch == nil {
+		return
+	}
+	n, err := daemon.DiscardQueuedContent(watch.StateDir)
+	if n > 0 {
+		log(fmt.Sprintf("content upload is off: discarded the queued content of %d transcripts an earlier run had not sent", n))
+	}
+	if err != nil {
+		log(fmt.Sprintf("content upload is off: discard the content an earlier run queued: %v", err))
+	}
 }
 
 // loadCAFiles parses each -ca-file PEM bundle into additive x509 trust anchors for the collector
