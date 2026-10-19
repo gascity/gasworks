@@ -3,6 +3,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +41,7 @@ const (
 	contentTransientHold = 15 * time.Second
 	// maxContentHold caps how long a single server-supplied Retry-After can shed content upload, so a
 	// malformed or absurd value cannot silently disable content upload for the whole process lifetime.
+	// It caps the refusal back-off (contentRefusal) the same way.
 	maxContentHold = 5 * time.Minute
 	// maxContentPostAttempts bounds how many times a single stable snapshot is re-read + re-hashed +
 	// re-POSTed after transport/retryable failures before the uploader gives up on THAT snapshot (until
@@ -50,6 +53,8 @@ const (
 	// legacyContentMarkerVersion is accepted so an existing plain-upload marker remains a dedup
 	// hit until a sidecar binding actually arrives.
 	legacyContentMarkerVersion = 1
+	// contentMarkerTempPrefix names the temporary file a marker write renames over the marker.
+	contentMarkerTempPrefix = ".tmp-content-marker-"
 	// maxNativeSessionIDLen / maxSourcePathLen mirror the Phase 1a server header-validation limits,
 	// enforced client-side so a structurally invalid transcript never triggers a server 422 loop.
 	maxNativeSessionIDLen = 256
@@ -121,6 +126,8 @@ type contentUploaderConfig struct {
 	// consent, when non-nil, is the live consent policy every observation and upload is checked
 	// against (see contentUploader.consent).
 	consent *consent.Source
+	// tokenFile is the bearer token file the sender reads its credential from ("" when unknown).
+	tokenFile string
 }
 
 // contentUploader ships whole-transcript snapshots to the collector's content endpoint as a side
@@ -145,10 +152,20 @@ type contentUploader struct {
 	// drops the queued state it no longer covers and cancels an in-flight upload it no longer
 	// covers. nil (no -root-policy-file) keeps the static -content-upload behavior.
 	consent *consent.Source
+	// tokenFile is the bearer token file the sender reads its credential from ("" when unknown).
+	// While the collector refuses content upload, a change to it retries at once (contentRefusal).
+	tokenFile string
 
 	// tickMu serializes ticks, so the content loop and an on-demand tick never upload the same
 	// snapshot twice.
 	tickMu sync.Mutex
+
+	// pendingMu serializes the pending records' file operations (content_pending.go): a record is
+	// written, deleted, or swept under it, never under u.mu. Lock order: pendingMu before u.mu.
+	pendingMu sync.Mutex
+	// pendingDeleteFailing latches the log of a pending-record delete failure until a delete succeeds
+	// again, so a read-only disk is reported once, not on every acceptance. Guarded by pendingMu.
+	pendingDeleteFailing bool
 
 	mu    sync.Mutex
 	files map[transcriptIdentity]*contentState
@@ -159,9 +176,11 @@ type contentUploader struct {
 	// PEM sniff), keyed by reason, so a refused credential/config/key file is visible and testable —
 	// counted + logged, never silent. Guarded by u.mu.
 	guardRefusals map[contentguard.Reason]int
-	// disabled is latched when the server reports the tenant is not provisioned (501): content upload
-	// stops for the process lifetime (a restart re-probes). It never affects the metadata pipeline.
-	disabled bool
+	// refusal is the back-off the collector armed by refusing content upload (401/403/404/501); nil
+	// while it accepts content upload. It never affects the metadata pipeline. Guarded by u.mu.
+	refusal *contentRefusal
+	// lastPlanned is when plan last ran (recordOwedIfStale). Guarded by u.mu.
+	lastPlanned time.Time
 	// holdUntil shed-backs off ALL content uploads until this time, set on a 429 Retry-After or a
 	// transient/5xx failure. It is a coarse global gate because the shed is a server-wide signal.
 	holdUntil time.Time
@@ -199,6 +218,14 @@ type contentState struct {
 	markerProvider    string
 	markerGCSessionID string
 	gcSessionID       string
+
+	// pending mirrors the transcript's durable pending record when one keys it: the session its owed,
+	// never-accepted content was queued under (content_pending.go). pendingLoaded marks that the
+	// record on disk was looked for; pendingWriteLogged latches the log of a failure to write it until
+	// a write succeeds.
+	pending            *contentPending
+	pendingLoaded      bool
+	pendingWriteLogged bool
 
 	// eval* is the (size,modNanos,gcSessionID) of the snapshot last EVALUATED to a non-upload-needed
 	// outcome (uploaded, unchanged, oversize, invalid, or permanently-rejected). A file whose current
@@ -272,20 +299,29 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 	// across restarts. The state dir is shared with the watcher's cursor files; we only touch our
 	// own distinctly-prefixed temp files.
 	sweepOrphanContentTemps(cfg.stateDir)
-	return &contentUploader{
-		sender:   cfg.sender,
-		sessions: cfg.sessions,
-		stateDir: cfg.stateDir,
-		maxBytes: maxBytes,
-		debounce: debounce,
-		read:     read,
-		now:      now,
-		log:      cfg.log,
-		consent:  cfg.consent,
-		files:    map[transcriptIdentity]*contentState{},
+	u := &contentUploader{
+		sender:    cfg.sender,
+		sessions:  cfg.sessions,
+		stateDir:  cfg.stateDir,
+		maxBytes:  maxBytes,
+		debounce:  debounce,
+		read:      read,
+		now:       now,
+		log:       cfg.log,
+		consent:   cfg.consent,
+		tokenFile: cfg.tokenFile,
+		files:     map[transcriptIdentity]*contentState{},
 
 		guardRefusals: map[contentguard.Reason]int{},
-	}, nil
+	}
+	// Content an earlier run queued under consent that no longer applies — withdrawn or re-registered
+	// while the daemon was stopped — is discarded before anything can key it.
+	if n, err := sweepContentPending(u.stateDir, u.pendingConsented); err != nil {
+		u.logf("content upload: discard content queued under withdrawn consent: %v", err)
+	} else if n > 0 {
+		u.logf("content upload: discarded the queued content of %d transcripts: the consent it was queued under no longer applies", n)
+	}
+	return u, nil
 }
 
 // contentUploader is the watcher's ContentObserver.
@@ -338,35 +374,97 @@ func (u *contentUploader) tick(ctx context.Context) {
 	defer u.tickMu.Unlock()
 	u.refreshConsent()
 	now := u.now()
-	u.mu.Lock()
-	if u.disabled || (!u.holdUntil.IsZero() && now.Before(u.holdUntil)) {
-		u.mu.Unlock()
+	jobs, saves := u.plan(now)
+	// What is owed is recorded before anything can hold the upload, so content first queued during a
+	// refusal or a shed survives a restart all the same.
+	u.savePending(saves)
+	if u.postingHeld(now) {
 		return
 	}
-	type job struct {
-		id                            transcriptIdentity
-		origin                        consentOrigin
-		root, locator, path           string
-		native, provider, gcSessionID string
+	for _, j := range jobs {
+		if ctx.Err() != nil {
+			return
+		}
+		// Consent is re-checked before every upload: a narrowing written since this tick began drops
+		// the jobs it no longer covers before any of their bytes are read.
+		u.refreshConsent()
+		// A shed (429) or a refusal (401/403/404/501) recorded while processing an earlier job in this
+		// same tick must stop the rest — re-check before each POST, not only at tick entry.
+		if u.postingHeld(u.now()) {
+			return
+		}
+		u.mu.Lock()
+		skip := !u.allowedLocked(j.origin) || u.files[j.id] == nil
+		u.mu.Unlock()
+		if skip {
+			continue
+		}
+		u.processOne(ctx, j.id, j.origin, j.root, j.locator, j.path, j.native, j.provider, j.gcSessionID)
+		// An upload can take minutes: content first owed while it was in flight is recorded now, not
+		// at the next tick.
+		u.recordOwedIfStale()
 	}
-	var jobs []job
+}
+
+// recordOwed writes the pending records of every transcript whose content is owed and not yet
+// recorded: plan's durable half, without its uploads. The tick runs it between uploads and the daemon
+// runs it once more as it stops, so content first owed since the last plan still survives a restart.
+// It does not take tickMu: it runs inside a tick, and at shutdown possibly beside one.
+func (u *contentUploader) recordOwed() {
+	_, saves := u.plan(u.now())
+	u.savePending(saves)
+}
+
+// recordOwedIfStale runs recordOwed unless a plan ran within the last DefaultContentInterval, so a
+// long upload burst spends one plan per interval on its bookkeeping rather than one per upload.
+func (u *contentUploader) recordOwedIfStale() {
+	u.mu.Lock()
+	stale := u.now().Sub(u.lastPlanned) >= DefaultContentInterval
+	u.mu.Unlock()
+	if stale {
+		u.recordOwed()
+	}
+}
+
+// contentJob is one stable, changed transcript a tick reads and, if its content changed, uploads.
+type contentJob struct {
+	id                            transcriptIdentity
+	origin                        consentOrigin
+	root, locator, path           string
+	native, provider, gcSessionID string
+	size                          int64
+	// fails is how many consecutive POSTs of this snapshot have failed.
+	fails int
+}
+
+// plan evaluates every tracked transcript once, without reading any: it returns the stable, changed
+// transcripts to upload, and the pending records the transcripts whose content is owed need. It runs
+// whether or not posting is held. A snapshot that just failed goes behind every one that has not, so
+// an outage spreads its failures over the queue instead of exhausting one transcript's attempts
+// (maxContentPostAttempts) after another; otherwise jobs come smallest first. While a refusal holds,
+// they come smallest first regardless: the next request only probes the collector, so it should be
+// the cheapest one.
+func (u *contentUploader) plan(now time.Time) ([]contentJob, []pendingSave) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.lastPlanned = now
+	var jobs []contentJob
+	var saves []pendingSave
 	for id, st := range u.files {
 		if !u.allowedLocked(st.origin) {
 			delete(u.files, id) // queued under consent that no longer applies: never sent
 			continue
 		}
 		u.ensureMarkerLoadedLocked(id, st)
-		if !st.observed || now.Sub(st.stableSince) < u.debounce {
-			continue // still growing or not stable long enough
-		}
-		if st.evalSet && st.size == st.evalSize && st.modNanos == st.evalMod && st.gcSessionID == st.evalGCSessionID {
+		if !st.observed || st.handled() {
 			continue // unchanged since the last snapshot we handled
 		}
+		u.ensurePendingLoadedLocked(id, st)
 		// Resolve the native session id BEFORE any whole-file read/hash. Prefer the live sink; fall
-		// back to the marker's persisted id so a transcript uploaded at least once still keys after a
-		// restart. Unknown → skip cheaply (no read, no hash); a later tick retries once the session is
-		// threaded or the marker lands. This is the guard that stops an unknown-session transcript from
-		// being fully re-read and re-hashed on every tick.
+		// back to the pending record's or the marker's persisted id so a transcript queued or uploaded
+		// before a restart still keys after it. Unknown → skip cheaply (no read, no hash); a later tick
+		// retries once the session is threaded or the marker lands. This is the guard that stops an
+		// unknown-session transcript from being fully re-read and re-hashed on every tick.
 		native, provider, ok := u.resolveSessionLocked(id, st)
 		if !ok {
 			continue
@@ -392,31 +490,54 @@ func (u *contentUploader) tick(ctx context.Context) {
 			st.markEvaluated(st.size, st.modNanos, st.gcSessionID)
 			continue
 		}
-		jobs = append(jobs, job{id: id, origin: st.origin, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID})
+		// The content is owed from here on, settled or not: one the daemon stops before it settles
+		// is owed after the restart too.
+		if rec, owed := st.pendingRecord(id, native, provider, now); owed {
+			saves = append(saves, pendingSave{id: id, st: st, locator: st.locator, rec: rec})
+		}
+		if now.Sub(st.stableSince) < u.debounce {
+			continue // still growing or not stable long enough
+		}
+		jobs = append(jobs, contentJob{id: id, origin: st.origin, root: st.root, locator: st.locator, path: st.path, native: native, provider: provider, gcSessionID: st.gcSessionID, size: st.size, fails: st.failures()})
 	}
-	u.mu.Unlock()
+	probing := u.refusal != nil
+	slices.SortFunc(jobs, func(a, b contentJob) int {
+		fails := 0
+		if !probing {
+			fails = cmp.Compare(a.fails, b.fails)
+		}
+		return cmp.Or(fails, cmp.Compare(a.size, b.size), cmp.Compare(a.id.device, b.id.device), cmp.Compare(a.id.inode, b.id.inode))
+	})
+	return jobs, saves
+}
 
-	for _, j := range jobs {
-		if ctx.Err() != nil {
-			return
-		}
-		// Consent is re-checked before every upload: a narrowing written since this tick began drops
-		// the jobs it no longer covers before any of their bytes are read.
-		u.refreshConsent()
-		// A shed (429) or provision/auth latch (401/403/404/501) recorded while processing an earlier
-		// job in this same tick must stop the rest — re-check before each POST, not only at tick entry.
-		u.mu.Lock()
-		stop := u.disabled || (!u.holdUntil.IsZero() && u.now().Before(u.holdUntil))
-		skip := !u.allowedLocked(j.origin) || u.files[j.id] == nil
-		u.mu.Unlock()
-		if stop {
-			return
-		}
-		if skip {
+// handled reports whether the transcript's current snapshot — its stat and gc session id — is the one
+// last evaluated to an outcome that needs no upload.
+func (st *contentState) handled() bool {
+	return st.evalSet && st.size == st.evalSize && st.modNanos == st.evalMod && st.gcSessionID == st.evalGCSessionID
+}
+
+// failures returns how many consecutive POSTs of the transcript's current snapshot have failed.
+func (st *contentState) failures() int {
+	if st.postFailSize != st.size || st.postFailMod != st.modNanos {
+		return 0
+	}
+	return st.postFailCount
+}
+
+// queuedLocked counts the tracked transcripts whose current content is owed and can be keyed: what a
+// refusal holds back. Called under u.mu.
+func (u *contentUploader) queuedLocked() int {
+	n := 0
+	for id, st := range u.files {
+		if !st.observed || st.handled() {
 			continue
 		}
-		u.processOne(ctx, j.id, j.origin, j.root, j.locator, j.path, j.native, j.provider, j.gcSessionID)
+		if _, _, ok := u.resolveSessionLocked(id, st); ok {
+			n++
+		}
 	}
+	return n
 }
 
 // refreshConsent re-checks the live consent policy; a change runs onConsentChange.
@@ -441,8 +562,9 @@ func contentAllowedBy(p consent.Policy, origin consentOrigin) bool {
 }
 
 // onConsentChange applies a consent change to content not yet sent: queued transcripts the policy no
-// longer covers are dropped, and an upload in flight that it no longer covers is cancelled. It is
-// the consent Source's subscriber, so it runs on whichever daemon loop observed the change.
+// longer covers are dropped — their pending records with them, so a restart cannot resurrect them —
+// and an upload in flight that it no longer covers is cancelled. It is the consent Source's
+// subscriber, so it runs on whichever daemon loop observed the change.
 func (u *contentUploader) onConsentChange() {
 	p := u.consent.Latest()
 	u.mu.Lock()
@@ -461,6 +583,7 @@ func (u *contentUploader) onConsentChange() {
 	if dropped > 0 {
 		u.logf("content upload: consent narrowed; dropped %d queued transcripts without sending them", dropped)
 	}
+	u.sweepPending()
 }
 
 // dropAll forgets every queued transcript. The daemon calls it when it rebuilds the watcher for a
@@ -472,11 +595,14 @@ func (u *contentUploader) dropAll() {
 }
 
 // resolveSessionLocked resolves the native session id + provider for a transcript, preferring the
-// live sink threading and falling back to the last-uploaded marker's persisted identity (which
-// survives a restart). Called under u.mu.
+// live sink threading and falling back to the identities persisted across a restart: the pending
+// record of content queued and not yet accepted, then the last-uploaded marker. Called under u.mu.
 func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *contentState) (native, provider string, ok bool) {
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
+	}
+	if p := st.pending; p != nil {
+		return p.NativeSessionID, p.Provider, true
 	}
 	if st.markerNative != "" {
 		return st.markerNative, st.markerProvider, true
@@ -498,8 +624,10 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 				st.oversizeLogged = true
 			}
 			st.markEvaluated(rsize, rmod, gcSessionID)
+			st.pending = nil
 		}
 		u.mu.Unlock()
+		u.dropPending(id) // a transcript only grows: it is not owed
 		return
 	}
 	if err != nil {
@@ -528,8 +656,10 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		if st := u.files[id]; st != nil {
 			u.recordGuardRefusalLocked(st, locator, reason)
 			st.markEvaluated(rsize, rmod, gcSessionID)
+			st.pending = nil
 		}
 		u.mu.Unlock()
+		u.dropPending(id) // refused content is not owed
 		return
 	}
 
@@ -548,16 +678,24 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 		// Advance eval so future ticks skip the re-read and do not re-POST. Only refresh + persist the
 		// durable marker when the hash came from a REAL acceptance; a hash recorded from a permanent-4xx
 		// rejection stays in-memory-only so a restart still re-probes it (the 400/413/422 intent).
+		// Either way the content is not owed: accepted, or rejected for good. A pending record written
+		// for it since — after only its mtime moved, or by a run that stopped between persisting the
+		// marker and deleting the record — goes.
 		st.markEvaluated(rsize, rmod, gcSessionID)
+		pending := st.pending != nil
+		st.pending = nil
 		if st.uploaded {
 			st.markerSize, st.markerMod = rsize, rmod
 			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
 			marker := st.markerRecord(id, u.now())
 			u.mu.Unlock()
 			u.persistMarker(id, marker)
-			return
+		} else {
+			u.mu.Unlock()
 		}
-		u.mu.Unlock()
+		if pending {
+			u.dropPending(id)
+		}
 		return
 	}
 	// A GC binding already refused for this transcript is never re-offered: the content store binds a
@@ -582,6 +720,9 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 	u.refreshConsent()
 	postCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// The token file as it is before the request: a refusal is recorded against the oldest credential
+	// the request could carry, so a renewal racing the request is still seen as one and retried.
+	token := statTokenFile(u.tokenFile)
 	u.mu.Lock()
 	if !u.allowedLocked(origin) {
 		delete(u.files, id)
@@ -629,15 +770,10 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 	}
 	switch {
 	case res.StatusCode == 200 || res.StatusCode == 201:
-		var marker contentMarker
-		if st != nil {
-			st.setUploaded(hash, rsize, rmod, native, provider, gcSessionID)
-			marker = st.markerRecord(id, now)
-		}
+		resumed := u.acceptedLocked()
+		marker, ok := u.acceptedSnapshotLocked(st, id, hash, rsize, rmod, native, provider, gcSessionID, now)
 		u.mu.Unlock()
-		if st != nil {
-			u.persistMarker(id, marker)
-		}
+		u.recordAccepted(id, marker, ok, resumed, res.StatusCode)
 		u.logf("content upload: sent %s for session %s (%d bytes, gc_session_id=%s)", locator, native, len(content), res.GCSessionID)
 	case res.StatusCode == 409 && res.Code == wire.ObserverErrorBodyCodeSOURCEBINDINGCONFLICT && sendGC != "":
 		// The content store already binds this transcript's source path to a DIFFERENT GC session id,
@@ -652,7 +788,12 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 		if st != nil {
 			st.gcRefusedLogged = true
 		}
+		// The collector judged the binding, so it accepted the credential: a refusal is over.
+		resumed := u.acceptedLocked()
 		u.mu.Unlock()
+		if resumed {
+			u.logResumed(res.StatusCode)
+		}
 		if logIt {
 			u.logf("content upload: collector refused the gc session binding for %s (session %s)%s; re-sending without it", locator, native, serverMessage(res))
 		}
@@ -660,15 +801,10 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 	case res.StatusCode == 409:
 		// Idempotency content mismatch: the server already holds different bytes for this
 		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.
-		var marker contentMarker
-		if st != nil {
-			st.setUploaded(hash, rsize, rmod, native, provider, gcSessionID)
-			marker = st.markerRecord(id, now)
-		}
+		resumed := u.acceptedLocked()
+		marker, ok := u.acceptedSnapshotLocked(st, id, hash, rsize, rmod, native, provider, gcSessionID, now)
 		u.mu.Unlock()
-		if st != nil {
-			u.persistMarker(id, marker)
-		}
+		u.recordAccepted(id, marker, ok, resumed, res.StatusCode)
 		u.logf("content upload: 409 content mismatch for session %s%s; advancing", native, serverMessage(res))
 	case res.StatusCode == 429:
 		// Shed: honor Retry-After, but cap it so an absurd value cannot disable upload for the run.
@@ -682,30 +818,41 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 		u.holdUntil = now.Add(hold)
 		u.mu.Unlock()
 		u.logf("content upload: 429 shed; backing off %s", hold)
-	case res.StatusCode == 401 || res.StatusCode == 403 || res.StatusCode == 404 || res.StatusCode == 501:
-		// Provisioning / authorization / route failure: content upload cannot work for this run at
-		// all (the credential, tenant provisioning, or route will not change), so latch off rather
-		// than retry every transcript forever. A restart re-probes.
-		u.disabled = true
+	case isContentRefusal(res.StatusCode):
+		// The collector refuses content upload itself — the credential (401/403), or content upload
+		// not provisioned or disabled for this source (404/501) — not these bytes. An operator fixes
+		// either without restarting the daemon, so back off and keep every queued transcript, its
+		// snapshot unmarked, rather than latch off (see contentRefusal).
+		wait, transition := u.recordRefusalLocked(res.StatusCode, now, token)
+		queued := u.queuedLocked()
 		u.mu.Unlock()
-		u.logf("content upload: status %d%s; disabling content upload for this run", res.StatusCode, serverMessage(res))
+		if transition {
+			u.logRefusal(res.StatusCode, serverMessage(res), queued, wait)
+		}
 	case res.StatusCode == 400 || res.StatusCode == 413 || res.StatusCode == 422:
 		// Permanent for THESE bytes (malformed / too large / contract violation the client guard
 		// missed): record the hash in memory so identical bytes are not re-POSTed, advance eval so the
 		// file is not re-read, but do NOT persist (a restart re-probes) and do NOT arm the global hold
 		// (other transcripts may upload fine). A genuine content change produces a new hash and is
-		// retried once.
+		// retried once. The collector judged the bytes, so it accepted the credential: a refusal is
+		// over. And the rejected content is not owed: its pending record goes.
 		if st != nil {
 			st.markerHash = hash
 			st.uploaded = false // in-memory dedup only; a restart re-probes (do not persist)
 			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
 			st.markEvaluated(rsize, rmod, gcSessionID)
+			st.pending = nil
 			if !st.permanentLogged {
 				u.logf("content upload: permanent status %d for session %s%s; not retrying identical bytes", res.StatusCode, native, serverMessage(res))
 				st.permanentLogged = true
 			}
 		}
+		resumed := u.acceptedLocked()
 		u.mu.Unlock()
+		u.dropPending(id)
+		if resumed {
+			u.logResumed(res.StatusCode)
+		}
 	default:
 		u.holdUntil = now.Add(contentTransientHold)
 		gaveUp := false
@@ -758,6 +905,31 @@ func (st *contentState) setUploaded(hash string, size, mod int64, native, provid
 	st.uploaded = true
 	st.markEvaluated(size, mod, gcSessionID)
 	st.postFailCount, st.giveUpLogged = 0, false
+}
+
+// acceptedSnapshotLocked records that the collector accepted (or already holds) a snapshot: the
+// in-memory marker advances to it, and the content is no longer owed. It returns the marker to
+// persist, or ok=false when the transcript is no longer tracked. Called under u.mu.
+func (u *contentUploader) acceptedSnapshotLocked(st *contentState, id transcriptIdentity, hash string, size, mod int64, native, provider, gcSessionID string, now time.Time) (marker contentMarker, ok bool) {
+	if st == nil {
+		return contentMarker{}, false
+	}
+	st.setUploaded(hash, size, mod, native, provider, gcSessionID)
+	st.pending = nil
+	return st.markerRecord(id, now), true
+}
+
+// recordAccepted makes an acceptance durable: a still-tracked transcript's marker is persisted, and
+// its pending record is deleted either way — accepted content is no longer owed. The end of a refusal
+// is logged once. Called with u.mu released.
+func (u *contentUploader) recordAccepted(id transcriptIdentity, marker contentMarker, tracked, resumed bool, status int) {
+	if tracked {
+		u.persistMarker(id, marker)
+	}
+	u.dropPending(id)
+	if resumed {
+		u.logResumed(status)
+	}
 }
 
 // ensureMarkerLoadedLocked loads the persisted last-uploaded marker the first time a transcript is
@@ -854,59 +1026,32 @@ func (u *contentUploader) persistMarker(id transcriptIdentity, m contentMarker) 
 		u.logf("content upload: marshal marker: %v", err)
 		return
 	}
-	path := contentMarkerPath(u.stateDir, id.device, id.inode)
-	if err := os.MkdirAll(u.stateDir, 0o700); err != nil {
-		u.logf("content upload: create marker dir: %v", err)
-		return
-	}
-	tmp, err := os.CreateTemp(u.stateDir, ".tmp-content-marker-*")
-	if err != nil {
-		u.logf("content upload: create marker temp: %v", err)
-		return
-	}
-	tmpName := tmp.Name()
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmpName)
-		u.logf("content upload: chmod marker temp: %v", err)
-		return
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		_ = os.Remove(tmpName)
-		u.logf("content upload: write marker temp: %v", err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-		u.logf("content upload: close marker temp: %v", err)
-		return
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-		u.logf("content upload: rename marker: %v", err)
+	if err := writeStateFile(u.stateDir, filepath.Base(contentMarkerPath(u.stateDir, id.device, id.inode)), contentMarkerTempPrefix, data); err != nil {
+		u.logf("content upload: write marker: %v", err)
 	}
 }
 
 // ForgetContent releases all state for a transcript identity the watcher has dropped (fully rotated
-// away / deleted): the in-memory bookkeeping, the durable marker file, and the sink's threaded
-// session id. Mirroring the cursor GC, this bounds memory + on-disk markers for a long-lived daemon
-// and stops a vanished transcript from being re-read every tick, and it ensures a later file that
-// reuses the same (device,inode) starts fresh rather than resurrecting a stale marker or session id.
+// away / deleted): the in-memory bookkeeping, the durable marker and pending record, and the sink's
+// threaded session id. Mirroring the cursor GC, this bounds memory + on-disk state for a long-lived
+// daemon and stops a vanished transcript from being re-read every tick, and it ensures a later file
+// that reuses the same (device,inode) starts fresh rather than resurrecting a stale marker or session.
 func (u *contentUploader) ForgetContent(device, inode uint64) {
 	id := transcriptIdentity{device: device, inode: inode}
 	u.mu.Lock()
 	delete(u.files, id)
 	u.mu.Unlock()
 	_ = os.Remove(contentMarkerPath(u.stateDir, device, inode))
+	u.dropPending(id)
 	if u.sessions != nil {
 		u.sessions.Forget(device, inode)
 	}
 }
 
-// sweepOrphanContentTemps removes marker temp files left by a crash between CreateTemp and rename, so
-// they cannot accumulate across restarts. It only removes our own distinctly-prefixed temp files and
-// silently tolerates an absent state dir (nothing has been written yet).
+// sweepOrphanContentTemps removes marker and pending-record temp files left by a crash between
+// CreateTemp and rename, so they cannot accumulate across restarts. It only removes our own
+// distinctly-prefixed temp files and silently tolerates an absent state dir (nothing has been written
+// yet).
 func sweepOrphanContentTemps(stateDir string) {
 	entries, err := os.ReadDir(stateDir)
 	if err != nil {
@@ -916,7 +1061,7 @@ func sweepOrphanContentTemps(stateDir string) {
 		if e.IsDir() {
 			continue
 		}
-		if strings.HasPrefix(e.Name(), ".tmp-content-marker-") {
+		if strings.HasPrefix(e.Name(), contentMarkerTempPrefix) || strings.HasPrefix(e.Name(), contentPendingTempPrefix) {
 			_ = os.Remove(filepath.Join(stateDir, e.Name()))
 		}
 	}

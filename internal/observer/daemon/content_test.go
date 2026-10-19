@@ -214,6 +214,7 @@ func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness 
 	if cfg.debounce != 0 {
 		base.debounce = cfg.debounce
 	}
+	base.tokenFile = cfg.tokenFile
 	if cfg.sender != nil {
 		base.sender = cfg.sender
 		h.sender = cfg.sender.(*fakeContentSender)
@@ -439,32 +440,6 @@ func TestContentUploadDedupUnchangedNotReuploadedGrownReuploaded(t *testing.T) {
 	}
 	if string(h.sender.at(1).Body) != "aaabbb" {
 		t.Fatalf("second upload body = %q", h.sender.at(1).Body)
-	}
-}
-
-func TestContentUpload501StopsUploads(t *testing.T) {
-	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
-		return &upload.ContentResult{StatusCode: 501}, nil
-	}}
-	h := newContentHarness(t, contentUploaderConfig{sender: sender})
-	h.sessions.set(1, 1, "s1", "codex")
-	h.sessions.set(2, 2, "s2", "codex")
-	h.reader.set(1, 1, "aaa", 1)
-	h.reader.set(2, 2, "bbb", 1)
-
-	h.observe(1, 1, testCodexPath, 3, 1)
-	h.clock.advance(31 * time.Second)
-	h.u.tick(context.Background())
-	if sender.count() != 1 {
-		t.Fatalf("first (501) attempt count = %d, want 1", sender.count())
-	}
-
-	// A second, different, stable-and-changed transcript is NOT attempted: content upload latched off.
-	h.observe(2, 2, testCodexPath, 3, 1)
-	h.clock.advance(31 * time.Second)
-	h.u.tick(context.Background())
-	if sender.count() != 1 {
-		t.Fatalf("attempted after 501 disable: %d", sender.count())
 	}
 }
 
@@ -762,8 +737,8 @@ func TestContentUploadPermanentStatusAdvancesNoLoop(t *testing.T) {
 	if sender.count() != 1 {
 		t.Fatalf("permanent 422 re-POSTed identical bytes: %d, want 1", sender.count())
 	}
-	if h.u.disabled {
-		t.Fatal("permanent 422 wrongly disabled all content upload")
+	if h.u.refusal != nil {
+		t.Fatal("permanent 422 wrongly held all content upload as a refusal")
 	}
 	if !h.u.holdUntil.IsZero() {
 		t.Fatal("permanent 422 wrongly armed the global hold")
@@ -782,7 +757,7 @@ func TestContentUploadRejectionLogsServerMessage(t *testing.T) {
 	}{
 		{"permanent", 422, "permanent status 422"},
 		{"mismatch", 409, "409 content mismatch"},
-		{"disabling", 501, "disabling content upload"},
+		{"refused", 501, "the collector refused content upload"},
 		{"unexpected", 502, "unexpected status 502"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1008,6 +983,10 @@ func TestContentUploadPermanent422NeverPersistedViaNoOp(t *testing.T) {
 	}
 	if sender.count() != 1 {
 		t.Fatalf("re-POSTed rejected bytes: %d", sender.count())
+	}
+	// Nor are the rejected bytes recorded as owed, which would re-send them after every restart.
+	if left := pendingRecords(t, h.stateDir); len(left) != 0 {
+		t.Fatalf("rejected bytes recorded as owed after an mtime-only bump: %v", left)
 	}
 }
 

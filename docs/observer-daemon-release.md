@@ -340,9 +340,16 @@ Treat any of these as a failed roll:
   on recovery. Go to §4.
 - `upload drain: observer upload: held — …` repeating — the batch lane is wedged; see the
   409 warning in §4a.
-- `content upload: status 401|403|404|501 …; disabling content upload for this run` —
-  content upload has latched off for the process lifetime. The log line carries the
-  collector's own message; read it before restarting.
+- `content upload: status 401|403|404|501 …: the collector refused content upload; …` —
+  the collector refuses the companion's credential (401/403) or has no content upload for
+  this source (404/501). The line carries the collector's own message; read it. Content
+  upload is held, not switched off: every queued transcript is kept — including the ones
+  first seen during the refusal, and across a restart — and retried after a back-off (15s,
+  doubling to 5 minutes), or at once when the `-token-file` changes. Renewing the token
+  file is enough; no restart is needed. One
+  `content upload: the collector accepted content upload again (status N); resuming` line
+  marks the recovery, after which each queued transcript is uploaded once. (Older builds
+  logged `…; disabling content upload for this run` here and stayed off until restarted.)
 
 Expect, within a poll interval or two:
 
@@ -393,6 +400,18 @@ zero, as deleting a cursor always did.
 A transcript that never names a model and never reports usage is no longer content-uploaded. Its
 observations name no session to key the snapshot by. A new transcript is uploaded after its first
 model record, a few seconds later than before.
+
+With content upload on, the cursor directory also holds a `content-pending-<dev>-<ino>.json` file
+for each transcript whose content is queued but has never been accepted: a refused upload, a
+shed, or a transcript still settling when the daemon stops. It names the session, the transcript's
+name, and the consent the content was queued under (no content), so the queue survives a restart
+even though the restarted daemon never parses a fully consumed transcript again. It is written as
+soon as the content is owed, after every upload, and once more on a graceful stop; only a crash
+can lose the content owed since the last of those. It is deleted once the collector accepts that
+content or rejects it for good, when the transcript goes away, as soon as the live policy no
+longer consents to it (including while the policy file is unreadable or invalid), and at the start
+of a run with `-content-upload` off — switching content upload off discards the queue; starting
+without `-collector` does not. Older builds ignore these files.
 
 See [observer-usage-message-id.md](./observer-usage-message-id.md) for the exact rules and the
 one-time effects on transcripts captured before the roll.
@@ -475,7 +494,7 @@ ledger on any build. Once the unit has drained (`ack` no longer advancing while 
 - [ ] Drop-in repeats the unit's arguments verbatim; only the binary path differs
 - [ ] `ReadWritePaths=` still covers `-dir` and `-cursor-dir`
 - [ ] If §4 applied: drain confirmed, segment archived (not deleted), `ack` and `identity` untouched
-- [ ] `serving at` seen; no spool, drain, or latch-off errors for 60s
+- [ ] `serving at` seen; no spool, drain, or content-refusal errors for 60s
 - [ ] `acknowledged_through` advancing
 - [ ] At least one `content upload: sent` per unit
 - [ ] Manual content replay returns 200/201
