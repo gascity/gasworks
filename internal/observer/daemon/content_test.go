@@ -1293,8 +1293,8 @@ func TestContentUploadDoubleBindingConflictIsNeverPersisted(t *testing.T) {
 	}
 	n := 0
 	for _, l := range h.logLines() {
-		if strings.Contains(l, "advancing") {
-			t.Fatalf("logged the identity conflict as an advance: %q", l)
+		if strings.Contains(l, "content mismatch") {
+			t.Fatalf("logged the identity conflict as an advanced content mismatch: %q", l)
 		}
 		if strings.Contains(l, "identity conflict (409 SOURCE_BINDING_CONFLICT without a gc binding)") {
 			n++
