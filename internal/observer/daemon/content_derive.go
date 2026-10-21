@@ -22,18 +22,26 @@ import (
 // the identity the providers write into the transcript's name, which is the id the metadata pipeline
 // stamps for an ordinary transcript and the id the collector's content store keys it by:
 //
-//	claude <uuid>.jsonl                      → <uuid>  (Claude Code names the file by its session)
+//	claude <project>/<uuid>.jsonl            → <uuid>  (Claude Code names the file by its session)
 //	codex  rollout-<timestamp>-<uuid>.jsonl  → <uuid>  (the session_meta id Codex names the file by;
 //	                                                    the content store's canonical rollout identity)
 //
-// A Claude subagent transcript (agent-<hex>.jsonl) is deliberately NOT derived: its records carry
-// the PARENT session's id, and the content store keys one transcript per native id, so keying a
-// subagent's bytes by its parent's id would replace the parent's snapshot. Anything else stays
-// unknown and is skipped cheaply, as before.
+// A Claude transcript is derived only at exactly one directory below the root (the project dir),
+// where Claude Code writes a session's own transcript; a <uuid>.jsonl anywhere deeper is some other
+// layout and is not trusted to name its session. A Claude subagent transcript (agent-<hex>.jsonl,
+// under <project>/<session>/subagents/) is deliberately NOT derived: its records carry the PARENT
+// session's id, and the content store keys one transcript per native id, so keying a subagent's
+// bytes by its parent's id would replace the parent's snapshot. Anything else stays unknown and is
+// skipped cheaply, as before.
 
-// deriveSessionFromName derives the native session id and provider from a transcript's basename.
-func deriveSessionFromName(path string) (native, provider string, ok bool) {
-	stem, isJSONL := strings.CutSuffix(filepath.Base(path), ".jsonl")
+// deriveSessionFromName derives the native session id and provider from a transcript's locator, its
+// path relative to the watched root.
+func deriveSessionFromName(locator string) (native, provider string, ok bool) {
+	locator = filepath.ToSlash(filepath.Clean(locator))
+	if locator == "." || strings.HasPrefix(locator, "../") || strings.HasPrefix(locator, "/") {
+		return "", "", false
+	}
+	stem, isJSONL := strings.CutSuffix(filepath.Base(locator), ".jsonl")
 	if !isJSONL {
 		return "", "", false
 	}
@@ -48,7 +56,7 @@ func deriveSessionFromName(path string) (native, provider string, ok bool) {
 		}
 		return id, "codex", true
 	}
-	if isLowerUUID(stem) {
+	if isLowerUUID(stem) && strings.Count(locator, "/") == 1 {
 		return stem, "claude", true
 	}
 	return "", "", false

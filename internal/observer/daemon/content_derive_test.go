@@ -4,12 +4,16 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/gascity/gasworks/internal/observer/adapter/codex"
+	"github.com/gascity/gasworks/internal/observer/evidence"
+	"github.com/gascity/gasworks/internal/observer/local"
 )
 
 const (
@@ -19,28 +23,45 @@ const (
 
 func TestDeriveSessionFromName(t *testing.T) {
 	cases := []struct {
-		path             string
+		locator          string
 		native, provider string
 		ok               bool
 	}{
-		{"/r/2026/10/17/rollout-2026-10-17T12-34-56-" + derivedCodexUUID + ".jsonl", derivedCodexUUID, "codex", true},
-		{"/r/-work-p/" + derivedClaudeUUID + ".jsonl", derivedClaudeUUID, "claude", true},
+		{"2026/10/17/rollout-2026-10-17T12-34-56-" + derivedCodexUUID + ".jsonl", derivedCodexUUID, "codex", true},
+		{"rollout-2026-10-17T12-34-56-" + derivedCodexUUID + ".jsonl", derivedCodexUUID, "codex", true},
+		{"-work-p/" + derivedClaudeUUID + ".jsonl", derivedClaudeUUID, "claude", true},
+		// A Claude transcript names its session only at <project>/<uuid>.jsonl: at the root itself
+		// or any deeper it is some other layout.
+		{derivedClaudeUUID + ".jsonl", "", "", false},
+		{"-work-p/" + derivedClaudeUUID + "/" + derivedClaudeUUID + ".jsonl", "", "", false},
+		{"-work-p/" + derivedClaudeUUID + "/subagents/" + derivedClaudeUUID + ".jsonl", "", "", false},
 		// A subagent transcript carries its parent's session id: keying it by that id would replace
 		// the parent's snapshot in the content store, so it is never derived.
-		{"/r/-work-p/" + derivedClaudeUUID + "/subagents/agent-a1b2c3.jsonl", "", "", false},
-		{"/r/rollout-2026-06.jsonl", "", "", false},                                     // no uuid
-		{"/r/rollout-" + derivedCodexUUID + ".jsonl", "", "", false},                    // no timestamp before the uuid
-		{"/r/rollout-2026-10-17T12-34-56" + derivedCodexUUID + ".jsonl", "", "", false}, // no dash before the uuid
-		{"/r/3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C.jsonl", "", "", false},                // not the providers' lowercase shape
-		{"/r/" + derivedClaudeUUID + ".json", "", "", false},
-		{"/r/history.jsonl", "", "", false},
+		{"-work-p/" + derivedClaudeUUID + "/subagents/agent-a1b2c3.jsonl", "", "", false},
+		{"-work-p/agent-a1b2c3.jsonl", "", "", false},
+		{"../-work-p/" + derivedClaudeUUID + ".jsonl", "", "", false},                // escapes the root
+		{"rollout-2026-06.jsonl", "", "", false},                                     // no uuid
+		{"rollout-" + derivedCodexUUID + ".jsonl", "", "", false},                    // no timestamp before the uuid
+		{"rollout-2026-10-17T12-34-56" + derivedCodexUUID + ".jsonl", "", "", false}, // no dash before the uuid
+		{"-work-p/3F2B8C1A-9D4E-4F6A-8B7C-1D2E3F4A5B6C.jsonl", "", "", false},        // not the providers' lowercase shape
+		{"-work-p/" + derivedClaudeUUID + ".json", "", "", false},
+		{"-work-p/journal.jsonl", "", "", false},
+		{"history.jsonl", "", "", false},
 	}
 	for _, c := range cases {
-		native, provider, ok := deriveSessionFromName(c.path)
+		native, provider, ok := deriveSessionFromName(c.locator)
 		if native != c.native || provider != c.provider || ok != c.ok {
-			t.Errorf("deriveSessionFromName(%q) = (%q, %q, %v), want (%q, %q, %v)", c.path, native, provider, ok, c.native, c.provider, c.ok)
+			t.Errorf("deriveSessionFromName(%q) = (%q, %q, %v), want (%q, %q, %v)", c.locator, native, provider, ok, c.native, c.provider, c.ok)
 		}
 	}
+}
+
+// claudeTranscriptLines is a minimal Claude Code transcript of one finished response whose records
+// carry sessionID: what both a session's own transcript and its subagents' transcripts look like.
+func claudeTranscriptLines(sessionID string) string {
+	const rec = `{"type":%q,"uuid":%q,"parentUuid":%s,"sessionId":%q,"timestamp":"2026-10-17T10:00:0%dZ","message":%s}` + "\n"
+	return fmt.Sprintf(rec, "user", "u1", "null", sessionID, 1, `{"role":"user","content":"hi"}`) +
+		fmt.Sprintf(rec, "assistant", "a1", `"u1"`, sessionID, 2, `{"role":"assistant","id":"msg_1","model":"claude-opus-5-5","stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3},"content":[{"type":"text"}]}`)
 }
 
 // TestContentUploadRestartHoleMarkerlessFinishedTranscriptUploaded is the regression for the restart
@@ -49,41 +70,80 @@ func TestDeriveSessionFromName(t *testing.T) {
 // watcher's cursor is at EOF, so its sink never threads either session again. Before the name
 // derivation both were skipped on every tick for good; now both upload once, keyed by the id their
 // name carries, and their markers make the upload survive the next restart.
+//
+// Both runs use the production sink (the uploader's SessionFor is the same sink the watcher feeds),
+// so the test proves the restarted sink really never threads the EOF transcripts. A Claude subagent
+// transcript, whose records carry its parent's session id, sits beside them and is never uploaded.
 func TestContentUploadRestartHoleMarkerlessFinishedTranscriptUploaded(t *testing.T) {
 	root, state := t.TempDir(), t.TempDir()
 	rolloutDir := filepath.Join(root, "2026", "10", "17")
 	claudeDir := filepath.Join(root, "-work-p")
-	for _, d := range []string{rolloutDir, claudeDir} {
+	subagentDir := filepath.Join(claudeDir, derivedClaudeUUID, "subagents")
+	for _, d := range []string{rolloutDir, claudeDir, subagentDir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
 	rollout := filepath.Join(rolloutDir, "rollout-2026-10-17T12-34-56-"+derivedCodexUUID+".jsonl")
 	claude := filepath.Join(claudeDir, derivedClaudeUUID+".jsonl")
-	bodies := map[string]string{rollout: "rollout-line-1\nrollout-line-2\n", claude: "claude-line-1\n"}
+	subagent := filepath.Join(subagentDir, "agent-a1b2c3d4.jsonl")
+	bodies := map[string]string{
+		rollout:  rolloutLines(derivedCodexUUID, 2),
+		claude:   claudeTranscriptLines(derivedClaudeUUID),
+		subagent: claudeTranscriptLines(derivedClaudeUUID),
+	}
+	idOf := map[string]transcriptIdentity{}
 	for p, b := range bodies {
 		if err := os.WriteFile(p, []byte(b), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := info.Sys().(*syscall.Stat_t)
+		idOf[p] = transcriptIdentity{device: uint64(st.Dev), inode: st.Ino}
 	}
 
-	// The previous run: it parsed both transcripts to EOF and persisted its cursors, and never had
-	// their content accepted (no marker, no pending record).
-	prev, err := codex.NewWatcher(codex.WatchConfig{ApprovedRoots: []string{root}, StateDir: state, Sink: noopCandidateSink{}})
-	if err != nil {
-		t.Fatalf("NewWatcher (previous run): %v", err)
+	spoolDir := t.TempDir()
+	srv := startDaemonServer(t, spoolDir, newSpoolWriter(t, spoolDir), NewRegistry("src_test", "ws_main"))
+	watcher := func(sink *CandidateSinkAdapter, obs codex.ContentObserver) *codex.Watcher {
+		cfg := codex.WatchConfig{
+			ApprovedRoots: []string{root},
+			StateDir:      state,
+			Sink:          NewPartialCandidateSinkAdapter(sink),
+			References:    codex.ReferenceConfig{Resolver: evidence.ProjectResolver{DefaultProjectID: "proj_test"}},
+		}
+		if obs != nil {
+			cfg.ContentObserver = obs
+		}
+		w, err := codex.NewWatcher(cfg)
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		return w
 	}
-	if err := prev.Poll(context.Background()); err != nil {
+
+	// The previous run: it parsed all three transcripts to EOF and persisted its cursors, and never
+	// had their content accepted (no marker, no pending record). Its sink threaded every session,
+	// the subagent's under its parent's id.
+	prevSink := newSink(t, local.NewClient(srv.SocketPath()))
+	if err := watcher(prevSink, nil).Poll(context.Background()); err != nil {
 		t.Fatalf("poll (previous run): %v", err)
 	}
+	for p, want := range map[string]string{rollout: derivedCodexUUID, claude: derivedClaudeUUID, subagent: derivedClaudeUUID} {
+		if got, _, ok := prevSink.SessionFor(idOf[p].device, idOf[p].inode); !ok || got != want {
+			t.Fatalf("previous run threaded %s as (%q, %v), want %q", filepath.Base(p), got, ok, want)
+		}
+	}
 
-	// The restart: a fresh uploader whose sink threading is empty, over the same state dir.
+	// The restart: a fresh production sink and uploader over the same state dir.
 	clock := newClock()
-	sender := &fakeContentSender{}
-	newRun := func(sender *fakeContentSender) *contentUploader {
+	newRun := func(sender *fakeContentSender) (*contentUploader, *CandidateSinkAdapter) {
+		sink := newSink(t, local.NewClient(srv.SocketPath()))
 		cu, err := newContentUploader(contentUploaderConfig{
 			sender:   sender,
-			sessions: newSessions(),
+			sessions: sink,
 			stateDir: state,
 			read:     codex.ReadValidatedTranscript,
 			now:      clock.now,
@@ -92,25 +152,30 @@ func TestContentUploadRestartHoleMarkerlessFinishedTranscriptUploaded(t *testing
 		if err != nil {
 			t.Fatalf("newContentUploader: %v", err)
 		}
-		w, err := codex.NewWatcher(codex.WatchConfig{ApprovedRoots: []string{root}, StateDir: state, Sink: noopCandidateSink{}, ContentObserver: cu})
-		if err != nil {
-			t.Fatalf("NewWatcher: %v", err)
-		}
-		if err := w.Poll(context.Background()); err != nil {
+		if err := watcher(sink, cu).Poll(context.Background()); err != nil {
 			t.Fatalf("poll: %v", err)
 		}
-		return cu
+		return cu, sink
 	}
-	cu := newRun(sender)
+	sender := &fakeContentSender{}
+	cu, sink := newRun(sender)
+	for p := range bodies {
+		if _, _, ok := sink.SessionFor(idOf[p].device, idOf[p].inode); ok {
+			t.Fatalf("the restarted sink threaded %s from an EOF cursor; the test no longer covers the hole", filepath.Base(p))
+		}
+	}
 	clock.advance(31 * time.Second)
 	cu.tick(context.Background())
 
 	if sender.count() != 2 {
-		t.Fatalf("uploads after restart = %d, want both marker-less finished transcripts", sender.count())
+		t.Fatalf("uploads after restart = %d, want the two marker-less finished session transcripts", sender.count())
 	}
 	want := map[string][2]string{rollout: {derivedCodexUUID, "codex"}, claude: {derivedClaudeUUID, "claude"}}
 	for i := 0; i < sender.count(); i++ {
 		req := sender.at(i)
+		if req.SourcePath == subagent {
+			t.Fatal("uploaded the subagent transcript under its parent's session id")
+		}
 		w, ok := want[req.SourcePath]
 		if !ok {
 			t.Fatalf("uploaded unexpected path %q", req.SourcePath)
@@ -128,9 +193,10 @@ func TestContentUploadRestartHoleMarkerlessFinishedTranscriptUploaded(t *testing
 		t.Fatalf("markers = %d, want 2", len(markers))
 	}
 
-	// A second restart re-ships nothing: the markers now carry the uploads.
+	// A second restart re-ships nothing: the markers now carry the uploads, and the subagent is
+	// still never derived.
 	sender2 := &fakeContentSender{}
-	cu2 := newRun(sender2)
+	cu2, _ := newRun(sender2)
 	clock.advance(31 * time.Second)
 	cu2.tick(context.Background())
 	if sender2.count() != 0 {

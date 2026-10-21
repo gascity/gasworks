@@ -216,6 +216,8 @@ func newContentHarness(t *testing.T, cfg contentUploaderConfig) *contentHarness 
 	}
 	base.tokenFile = cfg.tokenFile
 	base.interval = cfg.interval
+	base.minGap = cfg.minGap
+	base.sleep = cfg.sleep
 	if cfg.sender != nil {
 		base.sender = cfg.sender
 		h.sender = cfg.sender.(*fakeContentSender)
@@ -1218,6 +1220,88 @@ func TestContentUploadAdoptsStoreBindingOnSourceBindingConflict(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("binding refusal logged %d times, want exactly 1", n)
+	}
+}
+
+// TestContentUploadMinGapPacesATicksBurst: one tick sends every ready transcript back to back unless
+// a minimum gap is configured; with one, each POST after the first waits out the gap.
+func TestContentUploadMinGapPacesATicksBurst(t *testing.T) {
+	var sleeps []time.Duration
+	var h *contentHarness
+	h = newContentHarness(t, contentUploaderConfig{minGap: 2 * time.Second, sleep: func(_ context.Context, d time.Duration) error {
+		sleeps = append(sleeps, d)
+		h.clock.advance(d)
+		return nil
+	}})
+	for i := uint64(0); i < 3; i++ {
+		h.reader.set(930+i, 930+i, "body", 1)
+		h.sessions.set(930+i, 930+i, "019fbaaf-fdeb-76c0-9829-77f33a28b36"+string(rune('0'+i)), "codex")
+		h.observe(930+i, 930+i, testCodexPath, 4, 1)
+	}
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 3 {
+		t.Fatalf("posts = %d, want 3", h.sender.count())
+	}
+	if len(sleeps) != 2 || sleeps[0] != 2*time.Second || sleeps[1] != 2*time.Second {
+		t.Fatalf("pacing sleeps = %v, want two 2s gaps", sleeps)
+	}
+	// A later POST that comes after the gap has passed does not wait.
+	h.reader.set(930, 930, "body-grown", 2)
+	h.observe(930, 930, testCodexPath, 10, 2)
+	h.clock.advance(31 * time.Second)
+	h.u.tick(context.Background())
+	if h.sender.count() != 4 || len(sleeps) != 2 {
+		t.Fatalf("posts = %d, sleeps = %v after the gap passed", h.sender.count(), sleeps)
+	}
+}
+
+// TestContentUploadDoubleBindingConflictIsNeverPersisted: when the re-send that dropped a refused GC
+// binding is ALSO answered SOURCE_BINDING_CONFLICT, the content store binds this path or native id to
+// another transcript and the bytes were not accepted. The daemon must not persist a marker (which
+// would hide the transcript from every later daemon and from a re-upload cutoff), must dedup those
+// bytes in memory only, and must log a distinct, counted line.
+func TestContentUploadDoubleBindingConflictIsNeverPersisted(t *testing.T) {
+	sender := &fakeContentSender{respond: func(int, upload.ContentRequest) (*upload.ContentResult, error) {
+		return &upload.ContentResult{
+			StatusCode: 409,
+			Code:       wire.ObserverErrorBodyCodeSOURCEBINDINGCONFLICT,
+			Message:    "transcript identity conflicts with the binding held for this source path",
+		}, nil
+	}}
+	h := newContentHarness(t, contentUploaderConfig{sender: sender})
+	const dev, ino = 915, 916
+	h.reader.set(dev, ino, "codex-body", 1)
+	h.sessions.set(dev, ino, "019fbaaf-fdeb-76c0-9829-77f33a28b363", "codex")
+	h.observeWithGCSessionID(dev, ino, testCodexPath, 10, 1, "gcs-session-abc")
+
+	for i := 0; i < 5; i++ {
+		h.clock.advance(31 * time.Second)
+		h.u.tick(context.Background())
+	}
+	if sender.count() != 2 {
+		t.Fatalf("posts = %d, want 2 (offered binding, re-sent without it, then in-memory dedup)", sender.count())
+	}
+	if got := sender.at(1).GCSessionID; got != "" {
+		t.Fatalf("re-send still carried a GC session id: %q", got)
+	}
+	if _, ok := h.u.loadMarker(transcriptIdentity{device: dev, inode: ino}); ok {
+		t.Fatal("persisted a marker for content the store refused as an identity conflict")
+	}
+	if h.u.identityConflicts != 1 {
+		t.Fatalf("identity conflicts counted = %d, want 1", h.u.identityConflicts)
+	}
+	n := 0
+	for _, l := range h.logLines() {
+		if strings.Contains(l, "advancing") {
+			t.Fatalf("logged the identity conflict as an advance: %q", l)
+		}
+		if strings.Contains(l, "identity conflict (409 SOURCE_BINDING_CONFLICT without a gc binding)") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("identity conflict logged %d times, want 1", n)
 	}
 }
 
