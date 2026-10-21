@@ -475,8 +475,10 @@ func (u *contentUploader) plan(now time.Time) ([]contentJob, []pendingSave) {
 		u.ensurePendingLoadedLocked(id, st)
 		// Resolve the native session id BEFORE any whole-file read/hash. Prefer the live sink; fall
 		// back to the pending record's or the marker's persisted id so a transcript queued or uploaded
-		// before a restart still keys after it. Unknown → skip cheaply (no read, no hash); a later tick
-		// retries once the session is threaded or the marker lands. This is the guard that stops an
+		// before a restart still keys after it, and last to the id the transcript's name carries, so
+		// one a previous run parsed to EOF without ever having it accepted still keys after a restart.
+		// Unknown → skip cheaply (no read, no hash); a later tick retries once the session is threaded
+		// or the marker lands. This is the guard that stops an
 		// unknown-session transcript from being fully re-read and re-hashed on every tick.
 		native, provider, ok := u.resolveSessionLocked(id, st)
 		if !ok {
@@ -609,7 +611,8 @@ func (u *contentUploader) dropAll() {
 
 // resolveSessionLocked resolves the native session id + provider for a transcript, preferring the
 // live sink threading and falling back to the identities persisted across a restart: the pending
-// record of content queued and not yet accepted, then the last-uploaded marker. Called under u.mu.
+// record of content queued and not yet accepted, then the last-uploaded marker, then the identity
+// derived from the transcript's name (deriveSessionFromName). Called under u.mu.
 func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *contentState) (native, provider string, ok bool) {
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
@@ -620,7 +623,9 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 	if st.markerNative != "" {
 		return st.markerNative, st.markerProvider, true
 	}
-	return "", "", false
+	// Last: the identity the transcript's own name carries (content_derive.go). Without it a
+	// transcript a previous run parsed to EOF but never had accepted could never be keyed again.
+	return deriveSessionFromName(st.path)
 }
 
 // processOne reads, hashes, and (if changed) uploads one transcript's whole content, then records

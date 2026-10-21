@@ -523,3 +523,32 @@ ledger on any build. Once the unit has drained (`ack` no longer advancing while 
 - **The metadata lane still drops the server's message.** `upload.OperatorError` carries the
   collector's `Message` but `Error()` renders only reason, status, and code. The content lane
   now includes it; the batch lane does not yet.
+
+## 9. Re-sending content: `content-reupload`
+
+The daemon uploads a transcript's content once and then trusts its marker
+(`content-marker-<dev>-<ino>.json` in `$CURSORS`). Content a marker records but the content store
+no longer serves — accepted by a destination before a cell cutover — is never sent again by the
+daemon. `gasworks-companion content-reupload` re-sends it, one-shot and paced:
+
+```sh
+# Counts only: nothing is read, sent or written.
+gasworks-companion content-reupload -dry-run -cursor-dir "$CURSORS" -approved-root <root>
+
+# Paced run (1/s by default), resumable from its progress journal.
+gasworks-companion content-reupload -cursor-dir "$CURSORS" -approved-root <root> \
+  -collector <url> -source-id <src> -token-file <file> \
+  -progress-file <journal> [-before 2026-08-02T00:00:00Z] [-ids-file ids.txt] \
+  [-provider codex|claude] [-interval 1s] [-limit N]
+```
+
+It selects markers uploaded before `-before` (default: the 2026-08-02 cutover) and/or naming a
+native session id from `-ids-file` (alone, an id list turns the default cutoff off), finds each
+transcript under the roots by identity, sends it with the daemon's collector client under the
+marker's native session id, and advances the marker on acceptance. A refusal (401/403/404/501) or
+`-max-consecutive-failures` stops the run; rerun the same command to resume. The report on stdout
+is counts only.
+
+A transcript with no marker needs no tool: the daemon derives its native session id from its
+name (`<uuid>.jsonl`, `rollout-<ts>-<uuid>.jsonl`) when nothing else names it, so a transcript a
+previous run parsed to EOF without ever having its content accepted is uploaded after a restart.
