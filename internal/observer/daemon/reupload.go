@@ -35,13 +35,27 @@ import (
 // current whole content through the same collector client the daemon uses, under the marker's native
 // session id. An accepted upload advances the marker exactly as the daemon would.
 //
-// It is resumable: every transcript it settles (accepted, or permanently rejected) is appended to a
-// progress journal, and a rerun skips what the journal holds. An accepted upload also advances its
-// marker past the cutoff, so a cutoff rerun would skip it even without the journal. A collector
-// refusal (401/403/404/501), the context, or a run of consecutive failures stops the run; nothing it
-// did not settle is journaled, so the rerun resumes there. The content store's ingest is idempotent
-// per observation id, so a snapshot it already holds comes back as a duplicate receipt, not a second
-// copy.
+// Identity: a marker names a (device, inode), and an inode can be reused by another transcript after
+// the one the marker recorded is deleted. Transcripts are append-only, so before anything is sent the
+// tool requires the first marker.Size bytes of the file to hash to the marker's content_sha256: the
+// file is then the transcript the marker recorded, grown or not. A file that fails the check (a
+// reused inode, a rewritten file, a marker whose id does not name this transcript) is counted as an
+// IdentityMismatch and never sent, whatever its name or marker id looks like.
+//
+// It is resumable: every transcript it settles (accepted, or permanently rejected 400/413/422) is
+// appended to a progress journal, and a rerun skips what the journal holds. An accepted upload also
+// advances its marker past the cutoff, so a cutoff rerun would skip it even without the journal. A
+// 409 is NOT settled: a conflict can be systematic (the content store holding rows the upload cannot
+// supersede), so a rerun retries it. A collector refusal (401/403/404/501), the context, a run of
+// consecutive failures, or a run of consecutive non-accepted answers (409/400/413/422) stops the run;
+// nothing it did not settle is journaled, so the rerun resumes there. The content store's ingest is
+// idempotent per observation id, so a snapshot it already holds comes back as a duplicate receipt,
+// not a second copy; the same bytes under a new native id are a NEW snapshot (201).
+//
+// The journal is held under an exclusive lock for the whole run, so two runs cannot share one. The
+// tool writes its markers through its own temp-file prefix, which a daemon restart's temp sweep does
+// not touch; a marker write that fails anyway is counted and leaves the transcript unjournaled, so a
+// rerun re-sends it (an idempotent duplicate).
 
 // Re-upload defaults.
 const (
@@ -51,6 +65,14 @@ const (
 	// be sent (transport errors and 5xx after their retries), so a collector outage does not walk the
 	// whole selection.
 	DefaultReuploadMaxConsecutiveFailures = 10
+	// DefaultReuploadMaxConsecutiveConflicts stops a run once this many sent transcripts in a row were
+	// answered 409 or 400/413/422, so a systematic conflict or rejection does not walk the selection.
+	DefaultReuploadMaxConsecutiveConflicts = 10
+	// reuploadMarkerTempPrefix is the tool's own marker temp-file prefix: distinct from the daemon's,
+	// so a daemon restart's orphan sweep never removes a temp file the tool is writing.
+	reuploadMarkerTempPrefix = ".tmp-reupload-marker-"
+	// reuploadTempSweepAge is how old a leftover tool temp file must be before a run removes it.
+	reuploadTempSweepAge = time.Hour
 	// reuploadAttempts bounds the POSTs of one transcript on transport/5xx/429 before it counts as
 	// failed (and stays unjournaled, so a rerun retries it).
 	reuploadAttempts = 4
@@ -67,6 +89,13 @@ var ErrReuploadRefused = errors.New("collector refused content upload")
 
 // ErrReuploadTooManyFailures reports that the run stopped after too many consecutive failures.
 var ErrReuploadTooManyFailures = errors.New("too many consecutive failed uploads")
+
+// ErrReuploadTooManyConflicts reports that the run stopped after too many consecutive non-accepted
+// answers (409, 400, 413, 422): a systematic conflict or rejection an operator must look at.
+var ErrReuploadTooManyConflicts = errors.New("too many consecutive conflicting or rejected uploads")
+
+// ErrReuploadJournalLocked reports that another run holds the progress journal.
+var ErrReuploadJournalLocked = errors.New("another content re-upload run holds the progress journal")
 
 // ReuploadConfig configures one RunContentReupload run.
 type ReuploadConfig struct {
@@ -89,6 +118,8 @@ type ReuploadConfig struct {
 	Interval time.Duration
 	// MaxConsecutiveFailures stops the run (DefaultReuploadMaxConsecutiveFailures when 0).
 	MaxConsecutiveFailures int
+	// MaxConsecutiveConflicts stops the run (DefaultReuploadMaxConsecutiveConflicts when 0).
+	MaxConsecutiveConflicts int
 	// MaxBytes bounds one transcript (DefaultMaxContentBytes when 0).
 	MaxBytes int64
 	// Limit, when > 0, stops after that many POSTed transcripts (a canary slice).
@@ -113,7 +144,7 @@ type ReuploadReport struct {
 	AlreadyDone        int // selected, and settled by an earlier run (progress journal)
 	Located            int // selected, not done, and their transcript was found under a root
 	Missing            int // selected, not done, and no transcript under the roots has the identity
-	IdentityMismatch   int // located, but the file's name names a different provider/rollout (a reused inode)
+	IdentityMismatch   int // located, but the file is not the transcript the marker recorded (name, or its first marker.Size bytes do not hash to the marker's content_sha256)
 	NativeDiffersName  int // located Claude transcripts whose marker id is not their file's uuid (resumed/forked)
 	Unkeyed            int // located, but neither marker nor name yields a valid native session id
 	Guarded            int // refused by the always-on content guards
@@ -123,8 +154,9 @@ type ReuploadReport struct {
 	Accepted           int // 2xx
 	Duplicate          int // 2xx whose receipt says the store already held the snapshot
 	Rejected           int // 400/413/422: permanent for those bytes
-	Conflict           int // 409: the store binds the path to another identity or other bytes
+	Conflict           int // 409, including a SOURCE_BINDING_CONFLICT after the GC binding was dropped (not journaled: a rerun retries)
 	Failed             int // transport/5xx/429 after every retry (not journaled: a rerun retries)
+	MarkerWriteErrors  int // accepted, but the marker could not be written (not journaled: a rerun re-sends)
 }
 
 // reuploadItem is one selected marker and, once located, its transcript.
@@ -172,6 +204,10 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 	if maxFails <= 0 {
 		maxFails = DefaultReuploadMaxConsecutiveFailures
 	}
+	maxConflicts := cfg.MaxConsecutiveConflicts
+	if maxConflicts <= 0 {
+		maxConflicts = DefaultReuploadMaxConsecutiveConflicts
+	}
 	maxBytes := cfg.MaxBytes
 	if maxBytes <= 0 {
 		maxBytes = DefaultMaxContentBytes
@@ -180,6 +216,19 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		if cfg.Log != nil {
 			cfg.Log(fmt.Sprintf(format, args...))
 		}
+	}
+
+	// A sending run holds its journal exclusively from before it reads it until it ends, so a second
+	// run over the same journal fails here instead of re-sending what the first is sending.
+	var journal *os.File
+	if !cfg.DryRun {
+		f, err := lockReuploadJournal(cfg.ProgressFile)
+		if err != nil {
+			return rep, err
+		}
+		journal = f
+		defer journal.Close()
+		sweepReuploadTemps(cfg.StateDir, time.Now())
 	}
 
 	markers, err := loadAllMarkers(cfg.StateDir)
@@ -217,7 +266,7 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		}
 		rep.Located++
 		it := reuploadItem{marker: m, root: f.root, locator: f.locator, path: f.path}
-		nameNative, nameProvider, named := deriveSessionFromName(f.path)
+		nameNative, nameProvider, named := deriveSessionFromName(f.locator)
 		switch {
 		case named && m.Provider != "" && nameProvider != m.Provider,
 			named && nameProvider == "codex" && isLowerUUID(m.NativeSessionID) && nameNative != m.NativeSessionID:
@@ -245,11 +294,6 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		return rep, nil
 	}
 
-	journal, err := os.OpenFile(cfg.ProgressFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
-	if err != nil {
-		return rep, fmt.Errorf("content re-upload: open progress file: %w", err)
-	}
-	defer journal.Close()
 	settle := func(m contentMarker, outcome string) error {
 		line, _ := json.Marshal(reuploadProgress{Device: m.Device, Inode: m.Inode, Native: m.NativeSessionID, Outcome: outcome, At: now().UTC().Format(time.RFC3339Nano)})
 		if _, err := journal.Write(append(line, '\n')); err != nil {
@@ -258,8 +302,8 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		return nil
 	}
 
-	fails := 0
-	for i, it := range items {
+	fails, conflicts := 0, 0
+	for _, it := range items {
 		if cfg.Limit > 0 && rep.Sent >= cfg.Limit {
 			logf("content re-upload: stopped at the limit of %d transcripts", cfg.Limit)
 			break
@@ -280,6 +324,14 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 			rep.ReadErrors++
 			continue
 		}
+		// The file must still be the transcript the marker recorded: transcripts only grow, so its
+		// first marker.Size bytes hash to the marker's content_sha256. Anything else (a reused inode,
+		// a rewritten file) would be sent under another transcript's identity and replace that
+		// transcript's snapshot in the content store.
+		if !markerPrefixMatches(it.marker, content) {
+			rep.IdentityMismatch++
+			continue
+		}
 		if _, refused := contentguard.ScreenContent(content); refused {
 			rep.Guarded++
 			continue
@@ -287,6 +339,12 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		sum := sha256.Sum256(content)
 		hash := hex.EncodeToString(sum[:])
 
+		// Pace every POST after the first, whatever the previous one's outcome was.
+		if rep.Sent > 0 {
+			if err := sleep(ctx, interval); err != nil {
+				return rep, err
+			}
+		}
 		outcome, res, err := postReupload(ctx, cfg.Sender, it, content, sleep)
 		rep.Sent++
 		if err != nil {
@@ -295,6 +353,7 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 		switch outcome {
 		case "accepted", "gc-refused":
 			rep.Accepted++
+			fails, conflicts = 0, 0
 			if res.StatusCode == 200 {
 				rep.Duplicate++ // the store already held this snapshot: 200 duplicate, 201 new
 			}
@@ -304,38 +363,97 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 			m.ContentSHA256, m.Size, m.ModNanos = hash, size, mod
 			m.UploadedAt = now().UTC().Format(time.RFC3339Nano)
 			data, _ := json.Marshal(m)
-			if err := writeStateFile(cfg.StateDir, filepath.Base(contentMarkerPath(cfg.StateDir, id.device, id.inode)), contentMarkerTempPrefix, data); err != nil {
-				return rep, fmt.Errorf("content re-upload: write marker: %w", err)
+			if err := writeStateFile(cfg.StateDir, filepath.Base(contentMarkerPath(cfg.StateDir, id.device, id.inode)), reuploadMarkerTempPrefix, data); err != nil {
+				// Accepted, but not recorded: leave it unjournaled so a rerun re-sends it (the store
+				// answers a duplicate). The run goes on; the error names no content.
+				rep.MarkerWriteErrors++
+				logf("content re-upload: accepted session %s but could not write its marker: %v", it.marker.NativeSessionID, err)
+				continue
 			}
-			outcome = "accepted"
+			if err := settle(it.marker, "accepted"); err != nil {
+				return rep, err
+			}
+		case "rejected", "conflict":
 			fails = 0
-		case "rejected":
-			rep.Rejected++
-			fails = 0
-		case "conflict":
-			rep.Conflict++
-			fails = 0
+			conflicts++
+			if outcome == "rejected" {
+				rep.Rejected++
+				// Permanent for these bytes: settled, so a rerun does not re-send them.
+				if err := settle(it.marker, outcome); err != nil {
+					return rep, err
+				}
+			} else {
+				rep.Conflict++ // not settled: a conflict may be systematic, so a rerun retries it
+			}
+			logf("content re-upload: %s for session %s (status %d%s)", outcome, it.marker.NativeSessionID, res.StatusCode, codeSuffix(res))
+			if conflicts >= maxConflicts {
+				return rep, fmt.Errorf("content re-upload: %w (%d in a row)", ErrReuploadTooManyConflicts, conflicts)
+			}
 		case "failed":
 			rep.Failed++
 			fails++
 			if fails >= maxFails {
 				return rep, fmt.Errorf("content re-upload: %w (%d in a row)", ErrReuploadTooManyFailures, fails)
 			}
-			continue // not settled: a rerun retries it
+			// not settled: a rerun retries it
 		}
-		if err := settle(it.marker, outcome); err != nil {
-			return rep, err
-		}
-		if (i+1)%100 == 0 {
+		if rep.Sent%100 == 0 {
 			logf("content re-upload: %d/%d sent (%d accepted, %d duplicate, %d rejected, %d conflict, %d failed)", rep.Sent, len(items), rep.Accepted, rep.Duplicate, rep.Rejected, rep.Conflict, rep.Failed)
-		}
-		if i+1 < len(items) {
-			if err := sleep(ctx, interval); err != nil {
-				return rep, err
-			}
 		}
 	}
 	return rep, nil
+}
+
+// markerPrefixMatches reports whether content is the transcript m recorded: its first m.Size bytes
+// hash to m.ContentSHA256. A marker without a size cannot be checked and never matches.
+func markerPrefixMatches(m contentMarker, content []byte) bool {
+	if m.Size <= 0 || m.Size > int64(len(content)) || m.ContentSHA256 == "" {
+		return false
+	}
+	sum := sha256.Sum256(content[:m.Size])
+	return hex.EncodeToString(sum[:]) == m.ContentSHA256
+}
+
+// codeSuffix renders the collector's error code for a log line, or "".
+func codeSuffix(res *upload.ContentResult) string {
+	if res == nil || res.Code == "" {
+		return ""
+	}
+	return ", " + string(res.Code)
+}
+
+// lockReuploadJournal opens (creating) the progress journal for appending and takes an exclusive,
+// non-blocking lock on it for the life of the returned file.
+func lockReuploadJournal(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("content re-upload: open progress file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, fmt.Errorf("content re-upload: %w (%s)", ErrReuploadJournalLocked, path)
+		}
+		return nil, fmt.Errorf("content re-upload: lock progress file: %w", err)
+	}
+	return f, nil
+}
+
+// sweepReuploadTemps removes the tool's own marker temp files a killed run left behind. Only ones
+// older than reuploadTempSweepAge go, so a concurrent run over another journal keeps its own.
+func sweepReuploadTemps(dir string, now time.Time) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), reuploadMarkerTempPrefix) {
+			continue
+		}
+		if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > reuploadTempSweepAge {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 // postReupload POSTs one transcript, retrying transport errors, 5xx and 429 with a capped backoff
