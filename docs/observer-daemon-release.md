@@ -523,3 +523,72 @@ ledger on any build. Once the unit has drained (`ack` no longer advancing while 
 - **The metadata lane still drops the server's message.** `upload.OperatorError` carries the
   collector's `Message` but `Error()` renders only reason, status, and code. The content lane
   now includes it; the batch lane does not yet.
+
+## 9. Re-sending content: `content-reupload`
+
+The daemon uploads a transcript's content once and then trusts its marker
+(`content-marker-<dev>-<ino>.json` in `$CURSORS`). Content a marker records but the content store
+no longer serves — accepted by a destination before a cell cutover — is never sent again by the
+daemon. `gasworks-companion content-reupload` re-sends it, one-shot and paced:
+
+```sh
+# Counts only: nothing is read, sent or written.
+gasworks-companion content-reupload -dry-run -cursor-dir "$CURSORS" -approved-root <root>
+
+# Paced run (1/s by default), resumable from its progress journal.
+gasworks-companion content-reupload -cursor-dir "$CURSORS" -approved-root <root> \
+  -collector <url> -source-id <src> -token-file <file> \
+  -progress-file <journal> [-before 2026-08-02T00:00:00Z] [-ids-file ids.txt] \
+  [-provider codex|claude] [-interval 1s] [-limit N] \
+  [-max-consecutive-failures 10] [-max-consecutive-conflicts 10]
+```
+
+Under a live consent policy, pass `-root-policy-file <policy>` instead of `-approved-root`: the
+roots are the policy's active transcript roots, and the run refuses unless the policy grants
+content upload (`content_upload: true`, v3).
+
+**Selection.** Markers uploaded before `-before` (default: the 2026-08-02 cutover) and/or naming a
+native session id from `-ids-file` (alone, an id list turns the default cutoff off). Each marker's
+transcript is found under the roots by `(device, inode)`.
+
+**Identity.** Before a transcript is sent, the sha256 of its first `marker.size` bytes must equal
+the marker's `content_sha256`. Transcripts only grow, so this proves the file is the transcript the
+marker recorded. A reused inode, a rewritten file, or a marker whose id does not name the file fails
+the check, is counted as `IdentityMismatch`, and is never sent. `-dry-run` reads no content, so it
+cannot run this check; its `IdentityMismatch` counts only name/provider mismatches.
+
+**Answers.**
+- 2xx: accepted. 201 is a new snapshot, 200 a duplicate. Expect mostly 201s: the same bytes under
+  a new native id are a new observation in the content store. The marker advances exactly as the
+  daemon would, and the transcript is journaled.
+- 400/413/422: rejected for those bytes, journaled.
+- 409 (including a second `SOURCE_BINDING_CONFLICT` after the GC binding was dropped): a conflict.
+  The marker is untouched and nothing is journaled, so a rerun retries it.
+- `-max-consecutive-conflicts` answers of 409/400/413/422 in a row stop the run: a systematic
+  conflict needs a human. A refusal (401/403/404/501) or `-max-consecutive-failures` transport/5xx
+  failures in a row also stop it. Rerun the same command to resume.
+- 429 honours Retry-After, capped at 5 minutes.
+
+**Safety.** The run holds an exclusive lock on its progress journal, so two runs cannot share one.
+It writes markers through its own temp-file prefix, which a daemon restart's temp sweep does not
+remove; a marker write that fails anyway is counted (`MarkerWriteErrors`), and the transcript stays
+unjournaled, so a rerun re-sends it as a duplicate. The report on stdout is counts only.
+
+A transcript with no marker needs no tool. When nothing else names it, the daemon derives its
+native session id from its name: `<project>/<uuid>.jsonl` directly under a Claude root, or
+`rollout-<ts>-<uuid>.jsonl` at any depth under a Codex root. A Claude subagent transcript
+(`agent-<hex>.jsonl`) is never derived. So a transcript a previous run parsed to EOF without ever
+having its content accepted is uploaded after a restart.
+
+**The restart burst is unpaced by default.** One content tick sends every ready transcript back to
+back, smallest first, and backs off only on 429 or on 5xx/transport errors. A restart that finds
+thousands of such transcripts sends all of them at once. To pace it, start the daemon with
+`-content-upload-min-interval 1s` (the least time between two content POSTs; 0, the default, keeps
+the old behaviour).
+
+**Identity conflicts in the daemon.** When the collector answers `SOURCE_BINDING_CONFLICT` to an
+upload that carried no GC binding (including the re-send after a refused binding), the daemon logs
+`content upload: identity conflict (409 SOURCE_BINDING_CONFLICT without a gc binding) … (N this
+run)`. It does not write a marker, and it does not re-send those bytes until a restart. Before this
+change, that answer was logged as `409 content mismatch … advancing` and marked as uploaded. During
+a rollout, count both lines.

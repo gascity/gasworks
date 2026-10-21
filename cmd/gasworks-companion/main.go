@@ -61,6 +61,8 @@ func dispatch(args []string) int {
 		return runDeclareWork(args[1:])
 	case "hook":
 		return runHook(args[1:])
+	case "content-reupload":
+		return runContentReupload(args[1:], os.Stdout)
 	case "-h", "--help", "help":
 		usage()
 		return 0
@@ -79,6 +81,7 @@ Usage:
 	  gasworks-companion run      [flags] -- CMD [args...]  run a child as an observed run
 	  gasworks-companion declare-work [flags]  declare work on the current explicit run
 	  gasworks-companion hook codex [flags]    Codex SessionStart hook handler (reads stdin)
+	  gasworks-companion content-reupload [flags]  one-shot paced re-upload of content markers (-dry-run counts only)
 `)
 }
 

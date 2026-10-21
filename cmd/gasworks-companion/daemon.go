@@ -68,6 +68,7 @@ func runDaemon(args []string) int {
 	// tens of thousands of transcripts, the default 500ms cadence pins a core; this flag trades tail
 	// latency for CPU. 0 keeps the watcher default.
 	pollInterval := fs.Duration("poll-interval", 0, "transcript watcher poll cadence (e.g. 2s); 0 uses the watcher default")
+	contentMinInterval := fs.Duration("content-upload-min-interval", 0, "least time between two content uploads (e.g. 1s), pacing the backlog a restart finds ready at once; 0 sends a tick's ready transcripts back to back")
 
 	// -bead-prefix enables PASSIVE work-reference extraction: a session that runs bd/git/gh with a
 	// bead id carrying one of these prefixes links that run to the bead with no per-session action.
@@ -168,6 +169,13 @@ func runDaemon(args []string) int {
 	} else if *contentUpload && policySource == nil {
 		// Under the live policy the daemon itself reports a content grant it cannot act on.
 		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload requires -collector; running metadata-only")
+	}
+	if *contentMinInterval < 0 {
+		fmt.Fprintln(os.Stderr, "gasworks-companion daemon: -content-upload-min-interval must not be negative")
+		return 2
+	}
+	if cfg.ContentUpload != nil {
+		cfg.ContentUpload.MinGap = *contentMinInterval
 	}
 	// Build the extraction configuration once and hand the same value to whichever watcher config is
 	// selected. Empty prefixes yield a nil bead pattern downstream (extraction off); a non-empty set

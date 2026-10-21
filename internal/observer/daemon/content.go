@@ -130,6 +130,11 @@ type contentUploaderConfig struct {
 	tokenFile string
 	// interval is the content loop's cadence; 0 selects DefaultContentInterval.
 	interval time.Duration
+	// minGap, when > 0, is the least time between the starts of two content POSTs (the restart
+	// burst's rate limit). 0 sends a tick's ready transcripts back to back.
+	minGap time.Duration
+	// sleep is the pacing wait (a test seam); nil selects a context-aware timer.
+	sleep func(context.Context, time.Duration) error
 }
 
 // contentUploader ships whole-transcript snapshots to the collector's content endpoint as a side
@@ -180,6 +185,15 @@ type contentUploader struct {
 	// PEM sniff), keyed by reason, so a refused credential/config/key file is visible and testable —
 	// counted + logged, never silent. Guarded by u.mu.
 	guardRefusals map[contentguard.Reason]int
+	// minGap paces content POSTs (see contentUploaderConfig.minGap); sleep is its wait. lastPost is
+	// when the previous POST started; it is touched only on the content loop (under tickMu).
+	minGap   time.Duration
+	sleep    func(context.Context, time.Duration) error
+	lastPost time.Time
+	// identityConflicts counts the uploads the collector answered with SOURCE_BINDING_CONFLICT while
+	// no GC binding was offered: an identity divergence in the content store, never persisted as
+	// accepted. Guarded by u.mu.
+	identityConflicts int
 	// refusal is the back-off the collector armed by refusing content upload (401/403/404/501); nil
 	// while it accepts content upload. It never affects the metadata pipeline. Guarded by u.mu.
 	refusal *contentRefusal
@@ -303,6 +317,10 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 	if interval <= 0 {
 		interval = DefaultContentInterval
 	}
+	sleep := cfg.sleep
+	if sleep == nil {
+		sleep = sleepCtx
+	}
 	// Sweep any orphaned marker temp files left by a crash mid-persist, so they cannot accumulate
 	// across restarts. The state dir is shared with the watcher's cursor files; we only touch our
 	// own distinctly-prefixed temp files.
@@ -319,6 +337,8 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 		consent:   cfg.consent,
 		tokenFile: cfg.tokenFile,
 		interval:  interval,
+		minGap:    cfg.minGap,
+		sleep:     sleep,
 		files:     map[transcriptIdentity]*contentState{},
 
 		guardRefusals: map[contentguard.Reason]int{},
@@ -475,8 +495,10 @@ func (u *contentUploader) plan(now time.Time) ([]contentJob, []pendingSave) {
 		u.ensurePendingLoadedLocked(id, st)
 		// Resolve the native session id BEFORE any whole-file read/hash. Prefer the live sink; fall
 		// back to the pending record's or the marker's persisted id so a transcript queued or uploaded
-		// before a restart still keys after it. Unknown → skip cheaply (no read, no hash); a later tick
-		// retries once the session is threaded or the marker lands. This is the guard that stops an
+		// before a restart still keys after it, and last to the id the transcript's name carries, so
+		// one a previous run parsed to EOF without ever having it accepted still keys after a restart.
+		// Unknown → skip cheaply (no read, no hash); a later tick retries once the session is threaded
+		// or the marker lands. This is the guard that stops an
 		// unknown-session transcript from being fully re-read and re-hashed on every tick.
 		native, provider, ok := u.resolveSessionLocked(id, st)
 		if !ok {
@@ -609,7 +631,8 @@ func (u *contentUploader) dropAll() {
 
 // resolveSessionLocked resolves the native session id + provider for a transcript, preferring the
 // live sink threading and falling back to the identities persisted across a restart: the pending
-// record of content queued and not yet accepted, then the last-uploaded marker. Called under u.mu.
+// record of content queued and not yet accepted, then the last-uploaded marker, then the identity
+// derived from the transcript's name (deriveSessionFromName). Called under u.mu.
 func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *contentState) (native, provider string, ok bool) {
 	if n, p, ok := u.sessions.SessionFor(id.device, id.inode); ok {
 		return n, p, true
@@ -620,7 +643,9 @@ func (u *contentUploader) resolveSessionLocked(id transcriptIdentity, st *conten
 	if st.markerNative != "" {
 		return st.markerNative, st.markerProvider, true
 	}
-	return "", "", false
+	// Last: the identity the transcript's own name carries (content_derive.go). Without it a
+	// transcript a previous run parsed to EOF but never had accepted could never be keyed again.
+	return deriveSessionFromName(st.locator)
 }
 
 // processOne reads, hashes, and (if changed) uploads one transcript's whole content, then records
@@ -727,6 +752,19 @@ func (u *contentUploader) processOne(ctx context.Context, id transcriptIdentity,
 // keyed by; sendGC is what actually goes on the wire, which is "" once the collector has refused the
 // binding. Called with u.mu released.
 func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentity, origin consentOrigin, locator, path string, content []byte, hash string, rsize, rmod int64, native, provider, observedGC, sendGC string) {
+	// Pace the POSTs: a restart can find thousands of transcripts ready at once, and one tick sends
+	// every ready one back to back unless a minimum gap is configured. The wait comes before the
+	// consent check below, so a narrowing during it still stops the upload.
+	if u.minGap > 0 {
+		if !u.lastPost.IsZero() {
+			if wait := u.minGap - u.now().Sub(u.lastPost); wait > 0 {
+				if err := u.sleep(ctx, wait); err != nil {
+					return
+				}
+			}
+		}
+		u.lastPost = u.now()
+	}
 	// Consent is checked right before the request (the file read that precedes it can be long), and
 	// the upload is registered under the same lock a consent narrowing takes: either the narrowing
 	// is already visible here and nothing is sent, or it cancels this request.
@@ -811,6 +849,29 @@ func (u *contentUploader) postSnapshot(ctx context.Context, id transcriptIdentit
 			u.logf("content upload: collector refused the gc session binding for %s (session %s)%s; re-sending without it", locator, native, serverMessage(res))
 		}
 		u.postSnapshot(ctx, id, origin, locator, path, content, hash, rsize, rmod, native, provider, gcSessionID, "")
+	case res.StatusCode == 409 && res.Code == wire.ObserverErrorBodyCodeSOURCEBINDINGCONFLICT:
+		// An identity conflict with no GC binding offered (the re-send above that dropped a refused
+		// binding, or a transcript that never carried one): the collector maps every content-store
+		// identity divergence to SOURCE_BINDING_CONFLICT, so the store binds this source path, or this
+		// native id, to a DIFFERENT transcript. The bytes were NOT accepted, so this must never be
+		// persisted as an upload: a marker would hide the transcript from every later daemon and from
+		// a re-upload cutoff. Treat it like 400/422: in-memory dedup of these bytes only (a restart
+		// re-probes), no global hold, and a distinct, counted line an operator can stop on. The
+		// pending record stays: the content is still owed.
+		if st != nil {
+			st.markerHash = hash
+			st.uploaded = false // in-memory dedup only; a restart re-probes (do not persist)
+			st.markerNative, st.markerProvider, st.markerGCSessionID = native, provider, gcSessionID
+			st.markEvaluated(rsize, rmod, gcSessionID)
+		}
+		u.identityConflicts++
+		n := u.identityConflicts
+		resumed := u.acceptedLocked()
+		u.mu.Unlock()
+		if resumed {
+			u.logResumed(res.StatusCode)
+		}
+		u.logf("content upload: identity conflict (409 SOURCE_BINDING_CONFLICT without a gc binding) for %s (session %s)%s; not advancing (%d this run)", locator, native, serverMessage(res), n)
 	case res.StatusCode == 409:
 		// Idempotency content mismatch: the server already holds different bytes for this
 		// (session, hash) pair. Advance the marker to this hash so we do not hot-loop; log and move on.

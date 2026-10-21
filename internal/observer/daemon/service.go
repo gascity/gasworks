@@ -198,6 +198,9 @@ type ContentUploadLoopConfig struct {
 	Debounce time.Duration
 	// Interval is the content-loop ticker cadence; 0 selects DefaultContentInterval.
 	Interval time.Duration
+	// MinGap is the least time between the starts of two content POSTs; 0 sends a tick's ready
+	// transcripts back to back (the default). It paces the burst a restart finds ready at once.
+	MinGap time.Duration
 	// TokenFile is the rotating bearer token file Sender reads its credential from (the daemon's
 	// -token-file). While the collector refuses content upload, a change to it — a renewed or rotated
 	// credential — retries at once instead of waiting out the back-off. "" relies on the back-off.
@@ -537,6 +540,7 @@ func (s *Service) buildContentUploader(cfg ServiceConfig, sink *CandidateSinkAda
 		consent:   cfg.Consent,
 		tokenFile: cfg.ContentUpload.TokenFile,
 		interval:  durationOr(cfg.ContentUpload.Interval, DefaultContentInterval),
+		minGap:    cfg.ContentUpload.MinGap,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build content uploader: %w", err)
