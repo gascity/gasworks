@@ -12,6 +12,11 @@
 // A missing or corrupt-JSON file degrades to "logged out" (empty Data), never a crash. An
 // unreadable-but-present file (a transient IO/perms error) returns a real error instead, so
 // a read-modify-write aborts rather than overwriting good credentials with empty.
+//
+// The cli-edge device root of `gasworks login --edge-device` lives in a second document,
+// edge-session.json, beside this one and under the same lock (see edge.go): credentials.json
+// is shared with bd-enterprise, whose store rewrites it without preserving fields it does not
+// know.
 package store
 
 import (
@@ -230,16 +235,22 @@ func load() (*Data, error) {
 // over the target. NOTE: like the Python store, Save does NOT take the lock itself — the
 // lock is held by Update/Clear around the full read-modify-write.
 func Save(d *Data) error {
-	dir, err := ensureDir()
-	if err != nil {
-		return err
-	}
 	buf, err := json.MarshalIndent(d, "", "  ")
 	if err != nil {
 		return err
 	}
+	return writeOwnerOnly(CredsPath(), ".cred-*.tmp", buf)
+}
 
-	tmp, err := os.CreateTemp(dir, ".cred-*.tmp")
+// writeOwnerOnly atomically replaces path (inside the config dir) with buf: an owner-only
+// temp file in the same directory, then a rename over the target, then the Windows
+// user-only ACL. Every credential document this package writes goes through it.
+func writeOwnerOnly(path, tmpPattern string, buf []byte) error {
+	dir, err := ensureDir()
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		return err
 	}
@@ -263,7 +274,7 @@ func Save(d *Data) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	if err := os.Rename(tmpName, CredsPath()); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
 	}
@@ -271,7 +282,7 @@ func Save(d *Data) error {
 	// would inherit the parent dir's ACL — potentially readable by other users. Re-apply a
 	// user-only ACL like the Python store's icacls call. Best-effort: a failure is logged,
 	// not fatal (the credentials are already written; failing here would lose the login).
-	lockdown.Apply(CredsPath())
+	lockdown.Apply(path)
 	return nil
 }
 
@@ -295,7 +306,9 @@ func Update(mutate func(*Data) error) error {
 	return Save(d)
 }
 
-// Clear removes credentials.json under the lock. A missing file is not an error.
+// Clear removes credentials.json and edge-session.json under the lock. A missing file is not
+// an error. credentials.json goes first: once it is gone the credential generation is gone
+// with it, so an edge session that then failed to unlink is already fenced out.
 func Clear() error {
 	unlock, err := lock()
 	if err != nil {
@@ -304,6 +317,9 @@ func Clear() error {
 	defer unlock()
 
 	if err := os.Remove(CredsPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Remove(EdgeSessionPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil

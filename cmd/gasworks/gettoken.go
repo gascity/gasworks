@@ -95,6 +95,16 @@ func mintEIA(
 		}
 	}
 
+	// An edge-device login (`gasworks login --edge-device`) has no id_token to refresh and no
+	// /sts/v0/login session to establish: its root is the session.
+	edge, edgeActive, err := loadActiveEdgeSession()
+	if err != nil {
+		return mintResult{}, err
+	}
+	if edgeActive {
+		return mintEIAWithEdge(cfg, edge, product, audience, requestedOrg, scope, forceRefresh, requireAllowedScopes)
+	}
+
 	credential, err := ensureHumanCredential(cfg, nil)
 	if err != nil {
 		return mintResult{}, err
@@ -124,42 +134,9 @@ func mintEIA(
 		return mintResult{}, dieCredential(credentialErrorDenied, "you are not a member of org %s", org)
 	}
 
-	var prod sts.Product
-	var ok bool
-	if product == "" {
-		product, prod, ok = productByAudience(orgCtx.Products, audience)
-	} else {
-		prod, ok = orgCtx.Products[product]
-	}
-	if !ok || len(prod.Scopes) == 0 {
-		requestedProduct := product
-		if requestedProduct == "" {
-			requestedProduct = audience
-		}
-		return mintResult{}, dieCredential(credentialErrorDenied, "no mintable '%s' scope for org %s (entitled products: %s)",
-			requestedProduct, orgCtx.Slug, productNames(orgCtx.Products))
-	}
-	canonicalAudience := prod.Audience
-	if canonicalAudience == "" {
-		canonicalAudience = product
-	}
-	if audience != "" && canonicalAudience != audience {
-		return mintResult{}, dieCredential(credentialErrorDenied, "no mintable '%s' scope for org %s (entitled products: %s)",
-			audience, orgCtx.Slug, productNames(orgCtx.Products))
-	}
-
-	if scope == "" {
-		scope = strings.Join(prod.Scopes, " ")
-	}
-	requestedScopes := strings.Fields(scope)
-	if requireAllowedScopes {
-		sort.Strings(requestedScopes)
-	}
-	if hasDuplicateScopes(requestedScopes) {
-		return mintResult{}, dieCredential(credentialErrorInvalid, "requested scopes contain duplicates")
-	}
-	if requireAllowedScopes && !scopeSubset(requestedScopes, prod.Scopes) {
-		return mintResult{}, dieCredential(credentialErrorDenied, "requested scopes are not mintable for '%s' in org %s", canonicalAudience, orgCtx.Slug)
+	canonicalAudience, requestedScopes, err := resolveMintRequest(orgCtx, product, audience, scope, requireAllowedScopes)
+	if err != nil {
+		return mintResult{}, err
 	}
 
 	cacheOrigin := cfg.STSBase
@@ -213,6 +190,69 @@ func mintEIA(
 	if res.Origin != "" && res.Origin != cacheOrigin {
 		cacheKey = eiaCacheKey(res.Origin, org, canonicalAudience, generation, requestedScopes)
 	}
+	return cacheMintedEIA(res, exchangeStartedAt, requestedScopes, cacheKey, generation, canonicalAudience)
+}
+
+// resolveMintRequest settles what to mint in one org: the product (named, or found by its
+// audience for the credential-provider), its canonical audience, and the scope set — the
+// discovered scopes unless the caller named some, which must then be mintable.
+func resolveMintRequest(
+	orgCtx *sts.OrgContext,
+	product string,
+	audience string,
+	scope string,
+	requireAllowedScopes bool,
+) (string, []string, error) {
+	var prod sts.Product
+	var ok bool
+	if product == "" {
+		product, prod, ok = productByAudience(orgCtx.Products, audience)
+	} else {
+		prod, ok = orgCtx.Products[product]
+	}
+	if !ok || len(prod.Scopes) == 0 {
+		requestedProduct := product
+		if requestedProduct == "" {
+			requestedProduct = audience
+		}
+		return "", nil, dieCredential(credentialErrorDenied, "no mintable '%s' scope for org %s (entitled products: %s)",
+			requestedProduct, orgCtx.Slug, productNames(orgCtx.Products))
+	}
+	canonicalAudience := prod.Audience
+	if canonicalAudience == "" {
+		canonicalAudience = product
+	}
+	if audience != "" && canonicalAudience != audience {
+		return "", nil, dieCredential(credentialErrorDenied, "no mintable '%s' scope for org %s (entitled products: %s)",
+			audience, orgCtx.Slug, productNames(orgCtx.Products))
+	}
+
+	if scope == "" {
+		scope = strings.Join(prod.Scopes, " ")
+	}
+	requestedScopes := strings.Fields(scope)
+	if requireAllowedScopes {
+		sort.Strings(requestedScopes)
+	}
+	if hasDuplicateScopes(requestedScopes) {
+		return "", nil, dieCredential(credentialErrorInvalid, "requested scopes contain duplicates")
+	}
+	if requireAllowedScopes && !scopeSubset(requestedScopes, prod.Scopes) {
+		return "", nil, dieCredential(credentialErrorDenied, "requested scopes are not mintable for '%s' in org %s", canonicalAudience, orgCtx.Slug)
+	}
+	return canonicalAudience, requestedScopes, nil
+}
+
+// cacheMintedEIA checks an exchange's answer and caches it under cacheKey, fenced by the
+// credential generation it was minted under: a login or logout that landed meanwhile wins.
+func cacheMintedEIA(
+	res sts.EIA,
+	exchangeStartedAt int64,
+	requestedScopes []string,
+	cacheKey string,
+	generation string,
+	canonicalAudience string,
+) (mintResult, error) {
 	if !validOpaqueToken(res.AccessToken) {
 		return mintResult{}, die("getToken returned an invalid credential")
 	}
@@ -762,10 +802,17 @@ type eiaIdentity struct {
 }
 
 func eiaCacheKey(stsAuthority, org, audience, generation string, scopes []string) string {
+	return eiaCacheKeyFor(humanCredentialKind, stsAuthority, org, audience, generation, scopes)
+}
+
+// eiaCacheKeyFor is eiaCacheKey for a given credential kind: the Keycloak login's sessions
+// ("human") or an edge-device root ("edge-device"). The kind is part of the key so the two
+// can never serve each other's cached assertions.
+func eiaCacheKeyFor(kind, stsAuthority, org, audience, generation string, scopes []string) string {
 	canonicalScopes := append([]string(nil), scopes...)
 	sort.Strings(canonicalScopes)
 	payload, _ := json.Marshal(eiaIdentity{
-		CredentialKind: humanCredentialKind,
+		CredentialKind: kind,
 		Generation:     generation,
 		STSAuthority:   strings.TrimRight(stsAuthority, "/"),
 		Org:            org,

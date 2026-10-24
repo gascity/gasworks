@@ -142,6 +142,20 @@ func jti() (string, error) {
 // irrelevant on the wire — the server verifies over the received bytes and never re-derives
 // the jkt from the header (that uses canonicalJWK).
 func (k *Key) Proof(htm, htu, credential string) (string, error) {
+	return k.proof(htm, htu, &credential)
+}
+
+// ProofWithoutATH builds a fresh proof for a request that presents no access token, so there
+// is nothing for ath to hash (RFC 9449 §4.2 requires ath only when the proof accompanies one).
+// Its one caller is the cli-edge device-token poll: the client proves possession of the key it
+// wants the device root bound to, before any root exists. Every other request this SDK signs
+// presents a credential and must use Proof.
+func (k *Key) ProofWithoutATH(htm, htu string) (string, error) {
+	return k.proof(htm, htu, nil)
+}
+
+// proof builds one proof; a nil credential omits ath.
+func (k *Key) proof(htm, htu string, credential *string) (string, error) {
 	jwk := k.PublicJWK()
 
 	header := map[string]any{
@@ -159,8 +173,10 @@ func (k *Key) Proof(htm, htu, credential string) (string, error) {
 		"iat": time.Now().Unix(), // int64 -> JSON integer
 		"jti": id,
 	}
-	credentialHash := sha256.Sum256([]byte(credential))
-	payload["ath"] = b64url.EncodeToString(credentialHash[:])
+	if credential != nil {
+		credentialHash := sha256.Sum256([]byte(*credential))
+		payload["ath"] = b64url.EncodeToString(credentialHash[:])
+	}
 
 	hJSON, err := json.Marshal(header)
 	if err != nil {

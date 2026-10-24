@@ -273,3 +273,80 @@ func jwkEqual(a, b map[string]string) bool {
 	}
 	return true
 }
+
+// The cli-edge device-token poll presents no access token, so its proof carries no ath — and
+// is otherwise the same proof: typ/alg/jwk header, htm/htu/iat/jti claims, a raw 64-byte ES256
+// signature over the exact header.payload bytes, and a fresh jti every time.
+func TestProofWithoutATHOmitsOnlyATH(t *testing.T) {
+	k, err := NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const htu = "https://works.gascity.com/gc/v0/auth/device/token"
+	proof, err := k.ProofWithoutATH("post", htu)
+	if err != nil {
+		t.Fatalf("ProofWithoutATH: %v", err)
+	}
+	hdr, payload, sig := parts(t, proof)
+	if hdr["typ"] != "dpop+jwt" || hdr["alg"] != "ES256" {
+		t.Fatalf("header = %v", hdr)
+	}
+	jwk, ok := hdr["jwk"].(map[string]any)
+	if !ok || jwk["kty"] != "EC" || jwk["crv"] != "P-256" {
+		t.Fatalf("jwk = %v", hdr["jwk"])
+	}
+	if _, leaked := jwk["d"]; leaked {
+		t.Fatal("jwk leaked the private scalar d")
+	}
+	if _, present := payload["ath"]; present {
+		t.Fatalf("payload carries ath with no access token: %v", payload)
+	}
+	if _, present := payload["nonce"]; present {
+		t.Fatalf("payload carries a nonce: %v", payload)
+	}
+	if payload["htm"] != "POST" || payload["htu"] != htu {
+		t.Fatalf("htm/htu = %v/%v", payload["htm"], payload["htu"])
+	}
+	if jti, _ := payload["jti"].(string); jti == "" {
+		t.Fatal("jti is empty")
+	}
+	if iat, ok := payload["iat"].(float64); !ok || iat != float64(int64(iat)) || iat <= 0 {
+		t.Fatalf("iat = %v, want a positive JSON integer", payload["iat"])
+	}
+	if len(payload) != 4 {
+		t.Fatalf("payload = %v, want exactly htm, htu, iat, jti", payload)
+	}
+	if len(sig) != 64 {
+		t.Fatalf("signature is %d bytes, want 64", len(sig))
+	}
+	seg := strings.Split(proof, ".")
+	xb, _ := base64.RawURLEncoding.DecodeString(jwk["x"].(string))
+	yb, _ := base64.RawURLEncoding.DecodeString(jwk["y"].(string))
+	pub := &ecdsa.PublicKey{Curve: elliptic.P256(), X: new(big.Int).SetBytes(xb), Y: new(big.Int).SetBytes(yb)}
+	digest := sha256.Sum256([]byte(seg[0] + "." + seg[1]))
+	if !ecdsa.Verify(pub, digest[:], new(big.Int).SetBytes(sig[:32]), new(big.Int).SetBytes(sig[32:])) {
+		t.Fatal("proof signature does not verify against its own jwk")
+	}
+
+	again, err := k.ProofWithoutATH("POST", htu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, _ := parts(t, again)
+	if second["jti"] == payload["jti"] {
+		t.Fatalf("jti reused across proofs: %v", second["jti"])
+	}
+}
+
+// Proof with an empty credential still binds it: ath is present (the hash of ""), so a caller
+// that has a credential can never get an ath-less proof by passing an empty string.
+func TestProofAlwaysCarriesATH(t *testing.T) {
+	k, err := NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, payload, _ := parts(t, mustProof(t, k, "POST", "https://works.gascity.com/sts/v0/token", ""))
+	if _, present := payload["ath"]; !present {
+		t.Fatal("Proof omitted ath")
+	}
+}

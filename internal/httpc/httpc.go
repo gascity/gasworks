@@ -229,6 +229,12 @@ func PostForm(rawURL string, values url.Values, headers map[string]string) (int,
 	return do(http.MethodPost, rawURL, strings.NewReader(values.Encode()), h, defaultTimeout)
 }
 
+// DeleteWith issues a bodyless DELETE on a caller-supplied client and returns (status,
+// parsedBody). On a non-2xx it returns an *HTTPError carrying the parsed body.
+func DeleteWith(client *http.Client, rawURL string, headers map[string]string) (int, any, error) {
+	return doWith(client, http.MethodDelete, rawURL, nil, headers)
+}
+
 // PostJSON marshals body and issues a JSON POST, returning (status, parsedBody). On a
 // non-2xx it returns an *HTTPError whose Body is the parsed response, so a caller can read
 // the fields of an error the API expresses in JSON rather than in the status alone.

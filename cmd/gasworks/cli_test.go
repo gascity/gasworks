@@ -59,11 +59,24 @@ type stubServer struct {
 	// mintChallenge is the default leg A 201 body; mintCredential the default leg C one.
 	mintChallenge  map[string]any
 	mintCredential map[string]any
+
+	// edge is the cli-edge device plane, started on demand by startEdge (edge_login_test.go):
+	// its own https origin, like the mint plane, because its URL is signed into every poll's
+	// DPoP proof. edgeIssueHandler overrides the issue leg; edgePollAnswers answers the polls
+	// in order (a DPoP-bound root once they run out). edgeSleeps records the poll pacing.
+	edge             *httptest.Server
+	edgeIssueHandler func(w http.ResponseWriter, r *http.Request)
+	edgePollAnswers  []func(w http.ResponseWriter)
+	edgeSleeps       []time.Duration
+	// sessionContextHandler overrides /sts/v0/context for a DPoP-presented session (the
+	// edge-device root) when non-nil.
+	sessionContextHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 type recordedReq struct {
-	path string
-	form url.Values
+	method string
+	path   string
+	form   url.Values
 	// body is the raw request body — the mint legs post JSON, which does not survive form
 	// parsing. auth and dpop are the two headers the ceremony's invariants are about.
 	body string
@@ -80,11 +93,12 @@ func (s *stubServer) record(r *http.Request) url.Values {
 	}
 	s.mu.Lock()
 	s.requests = append(s.requests, recordedReq{
-		path: r.URL.RequestURI(),
-		form: form,
-		body: string(raw),
-		auth: r.Header.Get("Authorization"),
-		dpop: r.Header.Get("DPoP"),
+		method: r.Method,
+		path:   r.URL.RequestURI(),
+		form:   form,
+		body:   string(raw),
+		auth:   r.Header.Get("Authorization"),
+		dpop:   r.Header.Get("DPoP"),
 	})
 	s.mu.Unlock()
 	return form
@@ -171,6 +185,14 @@ func newStub(t *testing.T) *stubServer {
 			}
 			writeJSON(w, http.StatusOK, response)
 		case strings.HasSuffix(path, "/sts/v0/context"):
+			if strings.HasPrefix(r.Header.Get("Authorization"), "DPoP ") {
+				if s.sessionContextHandler != nil {
+					s.sessionContextHandler(w, r)
+					return
+				}
+				writeJSON(w, http.StatusOK, edgeSessionContext("org_a", "acme"))
+				return
+			}
 			if s.contextStatus != 0 {
 				body := s.contextErrorBody
 				if body == nil {
