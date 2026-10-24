@@ -88,7 +88,13 @@ func (s *stubServer) startEdge(t *testing.T) {
 		s.edgeSleeps = append(s.edgeSleeps, d)
 		s.mu.Unlock()
 	}}
-	t.Cleanup(func() { edgeClient = previous })
+	previousSleep := edgeRetrySleep
+	edgeRetrySleep = func(d time.Duration) {
+		s.mu.Lock()
+		s.edgeRetrySleeps = append(s.edgeRetrySleeps, d)
+		s.mu.Unlock()
+	}
+	t.Cleanup(func() { edgeClient = previous; edgeRetrySleep = previousSleep })
 }
 
 func edgePollError(code string, interval int) func(http.ResponseWriter) {
@@ -918,5 +924,262 @@ func TestEdgeDeviceLoginRetiresThePreviousRoot(t *testing.T) {
 	if len(revokes) != 1 || revokes[0].auth != "Bearer "+oldRoot ||
 		proofPayload(t, revokes[0].dpop)["ath"] != wantATH(oldRoot) || proofJWK(t, revokes[0].dpop) != jwkJSON(t, oldKey) {
 		t.Fatalf("revocations = %+v", revokes)
+	}
+}
+
+// --allow-file-keystore only means something to the edge-device login; without --edge-device it
+// is refused as a flag error (as it was before the flag existed), before any request.
+func TestAllowFileKeystoreRequiresEdgeDevice(t *testing.T) {
+	for _, args := range [][]string{
+		{"login", "--allow-file-keystore"},
+		{"login", "--device", "--allow-file-keystore"},
+		{"login", "--browser", "--allow-file-keystore=false"},
+	} {
+		srv := newStub(t)
+		seed(t, srv, map[string]any{"refresh_token": "RT-KEEP", "id_token": validIDToken()})
+		srv.startEdge(t)
+		_, errOut, code := capture(t, func() int { return run(args) })
+		if code == 0 || !strings.Contains(errOut, "--allow-file-keystore requires --edge-device") ||
+			!strings.Contains(errOut, config.AllowFileKeystoreEnv) {
+			t.Fatalf("%v = exit %d stderr %q", args, code, errOut)
+		}
+		srv.mu.Lock()
+		requests := len(srv.requests)
+		srv.mu.Unlock()
+		if requests != 0 {
+			t.Fatalf("%v made %d requests", args, requests)
+		}
+		assertPriorKeycloakLoginIntact(t, "RT-KEEP")
+	}
+
+	srv := newStub(t)
+	seed(t, srv, map[string]any{})
+	srv.startEdge(t)
+	if _, errOut, code := capture(t, func() int { return run([]string{"login", "--edge-device", "--allow-file-keystore"}) }); code != 0 {
+		t.Fatalf("login --edge-device --allow-file-keystore = exit %d stderr %q", code, errOut)
+	}
+}
+
+// The exchange's answer is cross-checked against the org discovery pinned the root to: an EIA
+// whose (unverified) org_id names another org is refused and not cached; a matching one is
+// handed out.
+func TestEdgeDeviceGetTokenRefusesAnEIAForAnotherOrg(t *testing.T) {
+	for _, tc := range []struct {
+		org  string
+		want bool
+	}{{"org_b", false}, {"org_a", true}} {
+		t.Run(tc.org, func(t *testing.T) {
+			srv := newStub(t)
+			eia := fakeJWT(map[string]any{"org_id": tc.org, "aud": "manifold", "exp": time.Now().Unix() + 90})
+			srv.eiaResponse = map[string]any{"access_token": eia, "token_type": "DPoP", "expires_in": 90,
+				"scope": "manifold:proxy manifold:pool:acme"}
+			seed(t, srv, map[string]any{"credential_generation": testCredentialGenerationA})
+			seedEdgeSession(t, srv, testCredentialGenerationA)
+
+			out, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+			if tc.want {
+				if code != 0 || strings.TrimSpace(out) != eia {
+					t.Fatalf("getToken = exit %d stdout %q stderr %q", code, out, errOut)
+				}
+				return
+			}
+			if code == 0 || strings.Contains(out, eia) || !strings.Contains(errOut, "minted a credential for a different org") {
+				t.Fatalf("getToken = exit %d stdout %q stderr %q", code, out, errOut)
+			}
+			if data := loadStore(t); len(data.EIACache) != 0 {
+				t.Fatalf("a refused EIA was cached: %+v", data.EIACache)
+			}
+			response, _, providerCode := runCredentialProvider(t, `{
+				"version":"gascity.dev/credential-provider/v1","audience":"manifold",
+				"required_scopes":["manifold:proxy"],"interactive":false}`)
+			if providerCode == 0 || response.Code != credentialErrorDenied || response.AccessToken != "" {
+				t.Fatalf("credential-provider = exit %d %+v", providerCode, response)
+			}
+		})
+	}
+}
+
+// A transient answer from the STS while confirming a just-approved root (5xx, 429) is retried
+// with a fresh proof, honouring a bounded Retry-After, before the root is given up.
+func TestEdgeDeviceLoginRetriesATransientSTSAnswer(t *testing.T) {
+	transient := func(status int, retryAfter string) func(http.ResponseWriter, *http.Request) {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			if retryAfter != "" {
+				w.Header().Set("Retry-After", retryAfter)
+			}
+			writeJSON(w, status, map[string]any{"error": "temporarily_unavailable"})
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		answers   []func(http.ResponseWriter, *http.Request)
+		wantOK    bool
+		wantSleep []time.Duration
+	}{
+		{name: "503 then success", answers: []func(http.ResponseWriter, *http.Request){transient(http.StatusServiceUnavailable, "2")},
+			wantOK: true, wantSleep: []time.Duration{2 * time.Second}},
+		{name: "429 with a long Retry-After, then 502, then success", answers: []func(http.ResponseWriter, *http.Request){
+			transient(http.StatusTooManyRequests, "600"), transient(http.StatusBadGateway, ""),
+		}, wantOK: true, wantSleep: []time.Duration{edgeConfirmMaxRetryWait, edgeConfirmRetryWait}},
+		{name: "still unavailable", answers: []func(http.ResponseWriter, *http.Request){
+			transient(http.StatusServiceUnavailable, ""), transient(http.StatusServiceUnavailable, ""), transient(http.StatusServiceUnavailable, ""),
+		}, wantSleep: []time.Duration{edgeConfirmRetryWait, edgeConfirmRetryWait}},
+		{name: "a 4xx is not retried", answers: []func(http.ResponseWriter, *http.Request){
+			func(w http.ResponseWriter, _ *http.Request) {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_request"})
+			},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newStub(t)
+			attempts := 0
+			srv.sessionContextHandler = func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if attempts <= len(tc.answers) {
+					tc.answers[attempts-1](w, r)
+					return
+				}
+				writeJSON(w, http.StatusOK, edgeSessionContext("org_a", "acme"))
+			}
+			seed(t, srv, map[string]any{"refresh_token": "RT-KEEP", "id_token": validIDToken()})
+			srv.startEdge(t)
+
+			_, errOut, code := capture(t, func() int { return run([]string{"login", "--edge-device"}) })
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("login = exit %d stderr %q", code, errOut)
+			}
+			discovery := srv.reqs("/sts/v0/context")
+			wantAttempts := min(len(tc.answers)+1, edgeConfirmAttempts)
+			if !tc.wantOK && len(tc.answers) == 1 {
+				wantAttempts = 1
+			}
+			if len(discovery) != wantAttempts {
+				t.Fatalf("discovery attempts = %d, want %d", len(discovery), wantAttempts)
+			}
+			jtis := map[string]bool{}
+			for _, d := range discovery {
+				jti, _ := proofPayload(t, d.dpop)["jti"].(string)
+				if jti == "" || jtis[jti] {
+					t.Fatalf("a retry reused a proof (jti %q)", jti)
+				}
+				jtis[jti] = true
+			}
+			if len(srv.edgeRetrySleeps) != len(tc.wantSleep) {
+				t.Fatalf("retry waits = %v, want %v", srv.edgeRetrySleeps, tc.wantSleep)
+			}
+			for i := range tc.wantSleep {
+				if srv.edgeRetrySleeps[i] != tc.wantSleep[i] {
+					t.Fatalf("retry waits = %v, want %v", srv.edgeRetrySleeps, tc.wantSleep)
+				}
+			}
+			revokes := srv.reqs("/gc/v0/session")
+			if tc.wantOK {
+				if len(revokes) != 0 || loadEdgeFile(t) == nil {
+					t.Fatalf("a recovered login revoked its root (%d) or did not save it", len(revokes))
+				}
+				return
+			}
+			if len(revokes) != 1 || !strings.Contains(errOut, "nothing was changed") {
+				t.Fatalf("revocations = %d, stderr %q", len(revokes), errOut)
+			}
+			assertPriorKeycloakLoginIntact(t, "RT-KEEP")
+		})
+	}
+}
+
+// When there is a Keycloak login to lose, the bd warning comes before the device code, so a bd
+// user can stop at no cost; with nothing to lose there is no warning at all.
+func TestEdgeDeviceLoginWarnsAboutBdBeforeTheCode(t *testing.T) {
+	srv := newStub(t)
+	seed(t, srv, map[string]any{"refresh_token": "RT-OLD", "id_token": validIDToken()})
+	srv.startEdge(t)
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--edge-device"}) })
+	if code != 0 {
+		t.Fatalf("login = exit %d stderr %q", code, errOut)
+	}
+	before, prompt := strings.Index(errOut, "signs bd (bd-enterprise) out"), strings.Index(errOut, "BDWK-JQPX")
+	if before < 0 || prompt < 0 || before > prompt || !strings.Contains(errOut, "this login signed bd out") {
+		t.Fatalf("stderr = %q", errOut)
+	}
+
+	srv = newStub(t)
+	seed(t, srv, map[string]any{})
+	srv.startEdge(t)
+	_, errOut, code = capture(t, func() int { return run([]string{"login", "--edge-device"}) })
+	if code != 0 || strings.Contains(errOut, "bd (bd-enterprise)") {
+		t.Fatalf("login without a Keycloak login = exit %d stderr %q", code, errOut)
+	}
+}
+
+// A 401 for the just-approved root says the session could not be resolved — not that the
+// server lacks the feature — and is not retried.
+func TestEdgeDeviceLoginExplainsAnUnresolvableRoot(t *testing.T) {
+	srv := newStub(t)
+	srv.sessionContextHandler = func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "invalid_token"})
+	}
+	seed(t, srv, map[string]any{"refresh_token": "RT-KEEP", "id_token": validIDToken()})
+	srv.startEdge(t)
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--edge-device"}) })
+	if code == 0 || !strings.Contains(errOut, "could not resolve the just-approved edge-device session (HTTP 401 invalid_token)") ||
+		!strings.Contains(errOut, "expired or been revoked") || strings.Contains(errOut, "not enabled") ||
+		!strings.Contains(errOut, "nothing was changed") {
+		t.Fatalf("login = exit %d stderr %q", code, errOut)
+	}
+	if got := len(srv.reqs("/sts/v0/context")); got != 1 {
+		t.Fatalf("a 401 was retried (%d attempts)", got)
+	}
+	if got := len(srv.reqs("/gc/v0/session")); got != 1 {
+		t.Fatalf("revocations = %d", got)
+	}
+	assertPriorKeycloakLoginIntact(t, "RT-KEEP")
+}
+
+// A discovery refusal the CLI does not classify is server-chosen text: it reaches the terminal
+// through the relay filter, so it cannot forge output.
+func TestEdgeDiscoveryFailureTextIsRelayFiltered(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusTeapot} {
+		srv := newStub(t)
+		srv.sessionContextHandler = func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, status, map[string]any{"error": "nope\r\x1b[2Kforged", "error_description": "x\x1b]0;t\x07"})
+		}
+		seed(t, srv, map[string]any{"credential_generation": testCredentialGenerationA})
+		seedEdgeSession(t, srv, testCredentialGenerationA)
+		_, errOut, code := capture(t, func() int { return run([]string{"getToken", "manifold"}) })
+		if code == 0 || !strings.Contains(errOut, "discovery") || strings.ContainsAny(errOut, "\r\x1b\x07") {
+			t.Fatalf("HTTP %d: getToken = exit %d stderr %q", status, code, errOut)
+		}
+	}
+}
+
+// An STS that reports no slug can only be matched by id, and the refusal says so.
+func TestEdgeOrgRefusalSuggestsTheIDWithoutASlug(t *testing.T) {
+	srv := newStub(t)
+	srv.sessionContextHandler = func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, edgeSessionContext("org_a", ""))
+	}
+	seed(t, srv, map[string]any{})
+	srv.startEdge(t)
+	_, errOut, code := capture(t, func() int { return run([]string{"login", "--edge-device", "--org", "acme"}) })
+	if code == 0 || !strings.Contains(errOut, "reported no slug for org org_a") || !strings.Contains(errOut, "use --org org_a") {
+		t.Fatalf("login = exit %d stderr %q", code, errOut)
+	}
+
+	srv = newStub(t)
+	srv.sessionContextHandler = func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, edgeSessionContext("org_a", ""))
+	}
+	seed(t, srv, map[string]any{"credential_generation": testCredentialGenerationA})
+	seedEdgeSession(t, srv, testCredentialGenerationA)
+	_, errOut, code = capture(t, func() int { return run([]string{"getToken", "manifold", "--org", "acme"}) })
+	if code == 0 || !strings.Contains(errOut, "use --org org_a") {
+		t.Fatalf("getToken = exit %d stderr %q", code, errOut)
+	}
+	// With a slug the label already names both, so there is no extra hint.
+	srv = newStub(t)
+	seed(t, srv, map[string]any{"credential_generation": testCredentialGenerationA})
+	seedEdgeSession(t, srv, testCredentialGenerationA)
+	if _, errOut, _ = capture(t, func() int { return run([]string{"getToken", "manifold", "--org", "other"}) }); strings.Contains(errOut, "reported no slug") {
+		t.Fatalf("stderr = %q", errOut)
 	}
 }

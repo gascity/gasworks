@@ -62,6 +62,10 @@ const (
 	maxRootLength            = 512
 	maxTokenTypeLength       = 32
 	maxLabelRunes            = 128
+
+	// maxRevocableLength bounds a root this client will still present to revoke after refusing
+	// it as unusable: an oversized but header-safe token is sent once, to be ended.
+	maxRevocableLength = 8192
 )
 
 // TokenTypeDPoP is the only token_type this client accepts from a redeem.
@@ -335,6 +339,17 @@ func (c *Client) Await(cfg config.Config, auth Authorization, key *dpop.Key) (Ro
 			// revoked here, before the error leaves this package; the token never does.
 			_ = c.Revoke(origin, result.root.Token, nil)
 			return Root{}, result.err
+		case pollUnusable:
+			// The server minted something this client will not keep (today: a token longer
+			// than any root). It may still be a live session, so it is revoked best-effort —
+			// with proof of possession when it claimed to be DPoP-bound — and, like an unbound
+			// root, never leaves this package.
+			var revokeKey *dpop.Key
+			if result.root.TokenType == TokenTypeDPoP {
+				revokeKey = key
+			}
+			_ = c.Revoke(origin, result.root.Token, revokeKey)
+			return Root{}, result.err
 		case pollPending:
 			failures = 0
 			interval = nextInterval(interval, result.interval, false)
@@ -358,6 +373,7 @@ const (
 	pollTerminal pollState = iota
 	pollRedeemed
 	pollNotKeyBound
+	pollUnusable
 	pollPending
 	pollSlowDown
 	pollTransient
@@ -419,11 +435,22 @@ func redeemed(body any) pollResult {
 			Err: errors.New("the token response is not a JSON object")}}
 	}
 	token := asString(m["access_token"])
-	if token == "" || len(token) > maxRootLength || !printable(token, false) {
-		return pollResult{state: pollTerminal, err: &Error{Kind: Protocol, Op: "poll", Status: http.StatusOK,
-			Err: errors.New("the token response has no usable access_token")}}
-	}
 	tokenType := asString(m["token_type"])
+	if token == "" || len(token) > maxRootLength || !printable(token, false) {
+		unusable := &Error{Kind: Protocol, Op: "poll", Status: http.StatusOK,
+			Err: errors.New("the token response has no usable access_token")}
+		// A token that could still travel in an Authorization header is revoked by the caller;
+		// one that could not (empty, control bytes, spaces, absurd length) is no session this
+		// client can name, so there is nothing to revoke. Either way the token is not in the error.
+		if token != "" && len(token) <= maxRevocableLength && printable(token, false) {
+			bound := ""
+			if strings.EqualFold(tokenType, TokenTypeDPoP) {
+				bound = TokenTypeDPoP
+			}
+			return pollResult{state: pollUnusable, root: Root{Token: token, TokenType: bound}, err: unusable}
+		}
+		return pollResult{state: pollTerminal, err: unusable}
+	}
 	if !strings.EqualFold(tokenType, TokenTypeDPoP) {
 		shown := tokenType
 		if len(shown) > maxTokenTypeLength || !printable(shown, false) {

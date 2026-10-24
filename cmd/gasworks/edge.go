@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -89,6 +90,12 @@ func cmdLoginEdgeDevice(cfg config.Config, requestedOrg string) error {
 	if err != nil {
 		return die("could not generate the device key: %s", err)
 	}
+	// Said before the code exists, so a bd user can stop here at no cost: the commit below
+	// clears the Keycloak tokens bd reads.
+	if prior, err := store.Load(); err == nil && hasKeycloakLogin(prior) {
+		eprintf("note: this login replaces your current `gasworks login`, which signs bd (bd-enterprise) out: bd " +
+			"does not read edge-device sessions yet. Press Ctrl-C now and keep using `gasworks login` if you use bd.")
+	}
 
 	authorization, err := edgeClient.Issue(cfg, edgeDeviceLabel())
 	if err != nil {
@@ -106,7 +113,7 @@ func cmdLoginEdgeDevice(cfg config.Config, requestedOrg string) error {
 		return cause
 	}
 
-	ctx, err := sts.SessionContext(cfg, root.Token, key)
+	ctx, err := confirmEdgeRoot(cfg, root.Token, key)
 	if err != nil {
 		return abandon(edgeLoginRefused(err))
 	}
@@ -116,8 +123,9 @@ func cmdLoginEdgeDevice(cfg config.Config, requestedOrg string) error {
 	}
 	if requestedOrg != "" && !orgNamed(org, requestedOrg) {
 		return abandon(dieRelayed("the browser approved this device in org %s, not %s: switch to %s in the "+
-			"browser, then run `gasworks login --edge-device --org %s` again. The device session was revoked "+
-			"and nothing was changed.", orgLabel(org), requestedOrg, requestedOrg, requestedOrg))
+			"browser, then run `gasworks login --edge-device --org %s` again.%s The device session was revoked "+
+			"and nothing was changed.", orgLabel(org), requestedOrg, requestedOrg, requestedOrg,
+			edgeOrgIDHint(org, requestedOrg)))
 	}
 
 	generation, err := newCredentialGeneration()
@@ -149,11 +157,13 @@ func cmdLoginEdgeDevice(cfg config.Config, requestedOrg string) error {
 	}
 
 	var replacedRefresh string
+	var signedBdOut bool
 	var replacedEdge *store.EdgeSession
 	var orphanedKeys []store.KeyRef
 	if err := store.Transact(func(tx *store.Tx) error {
 		d := tx.Data
 		replacedRefresh = d.RefreshToken
+		signedBdOut = hasKeycloakLogin(d)
 		if tx.Edge != nil {
 			previous := *tx.Edge
 			replacedEdge = &previous
@@ -184,9 +194,62 @@ func cmdLoginEdgeDevice(cfg config.Config, requestedOrg string) error {
 	}
 
 	stdoutRelayed("Logged in with an edge-device session for org %s.", orgLabel(org))
-	eprintf("note: bd (bd-enterprise) does not read edge-device sessions yet; this login signed bd out. " +
-		"Keep using `gasworks login` if you use bd.")
+	if signedBdOut {
+		eprintf("note: bd (bd-enterprise) does not read edge-device sessions yet; this login signed bd out. " +
+			"Keep using `gasworks login` if you use bd.")
+	}
 	return nil
+}
+
+// hasKeycloakLogin reports whether d carries the Keycloak tokens bd reads.
+func hasKeycloakLogin(d *store.Data) bool {
+	return d != nil && (d.RefreshToken != "" || d.IDToken != "")
+}
+
+const (
+	// edgeConfirmAttempts bounds how often login presents a just-approved root to the STS. A
+	// transient answer (5xx, 429, no answer at all) is retried before the root is given up:
+	// revoking costs the user a fresh browser approval. A definitive 4xx is never retried.
+	edgeConfirmAttempts = 3
+	// edgeConfirmRetryWait is the pause between attempts when the STS names none; a
+	// Retry-After it does name is honoured up to edgeConfirmMaxRetryWait.
+	edgeConfirmRetryWait    = 1 * time.Second
+	edgeConfirmMaxRetryWait = 5 * time.Second
+)
+
+// edgeRetrySleep paces confirmEdgeRoot's retries. A var so tests do not wait.
+var edgeRetrySleep = time.Sleep
+
+// confirmEdgeRoot is the login's /sts/v0/context for the new root, retried on a transient
+// failure. Every attempt is a fresh sts.SessionContext — fresh proofs, starting again at the
+// canonical STS origin — and discovery is a read, so a retry cannot change server state.
+func confirmEdgeRoot(cfg config.Config, root string, key *dpop.Key) (sts.ContextResolution, error) {
+	for attempt := 1; ; attempt++ {
+		ctx, err := sts.SessionContext(cfg, root, key)
+		if err == nil || attempt >= edgeConfirmAttempts || !transientSTSFailure(err) {
+			return ctx, err
+		}
+		edgeRetrySleep(edgeConfirmWait(err))
+	}
+}
+
+// transientSTSFailure is a failure that says nothing about the root: a 5xx, a 429, or a
+// request that got no HTTP answer.
+func transientSTSFailure(err error) bool {
+	var he *httpc.HTTPError
+	if errors.As(err, &he) {
+		return he.Status >= 500 || he.Status == http.StatusTooManyRequests
+	}
+	var ne net.Error
+	return errors.As(err, &ne)
+}
+
+func edgeConfirmWait(err error) time.Duration {
+	var he *httpc.HTTPError
+	if errors.As(err, &he) && he.RetryAfter > 0 {
+		return min(he.RetryAfter, edgeConfirmMaxRetryWait)
+	}
+	return edgeConfirmRetryWait
 }
 
 // printEdgeDevicePrompt is the device flow's human half, on stderr like the Keycloak device
@@ -266,8 +329,11 @@ func edgeLoginRefused(err error) error {
 	if errors.As(err, &he) {
 		code := he.OAuthError()
 		switch {
-		case he.Status == http.StatusUnauthorized,
-			he.Status == http.StatusBadRequest && (code == "invalid_request" || code == "invalid_grant"):
+		case he.Status == http.StatusUnauthorized:
+			return dieRelayed("the STS could not resolve the just-approved edge-device session (HTTP %d %s): it "+
+				"may have expired or been revoked before it was confirmed — run `gasworks login --edge-device` "+
+				"again; if this keeps happening, sign in with `gasworks login`."+unchanged, he.Status, code)
+		case he.Status == http.StatusBadRequest && (code == "invalid_request" || code == "invalid_grant"):
 			return dieRelayed("the STS does not accept edge-device sessions yet (HTTP %d %s): edge-device login "+
 				"is not enabled on this server — sign in with `gasworks login`."+unchanged, he.Status, code)
 		case he.Status == http.StatusBadRequest && code == "invalid_dpop_proof":
@@ -295,6 +361,17 @@ func edgeSessionOrg(ctx sts.ContextResolution) (sts.OrgContext, error) {
 	return org, nil
 }
 
+// edgeOrgIDHint is the extra line for an org refusal the STS could not have matched by slug:
+// it reported none, so a value that names the root's org by slug fails all the same. The id
+// is the one name that matches.
+func edgeOrgIDHint(org sts.OrgContext, value string) string {
+	if org.Slug != "" || value == org.OrgID {
+		return ""
+	}
+	return " The STS reported no slug for org " + org.OrgID + ", so only its id matches: if " + value +
+		" is that org, use --org " + org.OrgID + "."
+}
+
 // orgNamed reports whether value names org by id or slug, as --org does everywhere else.
 func orgNamed(org sts.OrgContext, value string) bool {
 	return value == org.OrgID || (org.Slug != "" && value == org.Slug)
@@ -311,7 +388,7 @@ func orgLabel(org sts.OrgContext) string {
 func edgeOrgMismatch(org sts.OrgContext, value, source string) *cmdError {
 	refusal := dieRelayed("this edge-device session is pinned to org %s — the org that was active in the "+
 		"browser that approved it — not %s (%s). Switch to %s in the browser, then run "+
-		"`gasworks login --edge-device` again", orgLabel(org), value, source, value)
+		"`gasworks login --edge-device` again.%s", orgLabel(org), value, source, value, edgeOrgIDHint(org, value))
 	refusal.credentialErrCode = credentialErrorInteraction
 	return refusal.withCredentialHint("This edge-device session is pinned to a different org. Switch org in the " +
 		"browser and run `gasworks login --edge-device` again.")
@@ -359,10 +436,10 @@ func classifyEdgeDiscoveryError(err error) *cmdError {
 		case he.Status == http.StatusBadRequest && code == "invalid_dpop_proof":
 			return edgeProofRejected()
 		case he.Status == http.StatusForbidden:
-			return dieCredential(credentialErrorDenied, "discovery denied: %s", code)
+			return dieCredentialRelayed(credentialErrorDenied, "discovery denied: %s", code)
 		}
 	}
-	return dieCredential(credentialErrorUnavailable, "discovery failed: %s", err)
+	return dieCredentialRelayed(credentialErrorUnavailable, "discovery failed: %s", err)
 }
 
 // classifyEdgeExchangeError maps a refused /sts/v0/token for the root. There is no session to

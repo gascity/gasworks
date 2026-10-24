@@ -518,3 +518,61 @@ func TestCleanLabel(t *testing.T) {
 		}
 	}
 }
+
+// A redeem whose access_token is unusable but could still be a live session (header-safe, just
+// longer than any root) is refused AND revoked — with proof of possession when it claimed to be
+// DPoP-bound. One that could not travel in a header is not presented anywhere. The token is
+// never in the error.
+func TestUnusableRootIsRevokedWhenItCanBe(t *testing.T) {
+	long := "gcs_cli_" + strings.Repeat("x", maxRootLength)
+	for _, tc := range []struct {
+		name      string
+		token     string
+		tokenType string
+		revoked   bool
+		withProof bool
+	}{
+		{"oversized DPoP", long, "DPoP", true, true},
+		{"oversized bearer", long, "bearer", true, false},
+		{"space", "has space", "DPoP", false, false},
+		{"control byte", "gcs_cli_\x1bx", "DPoP", false, false},
+		{"absurdly long", strings.Repeat("x", maxRevocableLength+1), "DPoP", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edge := newStubEdge(t)
+			edge.tokenAnswers = []func(http.ResponseWriter){func(w http.ResponseWriter) {
+				writeJSON(w, http.StatusOK, map[string]any{"access_token": tc.token, "token_type": tc.tokenType})
+			}}
+			client, _ := edge.client()
+			auth, err := client.Issue(edge.cfg(), "x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := newKey(t)
+			root, err := client.Await(edge.cfg(), auth, key)
+			if KindOf(err) != Protocol || root.Token != "" || strings.Contains(err.Error(), tc.token) {
+				t.Fatalf("Await = %+v, %v", root, err)
+			}
+			revokes := edge.reqs("/gc/v0/session")
+			if !tc.revoked {
+				if len(revokes) != 0 {
+					t.Fatalf("revocations = %+v", revokes)
+				}
+				return
+			}
+			if len(revokes) != 1 || revokes[0].method != http.MethodDelete || revokes[0].auth != "Bearer "+tc.token {
+				t.Fatalf("revocations = %+v", revokes)
+			}
+			if !tc.withProof {
+				if revokes[0].dpop != "" {
+					t.Fatal("an unbound token was revoked with a proof")
+				}
+				return
+			}
+			_, claims := proofParts(t, revokes[0].dpop)
+			if claims["htm"] != http.MethodDelete || claims["ath"] == nil {
+				t.Fatalf("revocation proof = %v", claims)
+			}
+		})
+	}
+}

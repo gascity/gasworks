@@ -379,3 +379,33 @@ func TestDeleteWithSendsHeadersAndSurfacesStatus(t *testing.T) {
 		t.Fatalf("DeleteWith on 401 = %d, %v", status, err)
 	}
 }
+
+func TestHTTPErrorCarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	_, _, err := GetJSON(srv.URL, nil)
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Status != http.StatusServiceUnavailable || he.RetryAfter != 7*time.Second {
+		t.Fatalf("err = %#v", err)
+	}
+
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	for value, want := range map[string]time.Duration{
+		"":                              0,
+		"0":                             0,
+		"-3":                            0,
+		"soon":                          0,
+		"120":                           2 * time.Minute,
+		" 5 ":                           5 * time.Second,
+		"99999999999999999999":          0,
+		"Sat, 24 Oct 2026 12:00:30 GMT": 30 * time.Second,
+		"Sat, 24 Oct 2026 11:59:00 GMT": 0,
+	} {
+		if got := parseRetryAfter(value, now); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", value, got, want)
+		}
+	}
+}

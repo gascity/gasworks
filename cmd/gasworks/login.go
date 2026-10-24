@@ -23,6 +23,12 @@ func cmdLogin(cfg config.Config, argv []string) error {
 		return die("%s", err)
 	}
 
+	if !*edgeDevice && flagSet(fs, "allow-file-keystore") {
+		// The Keycloak login stores no DPoP key, so the flag would be a silent no-op here. It
+		// was not a login flag before --edge-device existed; refuse it as the flag error it was.
+		return die("--allow-file-keystore requires --edge-device: a `gasworks login` without it stores no DPoP "+
+			"key; set %s=1 to permit a 0600 key file for the commands that do", config.AllowFileKeystoreEnv)
+	}
 	// --edge-device is opt-in and never chosen implicitly: without it the headless default is
 	// still the Keycloak device grant, and --device still means that grant.
 	if *edgeDevice {
@@ -142,4 +148,15 @@ func claimString(claims map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// flagSet reports whether name was given on the command line (even as =false).
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

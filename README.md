@@ -97,7 +97,8 @@ gasworks login --edge-device --org acme   # also check the approval was made in 
   Keycloak refresh token and drops every cached STS session and EIA. A later `gasworks login` (or
   `gasworks logout`) revokes the edge-device session at the cli-edge and removes it.
 - **bd does not read it yet.** `bd` (bd-enterprise) shares `credentials.json` but not the edge-device
-  session, so an edge-device login signs `bd` out. If you use `bd`, keep using `gasworks login`.
+  session, so an edge-device login signs `bd` out (it says so before printing the code, so you can
+  stop there). If you use `bd`, keep using `gasworks login`.
 - **What works with it:** `getToken`, `credential-provider`, `whoami` and `inspect` (which reports the
   session kind as `edge-device`). `rotate-key` (the key is bound to the session for its whole life —
   sign in again for a new one) and `sp mint-key` (the mint plane accepts only `gasworks login`
@@ -190,7 +191,7 @@ rather than a production counter. Events never include URLs, tokens, subjects, o
 
 ## Storage & security
 
-Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. An [edge-device login](#edge-device-login-opt-in) keeps its session in a second file, `edge-session.json`, under the same lock and fenced by the same login generation as `credentials.json` (a login or logout by this CLI or by `bd` that changes the generation retires it). It does **not** hold the DPoP private key of any session this CLI writes: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key of ours. (Entries written by another tool that shares the file are carried through as found — see the limitations below.) `logout` revokes the refresh token at the IdP (and an edge-device session at the cli-edge), purges every enrolled key, and then clears both files.
+Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. An [edge-device login](#edge-device-login-opt-in) keeps its session in a second file, `edge-session.json`, under the same lock and fenced by the same login generation as `credentials.json` (a login or logout by this CLI or by `bd` that changes the generation retires it). Neither file holds the DPoP private key of any session this CLI writes: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key of ours. (Entries written by another tool that shares the file are carried through as found — see the limitations below.) `logout` revokes the refresh token at the IdP (and an edge-device session at the cli-edge), purges every enrolled key, and then clears both files.
 
 ### Credential custody: where the DPoP key lives
 

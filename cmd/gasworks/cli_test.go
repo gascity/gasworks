@@ -68,6 +68,8 @@ type stubServer struct {
 	edgeIssueHandler func(w http.ResponseWriter, r *http.Request)
 	edgePollAnswers  []func(w http.ResponseWriter)
 	edgeSleeps       []time.Duration
+	// edgeRetrySleeps records the waits between the login's /sts/v0/context attempts.
+	edgeRetrySleeps []time.Duration
 	// sessionContextHandler overrides /sts/v0/context for a DPoP-presented session (the
 	// edge-device root) when non-nil.
 	sessionContextHandler func(w http.ResponseWriter, r *http.Request)
