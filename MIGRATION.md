@@ -18,6 +18,8 @@ brew install gascity/tap/gasworks
 
 `gascity/tap` is the [`gascity/homebrew-tap`](https://github.com/gascity/homebrew-tap) repo. Or download a signed binary directly from the [GitHub Releases](https://github.com/gascity/gasworks/releases).
 
+One login flag is new and **opt-in only**: `gasworks login --edge-device` signs in through the cli-edge device flow (staff-only while it soaks; see the README's *Edge-device login* section). Nothing changes unless you pass it — the headless default is still the Keycloak device grant and `--device` still means that grant. It is pinned to the org that was active in the browser that approved it (to switch org, switch in the browser and run it again), and `bd` (bd-enterprise) does not read it yet, so keep using `gasworks login` if you use `bd`.
+
 Your existing credentials carry over: the config dir is unchanged (`~/.config/gasworks`, `%APPDATA%\gasworks` on Windows, or `GASWORKS_CONFIG_DIR`), so a prior `gasworks login` session keeps working after the swap. The first mint adds a login-generation fence and discards only old cached STS sessions/EIAs; it preserves the durable refresh login. If anything looks off, just `gasworks login` again.
 
 ### Verify the signed binary

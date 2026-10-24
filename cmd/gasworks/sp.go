@@ -352,6 +352,16 @@ func reportUnrenderedMint(minted climint.Redemption, path string, problem error)
 // ceremony may run. The session and key it returns are the ones the whole ceremony runs on;
 // nothing after this point establishes another.
 func resolveMintIdentity(cfg config.Config, requestedOrg string) (string, establishedSession, error) {
+	// The mint legs accept only a /sts/v0/login user session; an edge-device root is a
+	// different session class, and presenting it would only spend a proof on a 401.
+	_, edgeActive, err := loadActiveEdgeSession()
+	if err != nil {
+		return "", establishedSession{}, err
+	}
+	if edgeActive {
+		return "", establishedSession{}, errEdgeSessionCommand("sp mint-key", "the mint plane accepts only "+
+			climint.UserSessionPrefix+"... user sessions. Sign in with `gasworks login` to mint a key")
+	}
 	credential, err := ensureHumanCredential(cfg, nil)
 	if err != nil {
 		return "", establishedSession{}, err

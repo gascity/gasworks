@@ -35,6 +35,7 @@ gasworks login                 # SSO sign-in (browser on a laptop, device-code w
 gasworks login --device        # force the device-code flow (SSH / sandboxes / CI)
 gasworks login --browser       # force the loopback browser flow
 gasworks login --org acme      # remember a default org for getToken
+gasworks login --edge-device   # OPT-IN, staff soak: the cli-edge device flow (see below)
 
 gasworks getToken manifold     # mint an EIA for manifold (raw token on stdout — pipeable)
 gasworks getToken crucible --org acme        # pick an org by slug or id
@@ -57,6 +58,7 @@ gasworks version               # print the build version
 | Command | Description |
 |---|---|
 | `gasworks login [--device\|--browser] [--org <id\|slug>]` | SSO sign-in (browser loopback on a laptop, device-code when headless); `--org` remembers a default org. |
+| `gasworks login --edge-device [--org <id\|slug>] [--allow-file-keystore]` | **Opt-in** (staff soak): sign in through the cli-edge device flow instead — see [Edge-device login](#edge-device-login-opt-in). Cannot be combined with `--device`, `--browser` or `--staff`. |
 | `gasworks getToken <product> [--org <id\|slug>] [--scope "<space-sep>"] [--json] [--refresh] [--allow-file-keystore]` | Mint a short-lived EIA for a product; `--json` emits an envelope, `--refresh` bypasses the cache. |
 | `gasworks credential-provider` | Read a v1 credential request from stdin and emit one typed JSON response for automation. |
 | `gasworks inspect [--json]` | Decode what is cached locally — login, sessions and where their DPoP keys live, and each cached EIA's Auth Access v1 claims (`authn_class`, `auth_time`, `acr`, `amr`, `session_id`, delegation). Offline; prints claims, never credentials. |
@@ -66,6 +68,47 @@ gasworks version               # print the build version
 | `gasworks version` | Print the build version (`--version` also works). |
 
 You don't pass scopes or an org id by hand: `getToken` **discovers** which orgs you belong to and the exact mintable scopes per product (including the org-derived `manifold:pool:<name>` you couldn't guess). Pass `--org` only if you belong to more than one. Override the discovered scopes with `--scope "<space separated>"` only if you really need to.
+
+### Edge-device login (opt-in)
+
+`gasworks login --edge-device` signs in through the **cli-edge device flow** instead of the Keycloak
+device grant. It is **opt-in and staff-only for the soak**: it is never chosen by default, the
+headless default is still the Keycloak device grant, and `--device` still means that grant.
+
+```sh
+gasworks login --edge-device              # prints a link and a code; approve in a browser
+gasworks login --edge-device --org acme   # also check the approval was made in org acme
+```
+
+- **Approving asks you to sign in again.** Open the printed link on any device, check that the page
+  shows the code the terminal printed, sign in again when asked, and approve. Approve only a login
+  you started yourself.
+- **The session is bound to this device's key.** The CLI generates a DPoP key for the flow and
+  proves possession of it on every poll; the cli-edge binds the session it issues to that key, so
+  the session is useless without it. The CLI refuses — and revokes — a session the server issued
+  unbound. The key goes into the same credential store as the STS session keys
+  ([below](#credential-custody-where-the-dpop-key-lives)); the session itself is kept in
+  `edge-session.json` beside `credentials.json`, never inside it.
+- **It is pinned to one org**: the org that was active in the browser that approved it. `getToken`
+  and the credential provider mint for that org only; an `--org` (or stored default org) naming
+  another org is refused. To use another org, switch to it in the browser, then run
+  `gasworks login --edge-device` again.
+- **It replaces your `gasworks login`.** A successful edge-device login revokes and clears the
+  Keycloak refresh token and drops every cached STS session and EIA. A later `gasworks login` (or
+  `gasworks logout`) revokes the edge-device session at the cli-edge and removes it.
+- **bd does not read it yet.** `bd` (bd-enterprise) shares `credentials.json` but not the edge-device
+  session, so an edge-device login signs `bd` out (it says so before printing the code, so you can
+  stop there). If you use `bd`, keep using `gasworks login`.
+- **What works with it:** `getToken`, `credential-provider`, `whoami` and `inspect` (which reports the
+  session kind as `edge-device`). `rotate-key` (the key is bound to the session for its whole life —
+  sign in again for a new one) and `sp mint-key` (the mint plane accepts only `gasworks login`
+  sessions) refuse it with a message saying so. Nothing refreshes the session: when it expires or is
+  revoked, `getToken` says so and you sign in again.
+- **It needs the server side.** Until the server has enabled the cli-edge device plane and the STS
+  accepts these sessions, the command fails with "not enabled on this server yet" and changes nothing
+  — your existing login stays as it was.
+- The cli-edge origin is `GASWORKS_CLI_EDGE_URL` (a canonical `https://` origin; it is signed into
+  every poll's proof), defaulting to the configured STS base — `https://works.gascity.com`.
 
 ### Credential-provider protocol
 
@@ -148,7 +191,7 @@ rather than a production counter. Events never include URLs, tokens, subjects, o
 
 ## Storage & security
 
-Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. It does **not** hold the DPoP private key of any session this CLI writes: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key of ours. (Entries written by another tool that shares the file are carried through as found — see the limitations below.) `logout` revokes the refresh token at the IdP, purges every enrolled key, and then clears the file.
+Credentials live under the platform config dir (`~/.config/gasworks` on Linux, `%APPDATA%\gasworks` on Windows; override with `GASWORKS_CONFIG_DIR`), written mode `0600` (POSIX) / a user-only ACL (Windows, via `icacls`), atomic + lock-guarded. `credentials.json` holds the refresh token, the per-org sessions, and the EIA cache. An [edge-device login](#edge-device-login-opt-in) keeps its session in a second file, `edge-session.json`, under the same lock and fenced by the same login generation as `credentials.json` (a login or logout by this CLI or by `bd` that changes the generation retires it). Neither file holds the DPoP private key of any session this CLI writes: those live in a separate credential store and the session keeps only a reference to one, so a stolen credentials file carries no signing key of ours. (Entries written by another tool that shares the file are carried through as found — see the limitations below.) `logout` revokes the refresh token at the IdP (and an edge-device session at the cli-edge), purges every enrolled key, and then clears both files.
 
 ### Credential custody: where the DPoP key lives
 
@@ -172,7 +215,7 @@ gasworks: keystore: no approved credential store is available (registry gasworks
 The DPoP private key is never written to a plain file unless you ask for it: re-run with --allow-file-keystore, or set GASWORKS_ALLOW_FILE_KEYSTORE=1, to keep it in a 0600 file under /Users/you/.local/state/gasworks/dpop-keys.
 ```
 
-Opt in with `--allow-file-keystore` on `getToken` / `rotate-key`, or `GASWORKS_ALLOW_FILE_KEYSTORE=1` for every command (including `credential-provider`, which takes no such flag; its error names the variable). Reading back a key you already enrolled never needs the opt-in — the gate is on choosing where a *new* key goes.
+Opt in with `--allow-file-keystore` on `getToken` / `rotate-key` / `login --edge-device`, or `GASWORKS_ALLOW_FILE_KEYSTORE=1` for every command (including `credential-provider`, which takes no such flag; its error names the variable). Reading back a key you already enrolled never needs the opt-in — the gate is on choosing where a *new* key goes.
 
 The key dir is deliberately not the config dir, so a "back up my dotfiles" job does not carry both halves: `$GASWORKS_KEY_DIR` if set, else `~/.local/state/gasworks/dpop-keys` (`%LOCALAPPDATA%\gasworks\dpop-keys` on Windows). A profile pinned with `GASWORKS_CONFIG_DIR` is self-contained — its keys stay inside it, and `logout` in that profile purges only that profile's keys.
 
@@ -192,7 +235,7 @@ These are acknowledged, documented limitations of the current design — not bug
 - **No store registered today is non-exportable.** The macOS keychain releases the key to this process once unlocked, and the `file` store is a plain PEM. Hardware-held keys that sign in-place (Secure Enclave, TPM) are a registry slot, not a shipped backend.
 - **Linux and Windows have no platform keystore in this build.** The key is a plain file there. That is a smaller change than it sounds — it is where the key already was, minus co-location with the session — but it is not the custody the design asks for, and it is why the fail-closed default is not on for those platforms yet.
 - **Rotation does not revoke the old session.** `rotate-key` establishes a new session with a new key, but the superseded session remains usable at the STS until its own expiry (≤8h); there is no re-enrollment route that revokes the old session family yet. Treat `rotate-key` as scheduled hygiene, not incident response.
-- **`credentials.json` is a shared document.** `bd` (bd-enterprise) vendors this store and writes its own sessions — with its key inline — into the same file. The CLI replaces only the entry it is writing and carries every other entry through untouched, so the two binaries do not sign each other out; the reverse is not true until bd adopts split storage, and a `bd` write drops the `key` reference from a gasworks session (which then re-establishes itself).
+- **`credentials.json` is a shared document.** `bd` (bd-enterprise) vendors this store and writes its own sessions — with its key inline — into the same file. The CLI replaces only the entry it is writing and carries every other entry through untouched, so the two binaries do not sign each other out; the reverse is not true until bd adopts split storage, and a `bd` write drops the `key` reference from a gasworks session (which then re-establishes itself). That is why an edge-device session lives in its own `edge-session.json`: bd rewrites `credentials.json` without fields it does not know. `bd` does not read the edge-device session, and a `bd login`/`bd logout` fences it out without revoking it (a later `gasworks login` or `gasworks logout` revokes and removes it).
 - **Recall forwarder default filter is a blocklist (not an allowlist).** See the forwarder section above: secret-bearing JSON under a provider root with an unanticipated name is forwarded unless `RECALL_FORWARDER_STRICT_ALLOWLIST=1` is set.
 - **Hardlinks inside a transcript dir.** A hardlink in a scanned directory pointing at a sensitive inode is read and forwarded if its content isn't PEM-shaped (the PEM sniff still catches key files). Exploiting this requires a same-uid local writer who can already read the target. A possible future guard is to drop in-scope files with `st_nlink > 1`; it is not implemented today.
 - **Env-token `/proc` exposure.** `RECALL_FORWARDER_TOKEN` (the dev-only env path) is visible in `/proc/<pid>/environ` to the same user. It is popped from the environment at start and flagged with a warning; the production path (`RECALL_FORWARDER_TOKEN_FILE`, mode `0600`, re-read each cycle) avoids this.

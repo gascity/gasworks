@@ -251,3 +251,68 @@ func TestMintURLAccessors(t *testing.T) {
 		}
 	}
 }
+
+// The cli-edge device plane rides the STS's public host: with no override the edge origin is
+// the configured STS base (works.gascity.com), never the canonical api host or a guess.
+func TestCLIEdgeBaseDefaultsToTheSTSBase(t *testing.T) {
+	t.Setenv(CLIEdgeBaseEnv, "")
+	t.Setenv("GASWORKS_STS_URL", "")
+	t.Setenv("GASWORKS_STS_CANONICAL_URL", "")
+	cfg := FromEnv()
+	if got, want := cfg.CLIEdgeBase, "https://works.gascity.com"; got != want {
+		t.Fatalf("CLIEdgeBase = %q, want the STS base %q", got, want)
+	}
+	if got, err := cfg.CLIDeviceTokenURL(); err != nil || got != "https://works.gascity.com/gc/v0/auth/device/token" {
+		t.Fatalf("CLIDeviceTokenURL = %q, %v", got, err)
+	}
+
+	t.Setenv("GASWORKS_STS_URL", "https://works.staging.example/")
+	if got, want := FromEnv().CLIEdgeBase, "https://works.staging.example"; got != want {
+		t.Fatalf("CLIEdgeBase = %q, want the overridden STS base %q", got, want)
+	}
+}
+
+func TestCLIEdgeBaseEnvOverride(t *testing.T) {
+	t.Setenv("GASWORKS_STS_URL", "https://works.gascity.com")
+	t.Setenv(CLIEdgeBaseEnv, "https://edge.example:8443/")
+	cfg := FromEnv()
+	if got, want := cfg.CLIEdgeBase, "https://edge.example:8443"; got != want {
+		t.Fatalf("CLIEdgeBase = %q, want %q with the trailing slash trimmed", got, want)
+	}
+	code, err := cfg.CLIDeviceCodeURL()
+	if err != nil || code != "https://edge.example:8443/gc/v0/auth/device/code" {
+		t.Fatalf("CLIDeviceCodeURL = %q, %v", code, err)
+	}
+	poll, err := cfg.CLIDeviceTokenURL()
+	if err != nil || poll != "https://edge.example:8443/gc/v0/auth/device/token" {
+		t.Fatalf("CLIDeviceTokenURL = %q, %v", poll, err)
+	}
+	revoke, err := CLISessionURL("https://edge.example:8443")
+	if err != nil || revoke != "https://edge.example:8443/gc/v0/session" {
+		t.Fatalf("CLISessionURL = %q, %v", revoke, err)
+	}
+}
+
+// A plain-http STS override (a local dev STS) must not become a plain-http htu: the edge
+// accessors fail closed and name the override that fixes it, as the climint ones do.
+func TestCLIEdgeBaseFromNonHTTPSSTSFailsClosed(t *testing.T) {
+	t.Setenv(CLIEdgeBaseEnv, "")
+	t.Setenv("GASWORKS_STS_URL", "http://localhost:8080")
+	cfg := FromEnv()
+	for name, accessor := range map[string]func() (string, error){
+		"origin": cfg.CLIEdgeOrigin, "code": cfg.CLIDeviceCodeURL, "token": cfg.CLIDeviceTokenURL,
+	} {
+		got, err := accessor()
+		if err == nil {
+			t.Fatalf("%s accessor accepted a plain-http edge origin: %q", name, got)
+		}
+		if !strings.Contains(err.Error(), CLIEdgeBaseEnv) {
+			t.Errorf("%s error %q does not name %s", name, err, CLIEdgeBaseEnv)
+		}
+	}
+	for _, bad := range []string{"", "http://works.gascity.com", "https://works.gascity.com/gc", "https://Works.gascity.com"} {
+		if got, err := CLISessionURL(bad); err == nil {
+			t.Errorf("CLISessionURL(%q) = %q, want an error", bad, got)
+		}
+	}
+}

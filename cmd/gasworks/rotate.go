@@ -33,6 +33,16 @@ func cmdRotateKey(cfg config.Config, argv []string) error {
 	}
 	cfg.AllowFileKeystore = cfg.AllowFileKeystore || *allowFileKeystore
 
+	_, edgeActive, err := loadActiveEdgeSession()
+	if err != nil {
+		return err
+	}
+	if edgeActive {
+		return errEdgeSessionCommand("rotate-key", "an edge-device session's DPoP key was bound to it when "+
+			"the browser approved this device, and no route re-binds it. For a fresh key, run "+
+			"`gasworks login --edge-device` again")
+	}
+
 	credential, err := ensureHumanCredential(cfg, nil)
 	if err != nil {
 		return err

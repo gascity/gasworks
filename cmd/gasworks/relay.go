@@ -53,3 +53,8 @@ func stdoutRelayed(format string, a ...any) { stdoutf(format, relayed(a)...) }
 // dieRelayed is die for one. The message it builds is printed by main's own handler, which does
 // no filtering of its own — every die in the mint path that names a server value uses this.
 func dieRelayed(format string, a ...any) *cmdError { return die(format, relayed(a)...) }
+
+// dieCredentialRelayed is dieCredential for one.
+func dieCredentialRelayed(code, format string, a ...any) *cmdError {
+	return dieCredential(code, format, relayed(a)...)
+}

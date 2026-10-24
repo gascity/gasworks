@@ -18,10 +18,14 @@ func cmdWhoami(cfg config.Config, argv []string) error {
 		return die("%s", err)
 	}
 
-	data, err := store.Load()
+	snapshot, err := store.LoadSnapshot()
 	if err != nil {
 		return die("could not read credentials: %s", err)
 	}
+	if edge, ok := activeEdgeSession(snapshot); ok {
+		return whoamiEdge(cfg, edge)
+	}
+	data := snapshot.Data
 	if data.IDToken == "" {
 		return die("not logged in — run `gasworks login`")
 	}

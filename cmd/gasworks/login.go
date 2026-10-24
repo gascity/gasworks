@@ -16,9 +16,27 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	device := fs.Bool("device", false, "force the device-code flow (headless)")
 	browser := fs.Bool("browser", false, "force the browser loopback flow")
 	staff := fs.Bool("staff", false, "use the approved staff SSO route (browser only)")
-	org := fs.String("org", "", "remember a default org for getToken")
+	edgeDevice := fs.Bool("edge-device", false, "opt in to the cli-edge device flow (a DPoP-bound session pinned to the org active in the approving browser)")
+	org := fs.String("org", "", "remember a default org for getToken (with --edge-device: the org the approval must be in)")
+	allowFileKeystore := fs.Bool("allow-file-keystore", false, "with --edge-device: permit storing the DPoP key in a 0600 file when no platform keystore is available")
 	if err := fs.Parse(argv); err != nil {
 		return die("%s", err)
+	}
+
+	if !*edgeDevice && flagSet(fs, "allow-file-keystore") {
+		// The Keycloak login stores no DPoP key, so the flag would be a silent no-op here. It
+		// was not a login flag before --edge-device existed; refuse it as the flag error it was.
+		return die("--allow-file-keystore requires --edge-device: a `gasworks login` without it stores no DPoP "+
+			"key; set %s=1 to permit a 0600 key file for the commands that do", config.AllowFileKeystoreEnv)
+	}
+	// --edge-device is opt-in and never chosen implicitly: without it the headless default is
+	// still the Keycloak device grant, and --device still means that grant.
+	if *edgeDevice {
+		if *device || *browser || *staff {
+			return die("--edge-device cannot be combined with --device, --browser or --staff")
+		}
+		cfg.AllowFileKeystore = cfg.AllowFileKeystore || *allowFileKeystore
+		return cmdLoginEdgeDevice(cfg, *org)
 	}
 
 	// Default to device-code unless a display is present; --device/--browser force it.
@@ -77,13 +95,22 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	}
 
 	var orphanedKeys []store.KeyRef
-	if err := store.Update(func(d *store.Data) error {
+	var replacedEdge *store.EdgeSession
+	if err := store.Transact(func(tx *store.Tx) error {
+		d := tx.Data
 		d.IDToken = idt
 		d.CredentialGeneration = generation
 		d.RefreshToken = tok.RefreshToken
 		d.DefaultOrg = *org
 		// A fresh login invalidates any prior STS sessions / cached EIAs.
 		orphanedKeys = dropSessions(d)
+		// ...and any edge-device root: the new generation already fences it out, and the
+		// file goes with it.
+		if tx.Edge != nil {
+			previous := *tx.Edge
+			replacedEdge = &previous
+		}
+		tx.RemoveEdge()
 		return nil
 	}); err != nil {
 		return die("could not save credentials: %s", err)
@@ -91,6 +118,10 @@ func cmdLogin(cfg config.Config, argv []string) error {
 	// Those sessions are off disk now, so nothing can reach their keys: delete them instead
 	// of accumulating one orphaned private key per login.
 	forgetSessionKeys(orphanedKeys)
+	if replacedEdge != nil {
+		// Best-effort: revoke the superseded root at the cli-edge, then delete its key.
+		retireEdgeSession(*replacedEdge)
+	}
 
 	who := claimString(claims, "email")
 	if who == "" {
@@ -117,4 +148,15 @@ func claimString(claims map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// flagSet reports whether name was given on the command line (even as =false).
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

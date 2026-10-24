@@ -14,8 +14,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +37,9 @@ type HTTPError struct {
 	Status int
 	Body   any
 	URL    string
+	// RetryAfter is the response's Retry-After, when it named a positive wait (delta-seconds or
+	// an HTTP-date); 0 otherwise. Unbounded: a caller that honours it applies its own cap.
+	RetryAfter time.Duration
 }
 
 func (e *HTTPError) Error() string {
@@ -208,9 +213,29 @@ func doWith(client *http.Client, method, rawURL string, body io.Reader, headers 
 	parsed := Parse(resp.Payload())
 
 	if resp.Status < 200 || resp.Status >= 300 {
-		return resp.Status, parsed, &HTTPError{Status: resp.Status, Body: parsed, URL: rawURL}
+		return resp.Status, parsed, &HTTPError{Status: resp.Status, Body: parsed, URL: rawURL,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())}
 	}
 	return resp.Status, parsed, nil
+}
+
+// parseRetryAfter reads a Retry-After value (RFC 9110 10.2.3) as a wait from now, or 0 when it
+// is absent, malformed, or not in the future.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if secs <= 0 || secs > int64(math.MaxInt64/int64(time.Second)) {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }
 
 // GetJSON issues a GET and returns (status, parsedBody). On a non-2xx it returns an
@@ -227,6 +252,12 @@ func PostForm(rawURL string, values url.Values, headers map[string]string) (int,
 		h[k] = v
 	}
 	return do(http.MethodPost, rawURL, strings.NewReader(values.Encode()), h, defaultTimeout)
+}
+
+// DeleteWith issues a bodyless DELETE on a caller-supplied client and returns (status,
+// parsedBody). On a non-2xx it returns an *HTTPError carrying the parsed body.
+func DeleteWith(client *http.Client, rawURL string, headers map[string]string) (int, any, error) {
+	return doWith(client, http.MethodDelete, rawURL, nil, headers)
 }
 
 // PostJSON marshals body and issues a JSON POST, returning (status, parsedBody). On a

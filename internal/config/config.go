@@ -20,6 +20,11 @@ const AllowFileKeystoreEnv = "GASWORKS_ALLOW_FILE_KEYSTORE"
 // has to set this explicitly rather than have the CLI guess an origin.
 const ClimintBaseEnv = "GASWORKS_CLIMINT_URL"
 
+// CLIEdgeBaseEnv overrides the cli-edge origin that `gasworks login --edge-device` runs the
+// device flow against. Named here for the same reason as ClimintBaseEnv: the origin is signed
+// into the poll's DPoP proof as htu, so a bad one fails closed with an error that quotes it.
+const CLIEdgeBaseEnv = "GASWORKS_CLI_EDGE_URL"
+
 const (
 	defaultSTSBase      = "https://works.gascity.com"
 	defaultCanonicalSTS = "https://api.gascity.com"
@@ -56,7 +61,14 @@ type Config struct {
 	// never be routed through the STS client: the mint legs are signed with single-use DPoP
 	// proofs, and the STS client's cross-origin retry would burn one. It defaults to the
 	// origin of OIDCIssuer; the URL accessors validate it before it can be signed as an htu.
-	ClimintBase  string
+	ClimintBase string
+	// CLIEdgeBase is the origin of the cli-edge device plane (POST /gc/v0/auth/device/code,
+	// POST /gc/v0/auth/device/token, DELETE /gc/v0/session) used by the opt-in
+	// `gasworks login --edge-device`. It defaults to STSBase — works.gascity.com hosted, where
+	// the public route sends /gc/v0/* to cli-edge — and, like ClimintBase, is validated before
+	// it can be signed into a DPoP proof as htu: it must equal the cli-edge's own service
+	// origin byte for byte, or every poll proof is rejected.
+	CLIEdgeBase  string
 	ClientID     string
 	LoopbackPort int
 	// AllowFileKeystore opts the DPoP private key into the plaintext-file credential
@@ -92,11 +104,20 @@ func FromEnv() Config {
 	if climint == "" {
 		climint = originOf(issuer)
 	}
+	// The cli-edge device plane is served on the STS's public host, not its own: default to
+	// the configured STS base rather than guessing a second origin. A non-https STS override
+	// (a local dev STS) therefore needs GASWORKS_CLI_EDGE_URL set explicitly — the accessors
+	// refuse to sign a plain-http htu.
+	edge := strings.TrimRight(os.Getenv(CLIEdgeBaseEnv), "/")
+	if edge == "" {
+		edge = legacy
+	}
 	return Config{
 		STSBase:           legacy,
 		STSCanonical:      canonical,
 		OIDCIssuer:        issuer,
 		ClimintBase:       climint,
+		CLIEdgeBase:       edge,
 		ClientID:          env("GASWORKS_CLIENT_ID", defaultClientID),
 		LoopbackPort:      port,
 		AllowFileKeystore: boolEnv(AllowFileKeystoreEnv),
@@ -259,6 +280,54 @@ func (c Config) ClimintOrigin() (string, error) {
 		return "", fmt.Errorf("climint base URL: %w (set %s to a canonical https origin)", err, ClimintBaseEnv)
 	}
 	return origin, nil
+}
+
+// --- cli-edge device plane (works.gascity.com/gc/v0) ---
+
+// CLIEdgeOrigin is the validated scheme://host the cli-edge device plane is served at,
+// quoting the override that fixes a bad one. It is the htu origin of every device-token poll
+// proof and the only origin the CLI accepts a verification URI on.
+func (c Config) CLIEdgeOrigin() (string, error) {
+	return ValidCLIEdgeOrigin(c.CLIEdgeBase)
+}
+
+// ValidCLIEdgeOrigin validates a cli-edge origin read from somewhere other than this Config —
+// the origin an edge-device session recorded when it was issued, which is where it must be
+// revoked even if GASWORKS_CLI_EDGE_URL has changed since.
+func ValidCLIEdgeOrigin(raw string) (string, error) {
+	origin, err := canonicalOrigin(raw)
+	if err != nil {
+		return "", fmt.Errorf("cli-edge base URL: %w (set %s to a canonical https origin)", err, CLIEdgeBaseEnv)
+	}
+	return origin, nil
+}
+
+// CLIDeviceCodeURL is the device-flow issue endpoint (no DPoP: nothing is bound yet).
+func (c Config) CLIDeviceCodeURL() (string, error) {
+	origin, err := c.CLIEdgeOrigin()
+	if err != nil {
+		return "", err
+	}
+	return origin + "/gc/v0/auth/device/code", nil
+}
+
+// CLIDeviceTokenURL is the device-flow poll endpoint. It is the exact htu of every poll's
+// DPoP proof, so it is built from the validated origin and never normalised afterwards.
+func (c Config) CLIDeviceTokenURL() (string, error) {
+	origin, err := c.CLIEdgeOrigin()
+	if err != nil {
+		return "", err
+	}
+	return origin + "/gc/v0/auth/device/token", nil
+}
+
+// CLISessionURL is the cli-edge revocation endpoint (DELETE) for a root issued at origin.
+func CLISessionURL(origin string) (string, error) {
+	valid, err := ValidCLIEdgeOrigin(origin)
+	if err != nil {
+		return "", err
+	}
+	return valid + "/gc/v0/session", nil
 }
 
 // canonicalOrigin accepts only the origin form the climint server itself canonicalises to
