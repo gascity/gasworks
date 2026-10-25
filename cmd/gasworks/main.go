@@ -159,6 +159,7 @@ func printUsage() {
 
 Usage:
   gasworks login [--device|--browser] [--staff] [--org <id|slug>]
+  gasworks login --edge-device [--org <id|slug>] [--allow-file-keystore]   (opt-in)
   gasworks getToken <product> [--org <id|slug>] [--scope "<space-sep>"] [--json] [--refresh]
   gasworks credential-provider
   gasworks inspect [--json]

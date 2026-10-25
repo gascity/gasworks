@@ -136,6 +136,54 @@ func Context(cfg config.Config, idToken string, provision bool) (ContextResoluti
 	return ContextResolution{}, last
 }
 
+// SessionContext fetches /sts/v0/context for a DPoP-bound session the caller holds WITHOUT an
+// id_token: the cli-edge device root of `gasworks login --edge-device`. The session is
+// presented the RFC 9449 §7.1 way — `Authorization: DPoP <session>` plus a `DPoP` proof bound
+// to GET, the exact context URL (no query) and the session itself (ath) — so an STS that does
+// not know this shape refuses it (400 invalid_request: no Bearer subject_token) instead of
+// mistaking the session for an id_token.
+//
+// The device root is pinned to one org, the approver's active org at approval, so the STS is
+// expected to answer with exactly that org; the caller checks. It never provisions: a device
+// root exists only because an approver who already has an account authorized it.
+//
+// Like a non-provisioning Context it is read-only, so it may fall back to the next configured
+// origin on a network/404/5xx failure — with a FRESH proof, because htu names the origin and
+// each jti is single-use.
+func SessionContext(cfg config.Config, sessionToken string, key *dpop.Key) (ContextResolution, error) {
+	endpoints := cfg.STSEndpoints()
+	if len(endpoints) == 0 {
+		return ContextResolution{}, errNoSTSEndpoint
+	}
+	if key == nil {
+		return ContextResolution{}, errors.New("sts: session context requires the session's DPoP key")
+	}
+	var last error
+	for i, origin := range endpoints {
+		u := origin + "/sts/v0/context"
+		proof, err := key.Proof(http.MethodGet, u, sessionToken)
+		if err != nil {
+			return ContextResolution{}, err
+		}
+		_, body, err := getJSON(u, map[string]string{"Authorization": "DPoP " + sessionToken, "DPoP": proof})
+		if err == nil {
+			var res ContextResolution
+			if err := remarshal(body, &res); err != nil {
+				return ContextResolution{}, fmt.Errorf("context: %w", err)
+			}
+			res.Origin = origin
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: successOutcome(i), Reason: "success"})
+			return res, nil
+		}
+		last = err
+		if !retryable(err) || i == len(endpoints)-1 {
+			emit(cfg, Event{Operation: "context", Origin: originClass(cfg, origin), Outcome: failureOutcome(i), Reason: reason(err)})
+			return ContextResolution{}, err
+		}
+	}
+	return ContextResolution{}, last
+}
+
 // Login establishes a DPoP-bound session at /sts/v0/login. The DPoP proof is bound to the
 // login URL and signed by key; pass the SAME key to Exchange so the server's jkt-pin holds.
 // Login is state-changing: it attempts one origin and crosses to the next only when that

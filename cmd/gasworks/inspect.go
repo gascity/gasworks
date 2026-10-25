@@ -30,11 +30,11 @@ func cmdInspect(cfg config.Config, argv []string) error {
 		return die("%s", err)
 	}
 
-	data, err := store.Load()
+	snapshot, err := store.LoadSnapshot()
 	if err != nil {
 		return die("could not read credentials: %s", err)
 	}
-	report := inspectReport(cfg, data, now())
+	report := inspectReport(cfg, snapshot, now())
 	if *asJSON {
 		encoded, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
@@ -49,14 +49,18 @@ func cmdInspect(cfg config.Config, argv []string) error {
 
 // inspection is the machine-readable shape of `gasworks inspect --json`.
 type inspection struct {
-	CredentialsPath string             `json:"credentials_path"`
-	KeystoreVersion string             `json:"keystore_registry"`
-	Keystores       []keystoreReport   `json:"keystores"`
-	LoggedIn        bool               `json:"logged_in"`
-	Login           *loginReport       `json:"login,omitempty"`
-	Sessions        []sessionReport    `json:"sessions"`
-	CachedEIAs      []cachedEIAReport  `json:"cached_eias"`
-	RefreshPolicy   refreshPolicyBlock `json:"refresh_policy"`
+	CredentialsPath string           `json:"credentials_path"`
+	KeystoreVersion string           `json:"keystore_registry"`
+	Keystores       []keystoreReport `json:"keystores"`
+	LoggedIn        bool             `json:"logged_in"`
+	// SessionKind is the login in force: "keycloak" (an id_token + refresh token, with
+	// per-org STS sessions), "edge-device" (a cli-edge device root), or "none".
+	SessionKind   string             `json:"session_kind"`
+	Login         *loginReport       `json:"login,omitempty"`
+	EdgeSession   *edgeSessionReport `json:"edge_session,omitempty"`
+	Sessions      []sessionReport    `json:"sessions"`
+	CachedEIAs    []cachedEIAReport  `json:"cached_eias"`
+	RefreshPolicy refreshPolicyBlock `json:"refresh_policy"`
 }
 
 type keystoreReport struct {
@@ -96,10 +100,34 @@ type sessionReport struct {
 	KeyStatus   string `json:"key_status"`
 }
 
+// edgeSessionReport is the edge-device root `gasworks login --edge-device` signed in with. It
+// names where the root and its key live and what the STS said the root is pinned to; it never
+// carries the root itself.
+type edgeSessionReport struct {
+	Path        string `json:"path"`
+	Active      bool   `json:"active"`
+	Status      string `json:"status"`
+	EdgeOrigin  string `json:"edge_origin"`
+	TokenType   string `json:"token_type"`
+	OrgID       string `json:"org_id,omitempty"`
+	OrgSlug     string `json:"org_slug,omitempty"`
+	UserID      string `json:"user_id,omitempty"`
+	Generation  string `json:"credential_generation,omitempty"`
+	DefaultOrg  string `json:"default_org,omitempty"`
+	IssuedAt    string `json:"issued_at,omitempty"`
+	ExpiresAt   string `json:"expires_at,omitempty"`
+	SecondsLeft int64  `json:"seconds_remaining,omitempty"`
+	KeyBackend  string `json:"key_backend,omitempty"`
+	KeyHandle   string `json:"key_handle,omitempty"`
+	KeyJKT      string `json:"key_jkt,omitempty"`
+	KeyStatus   string `json:"key_status"`
+}
+
 type cachedEIAReport struct {
 	Audience    string     `json:"audience"`
 	Org         string     `json:"org"`
 	Origin      string     `json:"sts_origin"`
+	Via         string     `json:"credential_kind,omitempty"`
 	Scopes      []string   `json:"scopes,omitempty"`
 	ExpiresAt   string     `json:"expires_at,omitempty"`
 	SecondsLeft int64      `json:"seconds_remaining"`
@@ -142,11 +170,15 @@ type refreshPolicyBlock struct {
 	EIARemintAtSeconds      int    `json:"eia_remint_at_seconds_remaining"`
 }
 
-func inspectReport(cfg config.Config, data *store.Data, instant int64) inspection {
+func inspectReport(cfg config.Config, snapshot store.Snapshot, instant int64) inspection {
+	data := snapshot.Data
+	_, edgeActive := activeEdgeSession(snapshot)
+	keycloak := data.IDToken != "" || data.RefreshToken != ""
 	report := inspection{
 		CredentialsPath: store.CredsPath(),
 		KeystoreVersion: keystore.Version,
-		LoggedIn:        data.IDToken != "" || data.RefreshToken != "",
+		LoggedIn:        keycloak || edgeActive,
+		SessionKind:     "none",
 		Sessions:        []sessionReport{},
 		CachedEIAs:      []cachedEIAReport{},
 		RefreshPolicy: refreshPolicyBlock{
@@ -168,8 +200,17 @@ func inspectReport(cfg config.Config, data *store.Data, instant int64) inspectio
 			Deletion:      d.Deletion,
 		})
 	}
-	if report.LoggedIn {
+	switch {
+	case edgeActive:
+		report.SessionKind = edgeCredentialKind
+	case keycloak:
+		report.SessionKind = "keycloak"
+	}
+	if keycloak {
 		report.Login = loginBlock(data, instant)
+	}
+	if snapshot.Edge != nil {
+		report.EdgeSession = edgeSessionBlock(*snapshot.Edge, data, edgeActive, instant)
 	}
 	report.Sessions = sessionBlocks(data, instant)
 	report.CachedEIAs = cachedEIABlocks(data, instant)
@@ -200,6 +241,42 @@ func loginBlock(data *store.Data, instant int64) *loginReport {
 	if exp := jwtutil.Exp(claims); exp != 0 {
 		block.IDTokenExp = utcRFC3339(exp)
 		block.SecondsLeft = exp - instant
+	}
+	return block
+}
+
+func edgeSessionBlock(edge store.EdgeSession, data *store.Data, active bool, instant int64) *edgeSessionReport {
+	block := &edgeSessionReport{
+		Path:       store.EdgeSessionPath(),
+		Active:     active,
+		Status:     "active",
+		EdgeOrigin: edge.EdgeOrigin,
+		TokenType:  edge.TokenType,
+		OrgID:      edge.OrgID,
+		OrgSlug:    edge.OrgSlug,
+		UserID:     edge.UserID,
+		Generation: edge.CredentialGeneration,
+		KeyBackend: edge.Key.Backend,
+		KeyHandle:  edge.Key.Handle,
+	}
+	if active {
+		block.DefaultOrg = data.DefaultOrg
+	} else {
+		block.Status = "stale: a newer login replaced it (`gasworks login` or `gasworks logout` removes it)"
+	}
+	if edge.IssuedAt > 0 {
+		block.IssuedAt = utcRFC3339(edge.IssuedAt)
+	}
+	if edge.ExpiresAt > 0 {
+		block.ExpiresAt = utcRFC3339(edge.ExpiresAt)
+		block.SecondsLeft = edge.ExpiresAt - instant
+	}
+	switch dpopKey, err := loadSessionKey(edge.Key); {
+	case err != nil:
+		block.KeyStatus = "unreadable: " + err.Error()
+	default:
+		block.KeyStatus = "enrolled"
+		block.KeyJKT = dpopKey.Thumbprint()
 	}
 	return block
 }
@@ -248,6 +325,7 @@ func cachedEIABlocks(data *store.Data, instant int64) []cachedEIAReport {
 			Audience:    identity.Audience,
 			Org:         identity.Org,
 			Origin:      identity.STSAuthority,
+			Via:         identity.CredentialKind,
 			Scopes:      identity.Scopes,
 			SecondsLeft: entry.ExpiresAt - instant,
 		}
@@ -303,13 +381,60 @@ func printInspection(report inspection) {
 		report.RefreshPolicy.IDTokenRefreshAtSeconds, report.RefreshPolicy.SessionRenewAtSeconds,
 		report.RefreshPolicy.EIARemintAtSeconds)
 
+	edge := report.EdgeSession
+	if edge != nil && !edge.Active {
+		stdoutLine("")
+		printEdgeSession(edge)
+	}
 	if !report.LoggedIn {
 		stdoutLine("")
 		stdoutLine("not logged in — run `gasworks login`")
 		return
 	}
 
-	login := report.Login
+	stdoutLine("")
+	switch report.SessionKind {
+	case edgeCredentialKind:
+		stdoutLine("session kind: edge-device — a cli-edge device root, DPoP-bound and pinned to one org " +
+			"(`gasworks login --edge-device`); nothing refreshes it: sign in again when it ends")
+		stdoutLine("")
+		printEdgeSession(edge)
+	default:
+		stdoutLine("session kind: keycloak — an id_token + refresh token, with a DPoP-bound STS session per org")
+	}
+	if report.Login != nil {
+		printLogin(report.Login)
+	}
+	printSessionsAndEIAs(report)
+}
+
+// printEdgeSession prints the edge-device block. The org, user and origin are values a server
+// chose, so those lines go through the relay filter.
+func printEdgeSession(e *edgeSessionReport) {
+	stdoutLine("edge-device session:")
+	printField("status", e.Status)
+	if e.OrgSlug != "" {
+		printRelayedField("org", e.OrgSlug+" ("+e.OrgID+")")
+	} else {
+		printRelayedField("org", e.OrgID)
+	}
+	printRelayedField("user", e.UserID)
+	printRelayedField("cli-edge", e.EdgeOrigin)
+	printRelayedField("token type", e.TokenType)
+	printField("generation", e.Generation)
+	printRelayedField("default org", e.DefaultOrg)
+	printField("issued", e.IssuedAt)
+	if e.ExpiresAt != "" {
+		printField("expires", e.ExpiresAt+" ("+remaining(e.SecondsLeft)+")")
+	} else {
+		printField("expires", "set by the server (not reported to the client)")
+	}
+	printRelayedField("dpop key", keyLocation(sessionReport{KeyBackend: e.KeyBackend, KeyHandle: e.KeyHandle})+" ["+e.KeyStatus+"]")
+	printField("jkt", e.KeyJKT)
+	printField("file", e.Path)
+}
+
+func printLogin(login *loginReport) {
 	stdoutLine("")
 	stdoutLine("login:")
 	printField("subject", login.Subject)
@@ -327,7 +452,9 @@ func printInspection(report inspection) {
 	} else if login.IDTokenExp != "" {
 		printField("id_token", login.IDTokenExp+" ("+remaining(login.SecondsLeft)+")")
 	}
+}
 
+func printSessionsAndEIAs(report inspection) {
 	stdoutLine("")
 	stdoutf("sessions (%d):", len(report.Sessions))
 	for _, s := range report.Sessions {
@@ -343,6 +470,9 @@ func printInspection(report inspection) {
 	stdoutf("cached EIAs (%d):", len(report.CachedEIAs))
 	for _, e := range report.CachedEIAs {
 		stdoutf("  - audience %s  org %s  at %s", e.Audience, e.Org, e.Origin)
+		if e.Via == edgeCredentialKind {
+			stdoutLine("      via      the edge-device session")
+		}
 		stdoutf("      scopes   %s", strings.Join(e.Scopes, " "))
 		stdoutf("      expires  %s (%s)", e.ExpiresAt, remaining(e.SecondsLeft))
 		if e.ClaimsErr != "" {
@@ -394,6 +524,13 @@ func keyLocation(s sessionReport) string {
 func printField(label, value string) {
 	if value != "" {
 		stdoutf("  %-15s%s", label+":", value)
+	}
+}
+
+// printRelayedField is printField for a value a server chose.
+func printRelayedField(label, value string) {
+	if value != "" {
+		stdoutRelayed("  %-15s%s", label+":", value)
 	}
 }
 

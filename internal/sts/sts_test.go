@@ -18,6 +18,7 @@ import (
 
 	"github.com/gascity/gasworks/internal/config"
 	"github.com/gascity/gasworks/internal/dpop"
+	"github.com/gascity/gasworks/internal/httpc"
 )
 
 func base64urlDecode(s string) ([]byte, error) {
@@ -891,4 +892,125 @@ func htuOf(t *testing.T, proof string) string {
 func ath(credential string) string {
 	sum := sha256.Sum256([]byte(credential))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// htmOf reads the htm claim of a DPoP proof.
+func htmOf(t *testing.T, proof string) string {
+	t.Helper()
+	parts := strings.Split(proof, ".")
+	if len(parts) != 3 {
+		t.Fatalf("malformed DPoP proof: %q", proof)
+	}
+	raw, err := base64urlDecode(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims struct {
+		HTM string `json:"htm"`
+		JTI string `json:"jti"`
+	}
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return claims.HTM
+}
+
+// A session-authenticated discovery presents the session the RFC 9449 way: the DPoP auth
+// scheme (never Bearer, so an STS that does not know it cannot mistake the session for an
+// id_token) and a proof bound to GET, the exact context URL and the session itself.
+func TestSessionContextPresentsTheSessionWithDPoP(t *testing.T) {
+	cfg, srv := newStub(t)
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const session = "gcs_cli_aaaabbbbccccddddeeeeffffgggghhhh"
+	ctx, err := SessionContext(cfg, session, key)
+	if err != nil {
+		t.Fatalf("SessionContext: %v", err)
+	}
+	if ctx.Origin != cfg.STSBase || len(ctx.Orgs) != 1 || ctx.Orgs[0].OrgID != "org_a" {
+		t.Fatalf("ctx = %+v", ctx)
+	}
+	got := srv.reqs("/sts/v0/context")
+	if len(got) != 1 {
+		t.Fatalf("context requests = %d, want 1", len(got))
+	}
+	if strings.Contains(got[0].path, "provision") {
+		t.Fatalf("session context provisions: %q", got[0].path)
+	}
+	if auth := got[0].headers.Get("Authorization"); auth != "DPoP "+session {
+		t.Fatalf("Authorization = %q, want the DPoP scheme", auth)
+	}
+	proof := got[0].headers.Get("DPoP")
+	if htmOf(t, proof) != http.MethodGet || htuOf(t, proof) != cfg.STSBase+"/sts/v0/context" || athOf(t, proof) != ath(session) {
+		t.Fatalf("proof htm/htu/ath = %q %q %q", htmOf(t, proof), htuOf(t, proof), athOf(t, proof))
+	}
+	if !strings.Contains(jwkOf(t, proof), key.PublicJWK()["x"]) {
+		t.Fatal("proof is not signed by the session key")
+	}
+}
+
+// Read-only discovery may fall back to the legacy origin — with a fresh proof naming that
+// origin, never the canonical origin's proof replayed.
+func TestSessionContextFallsBackWithAFreshProof(t *testing.T) {
+	var canonicalProof string
+	canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		canonicalProof = r.Header.Get("DPoP")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "temporarily_unavailable"})
+	}))
+	t.Cleanup(canonical.Close)
+	cfg, legacy := newStub(t)
+	cfg.STSCanonical = canonical.URL
+	key, err := dpop.NewKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := SessionContext(cfg, "SESSION", key)
+	if err != nil {
+		t.Fatalf("SessionContext: %v", err)
+	}
+	if ctx.Origin != cfg.STSBase {
+		t.Fatalf("origin = %q, want the legacy fallback %q", ctx.Origin, cfg.STSBase)
+	}
+	legacyProof := legacy.reqs("/sts/v0/context")[0].headers.Get("DPoP")
+	if htuOf(t, canonicalProof) != canonical.URL+"/sts/v0/context" || htuOf(t, legacyProof) != cfg.STSBase+"/sts/v0/context" {
+		t.Fatalf("htu canonical=%q legacy=%q", htuOf(t, canonicalProof), htuOf(t, legacyProof))
+	}
+	if canonicalProof == legacyProof {
+		t.Fatal("the fallback replayed the canonical origin's proof")
+	}
+}
+
+// A refusal (the STS does not accept the session: an old STS answers 400 invalid_request,
+// a flag-off one invalid_grant, an expired session 401) is returned as the raw HTTPError and
+// never crosses to another origin.
+func TestSessionContextRefusalDoesNotFallBack(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{{http.StatusBadRequest, "invalid_request"}, {http.StatusBadRequest, "invalid_grant"}, {http.StatusUnauthorized, "invalid_grant"}} {
+		var legacyHits atomic.Int32
+		canonical := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, tc.status, map[string]any{"error": tc.code})
+		}))
+		legacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			legacyHits.Add(1)
+			writeJSON(w, http.StatusOK, map[string]any{})
+		}))
+		key, _ := dpop.NewKey()
+		_, err := SessionContext(config.Config{STSCanonical: canonical.URL, STSBase: legacy.URL}, "SESSION", key)
+		var he *httpc.HTTPError
+		if !errors.As(err, &he) || he.Status != tc.status || he.OAuthError() != tc.code {
+			t.Fatalf("%d %s: err = %v", tc.status, tc.code, err)
+		}
+		if legacyHits.Load() != 0 {
+			t.Fatalf("%d %s crossed to the legacy origin", tc.status, tc.code)
+		}
+		canonical.Close()
+		legacy.Close()
+	}
+	if _, err := SessionContext(config.Config{STSBase: "https://sts.example"}, "SESSION", nil); err == nil {
+		t.Fatal("SessionContext accepted a nil key")
+	}
 }
