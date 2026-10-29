@@ -1122,6 +1122,11 @@ func NewExtractedWorkReference(c Common, in ExtractedWorkRefInput, resolver Proj
 	if err := boundedNonEmpty("work_reference.bead_id", in.BeadID, maxBeadID); err != nil {
 		return ExtractedWorkRefResult{}, err
 	}
+	if SecretShapedBeadID(in.BeadID) {
+		// Defense in depth behind the extractor screen. The error names the field only, never
+		// the value, so the fail-closed diagnostic cannot carry the credential.
+		return ExtractedWorkRefResult{}, buildErr("work_reference.bead_id", "secret-shaped identifier rejected")
+	}
 	projectID, reason := resolver.resolve(in.BeadID)
 	if reason != "" {
 		detail := "extracted work reference dropped: no stamped, prefix-mapped, or default team-server project"

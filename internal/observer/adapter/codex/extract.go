@@ -13,7 +13,10 @@ import (
 // ExtractorVersion is the versioned identity of the deterministic reference extractors. Each
 // captured reference records this alongside the fixture-proven pattern_id that matched, so a
 // later extractor revision is distinguishable on the wire. Bump it whenever a pattern changes.
-const ExtractorVersion = "codex-refextract-v2"
+//
+// v3 screens bead-ID matches through evidence.SecretShapedBeadID, so a credential that happens to
+// match a user-chosen project prefix is no longer captured.
+const ExtractorVersion = "codex-refextract-v3"
 
 // RefKind is the closed set of reference kinds this extractor can capture. COMMIT and
 // PULL_REQUEST are VCS references; BEAD is an extracted work reference. BRANCH is deliberately
@@ -275,6 +278,12 @@ func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg Ref
 		}
 		id := trimBeadToken(tok)
 		if id == "" || !re.MatchString(id) {
+			continue
+		}
+		if evidence.SecretShapedBeadID(id) {
+			// Prefixes are user-chosen project prefixes, so a credential (sk-ant-…, xoxb-…,
+			// glpat-…) can match the bead grammar whole. Drop it before it becomes a candidate:
+			// no reference, no distinct-ref cap slot, no diagnostic carrying the value.
 			continue
 		}
 		out = append(out, ExtractedReference{

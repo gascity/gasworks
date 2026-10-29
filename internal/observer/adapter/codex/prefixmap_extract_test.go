@@ -143,3 +143,57 @@ func TestPrefixMapPatternCompiledOncePerSnapshot(t *testing.T) {
 		t.Fatal("a new snapshot did not get its own pattern")
 	}
 }
+
+// fakeBody is a deterministic pseudo-random token body; fixtures are assembled at runtime so no
+// literal credential-shaped string lives in the repository.
+func fakeBody(n int, alphabet string, seed uint32) string {
+	out := make([]byte, n)
+	x := seed | 1
+	for i := range out {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		out[i] = alphabet[int(x%uint32(len(alphabet)))]
+	}
+	return string(out)
+}
+
+// TestPrefixMapDoesNotCaptureSecretShapedTokens (bts-xpw.13.3.6): project prefixes are user-chosen,
+// so a project whose prefix is "sk" or "xoxb" turns a credential scheme into a capture prefix. A
+// credential passed on a gh/bd/git command line must not be captured as a bead id, while real
+// beads of the same project on the same line still are.
+func TestPrefixMapDoesNotCaptureSecretShapedTokens(t *testing.T) {
+	const al = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	sk := "s" + "k-"
+	xoxb := "xox" + "b-"
+	glpat := "glp" + "at-"
+	src := &swapSource{m: prefixMapOf(t, sk, "proj_sk", xoxb, "proj_slack", glpat, "proj_gl")}
+	cfg := ReferenceConfig{PrefixMap: src}
+
+	anthropic := sk + "ant-api03-" + fakeBody(93, al, 1)
+	slack := xoxb + fakeBody(13, "0123456789", 2) + "-" + fakeBody(13, "0123456789", 3) + "-" + fakeBody(24, al, 4)
+	gitlab := glpat + fakeBody(20, al, 5)
+	for _, tc := range []struct{ tool, text string }{
+		{"gh", "gh secret set ANTHROPIC_API_KEY --body " + anthropic + " && bd show " + sk + "a1b2"},
+		{"gh", "gh secret set SLACK_TOKEN --body '" + slack + "' ; bd close " + xoxb + "9z.1"},
+		{"git", "git remote set-url origin https://oauth2:" + gitlab + "@gitlab.example/x.git && bd update " + glpat + "abc"},
+		{"bd", "bd create --notes " + gitlab + " " + sk + "a1b2"},
+	} {
+		refs, _ := ExtractReferences(wire.ExtractionProvenanceSurfaceTOOLCALL, SurfaceText{Tool: tc.tool, Text: tc.text}, cfg)
+		var beads []string
+		for _, r := range refs {
+			if r.Kind != RefKindBead {
+				continue
+			}
+			for _, secret := range []string{anthropic, slack, gitlab} {
+				if r.Work.BeadID == secret {
+					t.Fatalf("%s: credential captured as bead id", tc.tool)
+				}
+			}
+			beads = append(beads, r.Work.BeadID)
+		}
+		if len(beads) != 1 {
+			t.Errorf("%s: captured %v, want exactly the one real bead", tc.tool, beads)
+		}
+	}
+}

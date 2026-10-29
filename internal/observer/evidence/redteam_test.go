@@ -357,3 +357,101 @@ func TestValidEnumErrorHasNoCandidateContent(t *testing.T) {
 		t.Fatalf("candidate enum string leaked into the error channel: %v", r.Cause)
 	}
 }
+
+// fakeTokenBody returns a deterministic pseudo-random body of n characters drawn from alphabet.
+// Fixture credentials are assembled at runtime from a split scheme and this body so no literal
+// token-shaped string lives in the repository (secret scanners) while the shapes stay realistic.
+func fakeTokenBody(n int, alphabet string, seed uint32) string {
+	var b strings.Builder
+	x := seed | 1
+	for i := 0; i < n; i++ {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		b.WriteByte(alphabet[int(x%uint32(len(alphabet)))])
+	}
+	return b.String()
+}
+
+const (
+	alnum      = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	lowerAlnum = "abcdefghijklmnopqrstuvwxyz0123456789"
+	digits     = "0123456789"
+)
+
+// secretShapedFixtures are dash-joined credential shapes that the alphanumeric/dash bead tail
+// grammar can match whole once a user-chosen project prefix collides with the credential scheme
+// (bts-xpw.13.3.6). Each is under maxBeadID, so the length bound alone does not stop it.
+func secretShapedFixtures() map[string]string {
+	return map[string]string{
+		"anthropic":       "s" + "k-ant-api03-" + fakeTokenBody(93, alnum, 1),
+		"anthropic-short": "s" + "k-ant-" + fakeTokenBody(12, lowerAlnum, 2),
+		"openai-proj":     "s" + "k-proj-" + fakeTokenBody(48, alnum, 3),
+		"slack-bot":       "xox" + "b-" + fakeTokenBody(13, digits, 4) + "-" + fakeTokenBody(13, digits, 5) + "-" + fakeTokenBody(24, alnum, 6),
+		"slack-user":      "xox" + "p-" + fakeTokenBody(12, digits, 7) + "-" + fakeTokenBody(12, digits, 8) + "-" + fakeTokenBody(13, digits, 9) + "-" + fakeTokenBody(32, lowerAlnum, 10),
+		"slack-app":       "xap" + "p-1-" + fakeTokenBody(11, alnum, 11) + "-" + fakeTokenBody(13, digits, 12) + "-" + fakeTokenBody(64, lowerAlnum, 13),
+		"gitlab-pat":      "glp" + "at-" + fakeTokenBody(20, alnum, 14),
+		"gitlab-pat-lc":   "glp" + "at-" + fakeTokenBody(20, lowerAlnum, 15),
+		"xai":             "xa" + "i-" + fakeTokenBody(80, alnum, 16),
+		"pypi":            "py" + "pi-" + fakeTokenBody(100, alnum, 17),
+		// A credential under a prefix not on the list is still caught by its high-entropy body.
+		"unknown-scheme": "acme-" + fakeTokenBody(40, alnum, 18),
+		"mixed-segment":  "acme-" + fakeTokenBody(16, alnum, 19) + "x9Z",
+	}
+}
+
+// TestSecretShapedBeadIDRejectsCredentials is the redteam fixture set for bts-xpw.13.3.6: every
+// credential shape is screened by SecretShapedBeadID and NewExtractedWorkReference fails closed on
+// it with a BuildError that never carries the value, even when the resolver would map its prefix.
+func TestSecretShapedBeadIDRejectsCredentials(t *testing.T) {
+	pm, err := NewBeadPrefixMap([]BeadPrefixMapping{
+		{Prefix: "s" + "k-", ProjectID: "proj_sk"},
+		{Prefix: "xox" + "b-", ProjectID: "proj_x"},
+		{Prefix: "xox" + "p-", ProjectID: "proj_x"},
+		{Prefix: "xap" + "p-", ProjectID: "proj_x"},
+		{Prefix: "glp" + "at-", ProjectID: "proj_gl"},
+		{Prefix: "xa" + "i-", ProjectID: "proj_x"},
+		{Prefix: "py" + "pi-", ProjectID: "proj_x"},
+		{Prefix: "acme-", ProjectID: "proj_acme"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tok := range secretShapedFixtures() {
+		if len(tok) > maxBeadID {
+			t.Fatalf("%s: fixture is %d bytes; it must be under maxBeadID to exercise the screen", name, len(tok))
+		}
+		if !SecretShapedBeadID(tok) {
+			t.Errorf("%s: not screened as secret-shaped", name)
+			continue
+		}
+		_, err := NewExtractedWorkReference(testCommon(), ExtractedWorkRefInput{BeadID: tok}, ProjectResolver{Prefixes: pm, DefaultProjectID: "proj_default"})
+		mustBuildErr(t, err, name)
+		if strings.Contains(err.Error(), tok) || strings.Contains(err.Error(), tok[len(tok)-8:]) {
+			t.Errorf("%s: build error leaks the credential: %v", name, err)
+		}
+	}
+}
+
+// TestSecretShapedBeadIDKeepsRealBeads: real bead ids — including ones under a prefix that
+// collides with a credential scheme — are not screened.
+func TestSecretShapedBeadIDKeepsRealBeads(t *testing.T) {
+	for _, id := range []string{
+		"ga-1tzraj", "ga-1tzraj-repair-merge", "bts-xpw.13.3.6", "ga-a1b2.1", "lego-pilot-7",
+		"gas-city-9", "acme-ops-3", "ABC-123", "proj-internationalization", "bd-0a1b2c3d4e5f",
+		"s" + "k-a1b2c3", "s" + "k-a1b2c3.4.12", "xox" + "b-9z", "glp" + "at-abc", "py" + "pi-3.1",
+	} {
+		if SecretShapedBeadID(id) {
+			t.Errorf("%q: real bead id screened as secret-shaped", id)
+		}
+	}
+	// Under a credential-colliding prefix only the strict bead shape survives.
+	for _, id := range []string{
+		"s" + "k-ant-a1b2", "s" + "k-a1b2-slug", "s" + "k-A1b2", "s" + "k-a1b2.", "s" + "k-a1b2.x",
+		"s" + "k-" + strings.Repeat("a", maxStrictBeadHash+1),
+	} {
+		if !SecretShapedBeadID(id) {
+			t.Errorf("%q: credential-prefixed id outside the strict bead shape was not screened", id)
+		}
+	}
+}
