@@ -1017,6 +1017,21 @@ func (m *BeadPrefixMap) Lookup(beadID string) (string, bool) {
 	return projectID, projectID != ""
 }
 
+// LongestPrefix returns the longest declared prefix beadID begins with, ambiguous ones included
+// (they are still captured), or "" when none does. It is the declared prefix SecretShapedBeadID
+// keeps out of its entropy screen.
+func (m *BeadPrefixMap) LongestPrefix(beadID string) string {
+	if m == nil {
+		return ""
+	}
+	for _, e := range m.entries {
+		if strings.HasPrefix(beadID, e.prefix) {
+			return e.prefix
+		}
+	}
+	return ""
+}
+
 // Prefixes returns every distinct declared prefix, ambiguous ones included (longest first): the
 // set bead ids are captured with. The caller owns the returned slice.
 func (m *BeadPrefixMap) Prefixes() []string {
@@ -1112,6 +1127,10 @@ func (r ExtractedWorkRefResult) Dropped() bool { return r.Resolved == nil }
 // (the identifier only selects which declared bead-prefix mapping, if any, applies).
 type ExtractedWorkRefInput struct {
 	BeadID string
+	// DeclaredPrefix is the longest declared capture prefix BeadID was matched under ("" if
+	// unknown). It only keeps declared configuration text out of the secret-shape screen (see
+	// SecretShapedBeadID); it never reaches the wire.
+	DeclaredPrefix string
 }
 
 // NewExtractedWorkReference resolves the project for a pattern-captured bead ID and either
@@ -1121,6 +1140,12 @@ type ExtractedWorkRefInput struct {
 func NewExtractedWorkReference(c Common, in ExtractedWorkRefInput, resolver ProjectResolver) (ExtractedWorkRefResult, error) {
 	if err := boundedNonEmpty("work_reference.bead_id", in.BeadID, maxBeadID); err != nil {
 		return ExtractedWorkRefResult{}, err
+	}
+	if SecretShapedBeadID(in.BeadID, in.DeclaredPrefix) {
+		// Defense in depth behind the extractor screen, which applies the same check to the same
+		// inputs. The error names the field only, never the value, so the fail-closed diagnostic
+		// cannot carry the credential.
+		return ExtractedWorkRefResult{}, buildErr("work_reference.bead_id", "secret-shaped identifier rejected")
 	}
 	projectID, reason := resolver.resolve(in.BeadID)
 	if reason != "" {

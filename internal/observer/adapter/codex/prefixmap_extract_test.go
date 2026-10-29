@@ -143,3 +143,102 @@ func TestPrefixMapPatternCompiledOncePerSnapshot(t *testing.T) {
 		t.Fatal("a new snapshot did not get its own pattern")
 	}
 }
+
+// fakeBody is a deterministic pseudo-random token body; fixtures are assembled at runtime so no
+// literal credential-shaped string lives in the repository.
+func fakeBody(n int, alphabet string, seed uint32) string {
+	out := make([]byte, n)
+	x := seed<<1 | 1 // xorshift32 state: odd so never 0, and distinct for distinct seeds
+	for i := range out {
+		x ^= x << 13
+		x ^= x >> 17
+		x ^= x << 5
+		out[i] = alphabet[int(x%uint32(len(alphabet)))]
+	}
+	return string(out)
+}
+
+// TestPrefixMapDoesNotCaptureSecretShapedTokens (bts-xpw.13.3.6): project prefixes are user-chosen,
+// so a project whose prefix is "sk", "xoxb" or "api" turns a credential scheme into a capture
+// prefix. A credential passed on a gh/bd/git command line must not be captured as a bead id, while
+// real beads of the same project on the same line still are.
+func TestPrefixMapDoesNotCaptureSecretShapedTokens(t *testing.T) {
+	const al = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+	const hex = "0123456789abcdef"
+	sk := "s" + "k-"
+	xoxb := "xox" + "b-"
+	glpat := "glp" + "at-"
+	api := "ap" + "i-"
+	src := &swapSource{m: prefixMapOf(t, sk, "proj_sk", xoxb, "proj_slack", glpat, "proj_gl", api, "proj_api")}
+	cfg := ReferenceConfig{PrefixMap: src}
+
+	anthropic := sk + "ant-api03-" + fakeBody(93, al, 1)
+	slack := xoxb + fakeBody(13, "0123456789", 2) + "-" + fakeBody(13, "0123456789", 3) + "-" + fakeBody(24, al, 4)
+	gitlab := glpat + fakeBody(20, al, 5)
+	// A LaunchDarkly-style api-<uuid> key: every segment is short, so only the UUID run gives it away.
+	launchDarkly := api + fakeBody(8, hex, 6) + "-" + fakeBody(4, hex, 7) + "-" + fakeBody(4, hex, 8) + "-" +
+		fakeBody(4, hex, 9) + "-" + fakeBody(12, hex, 10)
+	for _, tc := range []struct{ tool, text string }{
+		{"gh", "gh secret set ANTHROPIC_API_KEY --body " + anthropic + " && bd show " + sk + "a1b2"},
+		{"gh", "gh secret set SLACK_TOKEN --body '" + slack + "' ; bd close " + xoxb + "9z.1"},
+		{"git", "git remote set-url origin https://oauth2:" + gitlab + "@gitlab.example/x.git && bd update " + glpat + "abc"},
+		{"bd", "bd create --notes " + gitlab + " " + sk + "a1b2"},
+		{"gh", "gh secret set LD_API_KEY --body " + launchDarkly + " && bd show " + api + "k3x"},
+	} {
+		refs, _ := ExtractReferences(wire.ExtractionProvenanceSurfaceTOOLCALL, SurfaceText{Tool: tc.tool, Text: tc.text}, cfg)
+		var beads []string
+		for _, r := range refs {
+			if r.Kind != RefKindBead {
+				continue
+			}
+			for _, secret := range []string{anthropic, slack, gitlab, launchDarkly} {
+				if r.Work.BeadID == secret {
+					t.Fatalf("%s: credential captured as bead id", tc.tool)
+				}
+			}
+			beads = append(beads, r.Work.BeadID)
+		}
+		if len(beads) != 1 {
+			t.Errorf("%s: captured %v, want exactly the one real bead", tc.tool, beads)
+		}
+	}
+}
+
+// TestPrefixMapKeepsBeadsUnderUserChosenPrefixes (bts-xpw.13.3.6): BTS project prefixes may be up
+// to 32 mixed-case characters and may begin with a credential scheme. The screen exempts the
+// declared prefix the extractor matched, so each such project's real beads are captured and
+// resolve through the evidence constructor (which repeats the screen) instead of being dropped.
+func TestPrefixMapKeepsBeadsUnderUserChosenPrefixes(t *testing.T) {
+	sk := "s" + "k-"
+	src := &swapSource{m: prefixMapOf(t,
+		"PlatformServices-", "proj_ps",
+		"projectphoenix2026-", "proj_pp",
+		sk+"team-", "proj_skteam",
+		sk, "proj_sk",
+	)}
+	got := beadProjects(t, "bd dep add PlatformServices-a1b2 projectphoenix2026-q7.2 && bd show "+sk+"team-x9z "+sk+"a1b2", ReferenceConfig{PrefixMap: src})
+	want := map[string]string{
+		"PlatformServices-a1b2":   "proj_ps",
+		"projectphoenix2026-q7.2": "proj_pp",
+		sk + "team-x9z":           "proj_skteam",
+		sk + "a1b2":               "proj_sk",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("extracted %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s -> %q, want %q", k, got[k], v)
+		}
+	}
+
+	// The static -bead-prefix form gets the same exemption, alone and alongside a prefix map.
+	cfg := ReferenceConfig{BeadPrefixes: []string{"CustomerPortalV2-"}, Resolver: evidence.ProjectResolver{DefaultProjectID: "proj_cp"}}
+	if got := beadProjects(t, "bd show CustomerPortalV2-a1b2", cfg); got["CustomerPortalV2-a1b2"] != "proj_cp" {
+		t.Errorf("static prefix: extracted %v", got)
+	}
+	cfg.PrefixMap = src
+	if got := beadProjects(t, "bd show CustomerPortalV2-a1b2 PlatformServices-a1b2", cfg); got["CustomerPortalV2-a1b2"] != "proj_cp" || got["PlatformServices-a1b2"] != "proj_ps" {
+		t.Errorf("static + mapped prefixes: extracted %v", got)
+	}
+}
