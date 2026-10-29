@@ -475,8 +475,11 @@ func (p Policy) TransformDeclaredWorkReference(env PolicyEnvelope, raw DeclaredW
 // ExtractedWorkReferenceCandidate is a raw EXTRACTED bead-ID reference plus its project
 // resolver (stamped context and/or configured default).
 type ExtractedWorkReferenceCandidate struct {
-	BeadID   string
-	Resolver ProjectResolver
+	BeadID string
+	// DeclaredPrefix is the longest declared capture prefix the extractor matched BeadID under;
+	// see ExtractedWorkRefInput.DeclaredPrefix.
+	DeclaredPrefix string
+	Resolver       ProjectResolver
 }
 
 // TransformExtractedWorkReference gates a bead-ID reference on the BeadID toggle and then
@@ -490,7 +493,7 @@ func (p Policy) TransformExtractedWorkReference(env PolicyEnvelope, raw Extracte
 	if err != nil {
 		return p.failClosed(env, "WORK_REFERENCE", err)
 	}
-	res, err := NewExtractedWorkReference(common, ExtractedWorkRefInput{BeadID: raw.BeadID}, raw.Resolver)
+	res, err := NewExtractedWorkReference(common, ExtractedWorkRefInput{BeadID: raw.BeadID, DeclaredPrefix: raw.DeclaredPrefix}, raw.Resolver)
 	if err != nil {
 		return p.failClosed(env, "WORK_REFERENCE", err)
 	}

@@ -363,7 +363,7 @@ func TestValidEnumErrorHasNoCandidateContent(t *testing.T) {
 // token-shaped string lives in the repository (secret scanners) while the shapes stay realistic.
 func fakeTokenBody(n int, alphabet string, seed uint32) string {
 	var b strings.Builder
-	x := seed | 1
+	x := seed<<1 | 1 // xorshift32 state: odd so never 0, and distinct for distinct seeds
 	for i := 0; i < n; i++ {
 		x ^= x << 13
 		x ^= x >> 17
@@ -377,71 +377,95 @@ const (
 	alnum      = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	lowerAlnum = "abcdefghijklmnopqrstuvwxyz0123456789"
 	digits     = "0123456789"
+	lowerHex   = "0123456789abcdef"
 )
+
+// fakeUUID returns a deterministic UUID-shaped string (8-4-4-4-12 lowercase hex).
+func fakeUUID(seed uint32) string {
+	return fakeTokenBody(8, lowerHex, seed) + "-" + fakeTokenBody(4, lowerHex, seed+1) + "-" +
+		fakeTokenBody(4, lowerHex, seed+2) + "-" + fakeTokenBody(4, lowerHex, seed+3) + "-" +
+		fakeTokenBody(12, lowerHex, seed+4)
+}
+
+// secretFixture is a credential and the declared project prefix it would be captured under.
+type secretFixture struct{ tok, prefix string }
 
 // secretShapedFixtures are dash-joined credential shapes that the alphanumeric/dash bead tail
 // grammar can match whole once a user-chosen project prefix collides with the credential scheme
 // (bts-xpw.13.3.6). Each is under maxBeadID, so the length bound alone does not stop it.
-func secretShapedFixtures() map[string]string {
-	return map[string]string{
-		"anthropic":       "s" + "k-ant-api03-" + fakeTokenBody(93, alnum, 1),
-		"anthropic-short": "s" + "k-ant-" + fakeTokenBody(12, lowerAlnum, 2),
-		"openai-proj":     "s" + "k-proj-" + fakeTokenBody(48, alnum, 3),
-		"slack-bot":       "xox" + "b-" + fakeTokenBody(13, digits, 4) + "-" + fakeTokenBody(13, digits, 5) + "-" + fakeTokenBody(24, alnum, 6),
-		"slack-user":      "xox" + "p-" + fakeTokenBody(12, digits, 7) + "-" + fakeTokenBody(12, digits, 8) + "-" + fakeTokenBody(13, digits, 9) + "-" + fakeTokenBody(32, lowerAlnum, 10),
-		"slack-app":       "xap" + "p-1-" + fakeTokenBody(11, alnum, 11) + "-" + fakeTokenBody(13, digits, 12) + "-" + fakeTokenBody(64, lowerAlnum, 13),
-		"gitlab-pat":      "glp" + "at-" + fakeTokenBody(20, alnum, 14),
-		"gitlab-pat-lc":   "glp" + "at-" + fakeTokenBody(20, lowerAlnum, 15),
-		"xai":             "xa" + "i-" + fakeTokenBody(80, alnum, 16),
-		"pypi":            "py" + "pi-" + fakeTokenBody(100, alnum, 17),
-		// A credential under a prefix not on the list is still caught by its high-entropy body.
-		"unknown-scheme": "acme-" + fakeTokenBody(40, alnum, 18),
-		"mixed-segment":  "acme-" + fakeTokenBody(16, alnum, 19) + "x9Z",
+func secretShapedFixtures() map[string]secretFixture {
+	sk, xoxb, xoxp, xapp := "s"+"k-", "xox"+"b-", "xox"+"p-", "xap"+"p-"
+	glpat, xai, pypi := "glp"+"at-", "xa"+"i-", "py"+"pi-"
+	return map[string]secretFixture{
+		"anthropic":       {sk + "ant-api03-" + fakeTokenBody(93, alnum, 1), sk},
+		"anthropic-short": {sk + "ant-" + fakeTokenBody(12, lowerAlnum, 2), sk},
+		"openai-proj":     {sk + "proj-" + fakeTokenBody(48, alnum, 3), sk},
+		"slack-bot":       {xoxb + fakeTokenBody(13, digits, 4) + "-" + fakeTokenBody(13, digits, 5) + "-" + fakeTokenBody(24, alnum, 6), xoxb},
+		"slack-user":      {xoxp + fakeTokenBody(12, digits, 7) + "-" + fakeTokenBody(12, digits, 8) + "-" + fakeTokenBody(13, digits, 9) + "-" + fakeTokenBody(32, lowerAlnum, 10), xoxp},
+		"slack-app":       {xapp + "1-" + fakeTokenBody(11, alnum, 11) + "-" + fakeTokenBody(13, digits, 12) + "-" + fakeTokenBody(64, lowerAlnum, 13), xapp},
+		"gitlab-pat":      {glpat + fakeTokenBody(20, alnum, 14), glpat},
+		"gitlab-pat-lc":   {glpat + fakeTokenBody(20, lowerAlnum, 15), glpat},
+		"xai":             {xai + fakeTokenBody(80, alnum, 16), xai},
+		"pypi":            {pypi + fakeTokenBody(100, alnum, 17), pypi},
+		// A credential under a scheme not on the list is still caught by its high-entropy body.
+		"unknown-scheme": {"acme-" + fakeTokenBody(40, alnum, 18), "acme-"},
+		"mixed-segment":  {"acme-" + fakeTokenBody(16, alnum, 19) + "x9Z", "acme-"},
+		// UUID-bodied keys under a generic project prefix: every segment is short, so only the
+		// UUID run gives them away (LaunchDarkly api-/sdk-<uuid>, Plaid access-<env>-<uuid>).
+		"launchdarkly-api": {"ap" + "i-" + fakeUUID(20), "api-"},
+		"launchdarkly-sdk": {"sd" + "k-" + fakeUUID(30), "sdk-"},
+		"plaid-access":     {"acc" + "ess-sandbox-" + fakeUUID(40), "access-"},
 	}
 }
 
 // TestSecretShapedBeadIDRejectsCredentials is the redteam fixture set for bts-xpw.13.3.6: every
-// credential shape is screened by SecretShapedBeadID and NewExtractedWorkReference fails closed on
-// it with a BuildError that never carries the value, even when the resolver would map its prefix.
+// credential shape is screened by SecretShapedBeadID, both under the declared prefix it would be
+// captured with and with no prefix, and NewExtractedWorkReference fails closed on it with a
+// BuildError that never carries the value, even though the resolver maps its prefix.
 func TestSecretShapedBeadIDRejectsCredentials(t *testing.T) {
-	pm, err := NewBeadPrefixMap([]BeadPrefixMapping{
-		{Prefix: "s" + "k-", ProjectID: "proj_sk"},
-		{Prefix: "xox" + "b-", ProjectID: "proj_x"},
-		{Prefix: "xox" + "p-", ProjectID: "proj_x"},
-		{Prefix: "xap" + "p-", ProjectID: "proj_x"},
-		{Prefix: "glp" + "at-", ProjectID: "proj_gl"},
-		{Prefix: "xa" + "i-", ProjectID: "proj_x"},
-		{Prefix: "py" + "pi-", ProjectID: "proj_x"},
-		{Prefix: "acme-", ProjectID: "proj_acme"},
-	})
-	if err != nil {
-		t.Fatal(err)
+	fixtures := secretShapedFixtures()
+	var mappings []BeadPrefixMapping
+	for _, f := range fixtures {
+		mappings = append(mappings, BeadPrefixMapping{Prefix: f.prefix, ProjectID: "proj_" + strings.TrimSuffix(f.prefix, "-")})
 	}
-	for name, tok := range secretShapedFixtures() {
-		if len(tok) > maxBeadID {
-			t.Fatalf("%s: fixture is %d bytes; it must be under maxBeadID to exercise the screen", name, len(tok))
+	pm := mustPrefixMap(t, mappings...)
+	for name, f := range fixtures {
+		if len(f.tok) > maxBeadID {
+			t.Fatalf("%s: fixture is %d bytes; it must be under maxBeadID to exercise the screen", name, len(f.tok))
 		}
-		if !SecretShapedBeadID(tok) {
-			t.Errorf("%s: not screened as secret-shaped", name)
-			continue
+		if got := pm.LongestPrefix(f.tok); got != f.prefix {
+			t.Fatalf("%s: longest declared prefix is %q, want %q", name, got, f.prefix)
 		}
-		_, err := NewExtractedWorkReference(testCommon(), ExtractedWorkRefInput{BeadID: tok}, ProjectResolver{Prefixes: pm, DefaultProjectID: "proj_default"})
+		for _, prefix := range []string{f.prefix, ""} {
+			if !SecretShapedBeadID(f.tok, prefix) {
+				t.Errorf("%s: not screened as secret-shaped (declared prefix %q)", name, prefix)
+			}
+		}
+		_, err := NewExtractedWorkReference(testCommon(), ExtractedWorkRefInput{BeadID: f.tok, DeclaredPrefix: f.prefix},
+			ProjectResolver{Prefixes: pm, DefaultProjectID: "proj_default"})
 		mustBuildErr(t, err, name)
-		if strings.Contains(err.Error(), tok) || strings.Contains(err.Error(), tok[len(tok)-8:]) {
+		if strings.Contains(err.Error(), f.tok) || strings.Contains(err.Error(), f.tok[len(f.tok)-8:]) {
 			t.Errorf("%s: build error leaks the credential: %v", name, err)
 		}
 	}
+	// A declared prefix that swallows most of a UUID cannot hide it: the UUID check spans the
+	// whole id, prefix included.
+	ld := fixtures["launchdarkly-api"].tok
+	if !SecretShapedBeadID(ld, ld[:strings.LastIndexByte(ld, '-')+1]) {
+		t.Error("a declared prefix covering part of a UUID hid it from the screen")
+	}
 }
 
-// TestSecretShapedBeadIDKeepsRealBeads: real bead ids — including ones under a prefix that
-// collides with a credential scheme — are not screened.
+// TestSecretShapedBeadIDKeepsRealBeads: real bead ids, including ones under a prefix that
+// collides with a credential scheme, are not screened even with no declared prefix to exempt.
 func TestSecretShapedBeadIDKeepsRealBeads(t *testing.T) {
 	for _, id := range []string{
 		"ga-1tzraj", "ga-1tzraj-repair-merge", "bts-xpw.13.3.6", "ga-a1b2.1", "lego-pilot-7",
 		"gas-city-9", "acme-ops-3", "ABC-123", "proj-internationalization", "bd-0a1b2c3d4e5f",
 		"s" + "k-a1b2c3", "s" + "k-a1b2c3.4.12", "xox" + "b-9z", "glp" + "at-abc", "py" + "pi-3.1",
+		"api-k3x", "sdk-a1b2-retry-backoff", "bd-cafe-bead-face-feed",
 	} {
-		if SecretShapedBeadID(id) {
+		if SecretShapedBeadID(id, "") {
 			t.Errorf("%q: real bead id screened as secret-shaped", id)
 		}
 	}
@@ -450,8 +474,83 @@ func TestSecretShapedBeadIDKeepsRealBeads(t *testing.T) {
 		"s" + "k-ant-a1b2", "s" + "k-a1b2-slug", "s" + "k-A1b2", "s" + "k-a1b2.", "s" + "k-a1b2.x",
 		"s" + "k-" + strings.Repeat("a", maxStrictBeadHash+1),
 	} {
-		if !SecretShapedBeadID(id) {
-			t.Errorf("%q: credential-prefixed id outside the strict bead shape was not screened", id)
+		for _, prefix := range []string{"", "s" + "k-"} {
+			if !SecretShapedBeadID(id, prefix) {
+				t.Errorf("%q (declared prefix %q): credential-prefixed id outside the strict bead shape was not screened", id, prefix)
+			}
 		}
+	}
+}
+
+// TestSecretShapedBeadIDExemptsTheDeclaredPrefix: BTS project prefixes are user-chosen, up to 32
+// characters, in mixed case, and may begin with a credential scheme. Such a prefix is
+// configuration, not token material, so with the declared prefix known only the rest of the id is
+// screened and the project's real beads are kept. With the prefix unknown the same ids are
+// screened, which is why the extractor always passes the prefix it matched.
+func TestSecretShapedBeadIDExemptsTheDeclaredPrefix(t *testing.T) {
+	for _, c := range []struct{ id, prefix string }{
+		{"PlatformServices-a1b2", "PlatformServices-"},
+		{"CustomerPortalV2-a1b2.3", "CustomerPortalV2-"},
+		{"projectphoenix2026-q7x", "projectphoenix2026-"},
+		{"ops-ReleaseTrain2026-x9z-cut-branch", "ops-ReleaseTrain2026-"},
+		{"s" + "k-team-a1b2", "s" + "k-team-"},
+		{"xa" + "i-research-a1b2.1", "xa" + "i-research-"},
+		{"py" + "pi-mirror-k3", "py" + "pi-mirror-"},
+	} {
+		if SecretShapedBeadID(c.id, c.prefix) {
+			t.Errorf("%q under declared prefix %q: real bead id screened as secret-shaped", c.id, c.prefix)
+		}
+		if !SecretShapedBeadID(c.id, "") {
+			t.Errorf("%q: the whole-id screen (no declared prefix) did not reject it", c.id)
+		}
+	}
+	// The exemption covers only the prefix: a credential-shaped remainder is still screened.
+	for _, c := range []struct{ id, prefix string }{
+		{"PlatformServices-" + fakeTokenBody(24, alnum, 50), "PlatformServices-"},
+		{"s" + "k-team-a1b2-slug", "s" + "k-team-"},
+		{"s" + "k-team-" + fakeTokenBody(20, lowerAlnum, 51), "s" + "k-team-"},
+	} {
+		if !SecretShapedBeadID(c.id, c.prefix) {
+			t.Errorf("declared prefix %q: credential-shaped remainder not screened", c.prefix)
+		}
+	}
+	// Only a dash-terminated proper prefix of the id, at most maxBeadPrefix bytes, is honored;
+	// anything else falls back to screening the whole id.
+	id := "PlatformServices-a1b2"
+	for _, bogus := range []string{"Other-", "PlatformServices", "platformservices-", id, id + "-"} {
+		if !SecretShapedBeadID(id, bogus) {
+			t.Errorf("malformed declared prefix %q was honored", bogus)
+		}
+	}
+	long := strings.Repeat("Ab1", 22) + "-"
+	if !SecretShapedBeadID(long+"a1b2", long) {
+		t.Errorf("a %d-byte declared prefix (max %d) was honored", len(long), maxBeadPrefix)
+	}
+}
+
+// TestExtractedWorkReferenceKeepsBeadsUnderDeclaredPrefix: the constructor's fail-closed screen
+// sees the declared prefix the extractor matched, so a real bead of a project with a long,
+// mixed-case or credential-colliding prefix resolves to its project instead of failing closed.
+func TestExtractedWorkReferenceKeepsBeadsUnderDeclaredPrefix(t *testing.T) {
+	pm := mustPrefixMap(t,
+		BeadPrefixMapping{Prefix: "PlatformServices-", ProjectID: "btsproj_ps"},
+		BeadPrefixMapping{Prefix: "s" + "k-team-", ProjectID: "btsproj_skteam"},
+	)
+	for bead, want := range map[string]string{"PlatformServices-a1b2": "btsproj_ps", "s" + "k-team-a1b2.1": "btsproj_skteam"} {
+		in := ExtractedWorkRefInput{BeadID: bead, DeclaredPrefix: pm.LongestPrefix(bead)}
+		res, err := NewExtractedWorkReference(testCommon(), in, ProjectResolver{Prefixes: pm})
+		if err != nil {
+			t.Fatalf("%s: %v", bead, err)
+		}
+		if res.Dropped() {
+			t.Fatalf("%s: dropped (%s)", bead, res.DropReason)
+		}
+		wr, err := sealOne(t, *res.Resolved, 1, "obs_1").AsWorkReferenceObservation()
+		if err != nil || wr.WorkReference.TeamServerProjectId != want || wr.WorkReference.BeadId != bead {
+			t.Errorf("%s -> %+v (%v), want project %s", bead, wr.WorkReference, err, want)
+		}
+		// Without its declared prefix the constructor screens the whole id and fails closed.
+		_, err = NewExtractedWorkReference(testCommon(), ExtractedWorkRefInput{BeadID: bead}, ProjectResolver{Prefixes: pm})
+		mustBuildErr(t, err, bead+" without its declared prefix")
 	}
 }

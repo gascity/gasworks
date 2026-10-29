@@ -280,18 +280,32 @@ func extractBeads(surface wire.ExtractionProvenanceSurface, text string, cfg Ref
 		if id == "" || !re.MatchString(id) {
 			continue
 		}
-		if evidence.SecretShapedBeadID(id) {
+		prefix := declaredPrefix(id, snap, cfg.BeadPrefixes)
+		if evidence.SecretShapedBeadID(id, prefix) {
 			// Prefixes are user-chosen project prefixes, so a credential (sk-ant-…, xoxb-…,
-			// glpat-…) can match the bead grammar whole. Drop it before it becomes a candidate:
-			// no reference, no distinct-ref cap slot, no diagnostic carrying the value.
+			// glpat-…, api-<uuid>) can match the bead grammar whole. Drop it before it becomes a
+			// candidate: no reference, no distinct-ref cap slot, no diagnostic carrying the value.
 			continue
 		}
 		out = append(out, ExtractedReference{
 			Kind: RefKindBead,
-			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: id, Resolver: resolver},
+			Work: &evidence.ExtractedWorkReferenceCandidate{BeadID: id, DeclaredPrefix: prefix, Resolver: resolver},
 		})
 	}
 	return out
+}
+
+// declaredPrefix returns the longest declared capture prefix (mapped or static) that id begins
+// with. The secret-shape screen treats it as configuration and screens only the rest of the id,
+// and the candidate carries it so NewExtractedWorkReference repeats the identical check.
+func declaredPrefix(id string, snap *evidence.BeadPrefixMap, static []string) string {
+	p := snap.LongestPrefix(id)
+	for _, s := range static {
+		if len(s) > len(p) && strings.HasPrefix(id, s) {
+			p = s
+		}
+	}
+	return p
 }
 
 // branchOperandFlags are the git flags whose following token is a caller-chosen name/value, never a

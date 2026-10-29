@@ -25,20 +25,23 @@ func TestBeadPrefixMapLongestPrefixMatch(t *testing.T) {
 		BeadPrefixMapping{Prefix: "acme-", ProjectID: "proj_acme"},
 	)
 	cases := []struct {
-		bead, want string
-		ok         bool
+		bead, want, prefix string
+		ok                 bool
 	}{
-		{"gas-city-12", "proj_gascity", true},
-		{"gas-12", "proj_gas", true},
-		{"gas-cityx-1", "proj_gas", true},
-		{"acme-9a", "proj_acme", true},
-		{"beta-1", "", false},
-		{"acme", "", false},
+		{"gas-city-12", "proj_gascity", "gas-city-", true},
+		{"gas-12", "proj_gas", "gas-", true},
+		{"gas-cityx-1", "proj_gas", "gas-", true},
+		{"acme-9a", "proj_acme", "acme-", true},
+		{"beta-1", "", "", false},
+		{"acme", "", "", false},
 	}
 	for _, c := range cases {
 		got, ok := pm.Lookup(c.bead)
 		if got != c.want || ok != c.ok {
 			t.Errorf("Lookup(%q) = %q,%v want %q,%v", c.bead, got, ok, c.want, c.ok)
+		}
+		if p := pm.LongestPrefix(c.bead); p != c.prefix {
+			t.Errorf("LongestPrefix(%q) = %q, want %q", c.bead, p, c.prefix)
 		}
 	}
 	if got := pm.Prefixes(); len(got) != 3 || got[0] != "gas-city-" {
@@ -48,7 +51,7 @@ func TestBeadPrefixMapLongestPrefixMatch(t *testing.T) {
 		t.Errorf("clean map reported problems: %s", p)
 	}
 	var nilMap *BeadPrefixMap
-	if _, ok := nilMap.Lookup("gas-1"); ok || nilMap.Len() != 0 || nilMap.Prefixes() != nil || nilMap.Problems() != "" {
+	if _, ok := nilMap.Lookup("gas-1"); ok || nilMap.Len() != 0 || nilMap.Prefixes() != nil || nilMap.Problems() != "" || nilMap.LongestPrefix("gas-1") != "" {
 		t.Error("nil map must behave as empty")
 	}
 }
@@ -129,6 +132,9 @@ func TestBeadPrefixMapAmbiguousPrefixNeverLinks(t *testing.T) {
 	}
 	if pm.Len() != 4 {
 		t.Errorf("Len = %d, want 4 (ambiguous prefixes stay captured)", pm.Len())
+	}
+	if p := pm.LongestPrefix("gas-city-12"); p != "gas-city-" {
+		t.Errorf("LongestPrefix must include ambiguous prefixes (still captured), got %q", p)
 	}
 	if p := pm.Problems(); p != "2 prefixes declared for more than one project resolve to no project: FE-, gas-city-" {
 		t.Errorf("problems = %q", p)
