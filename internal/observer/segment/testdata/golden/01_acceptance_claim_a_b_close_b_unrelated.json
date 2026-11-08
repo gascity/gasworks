@@ -1,0 +1,114 @@
+{
+  "name": "01_acceptance_claim_a_b_close_b_unrelated",
+  "description": "The K9-T acceptance session: claim A, claim B, close B (A is current again), close A, then unrelated work. Segments A, B, A, none.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "bd close gc-b",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u4",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c4",
+      "command": "bd close gc-a",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u5",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1",
+          "u2"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "c3",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": "gc-a",
+        "open_ref": "c3",
+        "close_ref": "c4",
+        "usage_refs": [
+          "u4"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c4",
+        "close_ref": "",
+        "usage_refs": [
+          "u5"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

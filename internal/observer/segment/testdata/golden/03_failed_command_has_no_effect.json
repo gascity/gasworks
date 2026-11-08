@@ -1,0 +1,65 @@
+{
+  "name": "03_failed_command_has_no_effect",
+  "description": "A bd command whose tool result is an error never changes the current bead.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": true
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "c3",
+      "command": "bd close gc-b",
+      "result": "",
+      "is_error": true
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": null,
+        "open_ref": "",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

@@ -1,0 +1,151 @@
+{
+  "name": "07_status_and_assignee",
+  "description": "--status in_progress (any spelling of the flag) opens; any other status closes; a reassignment closes.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --status in_progress",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-a --status=open",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "bd update gc-b -s in_progress",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c4",
+      "command": "bd update gc-b --assignee someone-else",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u4",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c5",
+      "command": "bd update gc-c --status=in_progress --title 'fix-up thing'",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u5",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c6",
+      "command": "bd update gc-c -s closed",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u6",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c2",
+        "close_ref": "c3",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c3",
+        "close_ref": "c4",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c4",
+        "close_ref": "c5",
+        "usage_refs": [
+          "u4"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-c",
+        "open_ref": "c5",
+        "close_ref": "c6",
+        "usage_refs": [
+          "u5"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c6",
+        "close_ref": "",
+        "usage_refs": [
+          "u6"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}
