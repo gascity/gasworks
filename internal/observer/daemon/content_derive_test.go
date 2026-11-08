@@ -4,9 +4,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -230,5 +234,166 @@ func TestContentUploadDerivedSessionIsTheLastResort(t *testing.T) {
 	u2.tick(context.Background())
 	if sender2.count() != 1 || sender2.at(0).NativeSessionID != "threaded-id" {
 		t.Fatalf("marker session not preferred over the derived one: count=%d", sender2.count())
+	}
+}
+
+func TestIsClaudeSubagentTranscript(t *testing.T) {
+	cases := []struct {
+		locator string
+		want    bool
+	}{
+		{"-work-p/" + derivedClaudeUUID + "/subagents/agent-a1b2c3.jsonl", true},
+		{"/home/u/.claude/projects/-work-p/" + derivedClaudeUUID + "/subagents/agent-0123456789abcdef.jsonl", true},
+		{"-work-p/agent-a1b2c3.jsonl", true}, // the older layout, beside the session's transcript
+		{"-work-p/agent-A1B2C3.jsonl", true},
+		{"-work-p/" + derivedClaudeUUID + ".jsonl", false},
+		{"-work-p/agent-.jsonl", false},
+		{"-work-p/agent-xyz.jsonl", false},
+		{"-work-p/agent-a1b2c3.json", false},
+		{"2026/10/17/rollout-2026-10-17T12-34-56-" + derivedCodexUUID + ".jsonl", false},
+	}
+	for _, c := range cases {
+		if got := isClaudeSubagentTranscript(c.locator); got != c.want {
+			t.Errorf("isClaudeSubagentTranscript(%q) = %v, want %v", c.locator, got, c.want)
+		}
+	}
+}
+
+// TestContentUploadLiveSubagentTranscriptNeverUploaded is the regression for bts-xpw.204.9.10. On the
+// LIVE path (no restart) the production sink threads a Claude subagent transcript to its parent's
+// native session id, because every subagent record carries the parent's sessionId. Uploaded under that
+// id, the subagent's bytes replaced the parent session's snapshot in the content store. Now the
+// subagent transcript is never read, keyed, queued or uploaded; the parent's transcript is, and the
+// subagent's usage still threads under the parent's session on the metadata lane.
+func TestContentUploadLiveSubagentTranscriptNeverUploaded(t *testing.T) {
+	root, state := t.TempDir(), t.TempDir()
+	claudeDir := filepath.Join(root, "-work-p")
+	subagentDir := filepath.Join(claudeDir, derivedClaudeUUID, "subagents")
+	if err := os.MkdirAll(subagentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(claudeDir, derivedClaudeUUID+".jsonl")
+	subagent := filepath.Join(subagentDir, "agent-a1b2c3d4.jsonl")
+	bodies := map[string]string{
+		parent:   claudeTranscriptLines(derivedClaudeUUID),
+		subagent: claudeTranscriptLines(derivedClaudeUUID),
+	}
+	idOf := map[string]transcriptIdentity{}
+	for p, b := range bodies {
+		if err := os.WriteFile(p, []byte(b), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st := info.Sys().(*syscall.Stat_t)
+		idOf[p] = transcriptIdentity{device: uint64(st.Dev), inode: st.Ino}
+	}
+
+	spoolDir := t.TempDir()
+	srv := startDaemonServer(t, spoolDir, newSpoolWriter(t, spoolDir), NewRegistry("src_test", "ws_main"))
+	sink := newSink(t, local.NewClient(srv.SocketPath()))
+	clock := newClock()
+	sender := &fakeContentSender{}
+	var logMu sync.Mutex
+	var logs []string
+	cu, err := newContentUploader(contentUploaderConfig{
+		sender:   sender,
+		sessions: sink,
+		stateDir: state,
+		read:     codex.ReadValidatedTranscript,
+		now:      clock.now,
+		debounce: 30 * time.Second,
+		log: func(s string) {
+			logMu.Lock()
+			defer logMu.Unlock()
+			logs = append(logs, s)
+		},
+	})
+	if err != nil {
+		t.Fatalf("newContentUploader: %v", err)
+	}
+	w, err := codex.NewWatcher(codex.WatchConfig{
+		ApprovedRoots:   []string{root},
+		StateDir:        state,
+		Sink:            NewPartialCandidateSinkAdapter(sink),
+		References:      codex.ReferenceConfig{Resolver: evidence.ProjectResolver{DefaultProjectID: "proj_test"}},
+		ContentObserver: cu,
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	if err := w.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	// The precondition of the bug: the live sink threads the subagent under its parent's id.
+	if got, _, ok := sink.SessionFor(idOf[subagent].device, idOf[subagent].inode); !ok || got != derivedClaudeUUID {
+		t.Fatalf("live sink threaded the subagent as (%q, %v), want its parent's %q; the test no longer covers the bug", got, ok, derivedClaudeUUID)
+	}
+	clock.advance(31 * time.Second)
+	cu.tick(context.Background())
+
+	if sender.count() != 1 || sender.at(0).SourcePath != parent || sender.at(0).NativeSessionID != derivedClaudeUUID {
+		for i := 0; i < sender.count(); i++ {
+			t.Logf("upload %d: %s as %q", i, sender.at(i).SourcePath, sender.at(i).NativeSessionID)
+		}
+		t.Fatalf("uploads = %d, want only the parent's transcript under its own id", sender.count())
+	}
+	if _, err := os.Stat(filepath.Join(state, contentPendingName(idOf[subagent].device, idOf[subagent].inode))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a pending record was written for the subagent transcript (stat err %v)", err)
+	}
+
+	// It grows: still never uploaded, and logged and counted once.
+	if err := os.WriteFile(subagent, []byte(bodies[subagent]+claudeTranscriptLines(derivedClaudeUUID)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Poll(context.Background()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	clock.advance(31 * time.Second)
+	cu.tick(context.Background())
+	if sender.count() != 1 {
+		t.Fatalf("uploads after the subagent grew = %d, want still 1", sender.count())
+	}
+	cu.mu.Lock()
+	skips := cu.subagentSkips
+	cu.mu.Unlock()
+	logMu.Lock()
+	defer logMu.Unlock()
+	n := 0
+	for _, l := range logs {
+		if strings.Contains(l, "subagent transcript") {
+			n++
+		}
+	}
+	if skips != 1 || n != 1 {
+		t.Fatalf("subagent skips counted %d, logged %d; want 1 each (logs %q)", skips, n, logs)
+	}
+}
+
+// A pending record an earlier release wrote for a Claude subagent transcript (under its parent's id)
+// is not owed: the uploader discards it at startup instead of ever keying the subagent by it.
+func TestContentUploadDiscardsPendingRecordOfASubagentTranscript(t *testing.T) {
+	state := t.TempDir()
+	write := func(ino uint64, locator string) string {
+		t.Helper()
+		data, _ := json.Marshal(contentPending{Version: contentPendingVersion, Device: 7, Inode: ino, NativeSessionID: derivedClaudeUUID, Provider: "claude", Locator: locator, Size: 1, ModNanos: 1})
+		name := contentPendingName(7, ino)
+		if err := writeStateFile(state, name, contentPendingTempPrefix, data); err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(state, name)
+	}
+	sub := write(1, "-work-p/"+derivedClaudeUUID+"/subagents/agent-a1b2c3d4.jsonl")
+	own := write(2, "-work-p/"+derivedClaudeUUID+".jsonl")
+	if _, err := newContentUploader(contentUploaderConfig{sender: &fakeContentSender{}, sessions: newSessions(), stateDir: state}); err != nil {
+		t.Fatalf("newContentUploader: %v", err)
+	}
+	if _, err := os.Stat(sub); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the subagent's pending record survived startup (stat err %v)", err)
+	}
+	if _, err := os.Stat(own); err != nil {
+		t.Fatalf("the parent's pending record was discarded: %v", err)
 	}
 }

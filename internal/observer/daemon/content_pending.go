@@ -249,8 +249,8 @@ func (u *contentUploader) sweepPending() {
 	}
 }
 
-// sweepContentPending deletes the pending records in stateDir that keep rejects, and anything under a
-// record's name that cannot be read as one, returning how many it deleted. A record it cannot delete
+// sweepContentPending deletes the pending records in stateDir that keep rejects, every record of a Claude
+// subagent transcript, and anything under a record's name that cannot be read as one, returning how many it deleted. A record it cannot delete
 // does not stop it: it deletes every other one it should, and reports each failure in the error. An
 // absent state dir holds none.
 func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, error) {
@@ -269,7 +269,9 @@ func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, e
 			continue
 		}
 		path := filepath.Join(stateDir, name)
-		if p, ok := readContentPending(path); ok && keep(p.origin()) {
+		// A record an earlier release wrote for a Claude subagent transcript is never owed: the
+		// content lane does not upload subagent transcripts (isClaudeSubagentTranscript).
+		if p, ok := readContentPending(path); ok && keep(p.origin()) && !isClaudeSubagentTranscript(p.Locator) {
 			continue
 		}
 		switch err := os.Remove(path); {
