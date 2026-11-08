@@ -230,7 +230,7 @@ func pendingConsentedBy(src *consent.Source, origin consentOrigin) bool {
 // with a collector cannot send it.
 func followQueuedContentConsent(src *consent.Source, stateDir string, log func(string)) {
 	sweep := func() {
-		if _, err := sweepContentPending(stateDir, func(o consentOrigin) bool { return pendingConsentedBy(src, o) }); err != nil && log != nil {
+		if _, _, err := sweepContentPending(stateDir, func(o consentOrigin) bool { return pendingConsentedBy(src, o) }); err != nil && log != nil {
 			log(fmt.Sprintf("content upload: discard content queued under withdrawn consent: %v", err))
 		}
 	}
@@ -244,24 +244,24 @@ func followQueuedContentConsent(src *consent.Source, stateDir string, log func(s
 func (u *contentUploader) sweepPending() {
 	u.pendingMu.Lock()
 	defer u.pendingMu.Unlock()
-	if _, err := sweepContentPending(u.stateDir, u.pendingConsented); err != nil {
+	if _, _, err := sweepContentPending(u.stateDir, u.pendingConsented); err != nil {
 		u.logf("content upload: discard content queued under withdrawn consent: %v", err)
 	}
 }
 
-// sweepContentPending deletes the pending records in stateDir that keep rejects, every record of a Claude
-// subagent transcript, and anything under a record's name that cannot be read as one, returning how many it deleted. A record it cannot delete
-// does not stop it: it deletes every other one it should, and reports each failure in the error. An
-// absent state dir holds none.
-func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, error) {
+// sweepContentPending deletes the pending records in stateDir that keep rejects or that name a Claude
+// subagent transcript, and anything under a record's name that cannot be read as one. It returns how
+// many it deleted and, of those, how many named a subagent transcript. A record it cannot delete does
+// not stop it: it deletes every other one it should, and reports each failure in the error. An absent
+// state dir holds none.
+func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (removed, subagents int, err error) {
 	entries, err := os.ReadDir(stateDir)
 	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+		return 0, 0, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", stateDir, err)
+		return 0, 0, fmt.Errorf("read %s: %w", stateDir, err)
 	}
-	removed := 0
 	var failed []error
 	for _, e := range entries {
 		name := e.Name()
@@ -271,19 +271,24 @@ func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, e
 		path := filepath.Join(stateDir, name)
 		// A record an earlier release wrote for a Claude subagent transcript is never owed: the
 		// content lane does not upload subagent transcripts (isClaudeSubagentTranscript).
-		if p, ok := readContentPending(path); ok && keep(p.origin()) && !isClaudeSubagentTranscript(p.Locator) {
+		p, ok := readContentPending(path)
+		subagent := ok && isClaudeSubagentTranscript(p.Locator)
+		if ok && !subagent && keep(p.origin()) {
 			continue
 		}
 		switch err := os.Remove(path); {
 		case err == nil:
 			removed++
+			if subagent {
+				subagents++
+			}
 		case errors.Is(err, os.ErrNotExist):
 			// Deleted meanwhile (the transcript was forgotten or accepted).
 		default:
 			failed = append(failed, fmt.Errorf("delete %s: %w", name, err))
 		}
 	}
-	return removed, errors.Join(failed...)
+	return removed, subagents, errors.Join(failed...)
 }
 
 // DiscardQueuedContent deletes the content an earlier run queued for upload and never had accepted,
@@ -294,7 +299,8 @@ func sweepContentPending(stateDir string, keep func(consentOrigin) bool) (int, e
 // switching content upload off withdraws consent for that queue, so a later run that uploads content
 // again must not send it.
 func DiscardQueuedContent(stateDir string) (int, error) {
-	return sweepContentPending(stateDir, func(consentOrigin) bool { return false })
+	n, _, err := sweepContentPending(stateDir, func(consentOrigin) bool { return false })
+	return n, err
 }
 
 // writeStateFile atomically replaces dir/name with data, owner-only: a temporary file named with

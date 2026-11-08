@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -274,9 +275,11 @@ func TestContentUploadLiveSubagentTranscriptNeverUploaded(t *testing.T) {
 	}
 	parent := filepath.Join(claudeDir, derivedClaudeUUID+".jsonl")
 	subagent := filepath.Join(subagentDir, "agent-a1b2c3d4.jsonl")
+	second := filepath.Join(subagentDir, "agent-e5f6a7b8.jsonl")
 	bodies := map[string]string{
 		parent:   claudeTranscriptLines(derivedClaudeUUID),
 		subagent: claudeTranscriptLines(derivedClaudeUUID),
+		second:   claudeTranscriptLines(derivedClaudeUUID),
 	}
 	idOf := map[string]transcriptIdentity{}
 	for p, b := range bodies {
@@ -327,9 +330,11 @@ func TestContentUploadLiveSubagentTranscriptNeverUploaded(t *testing.T) {
 	if err := w.Poll(context.Background()); err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	// The precondition of the bug: the live sink threads the subagent under its parent's id.
-	if got, _, ok := sink.SessionFor(idOf[subagent].device, idOf[subagent].inode); !ok || got != derivedClaudeUUID {
-		t.Fatalf("live sink threaded the subagent as (%q, %v), want its parent's %q; the test no longer covers the bug", got, ok, derivedClaudeUUID)
+	// The precondition of the bug: the live sink threads each subagent under its parent's id.
+	for _, p := range []string{subagent, second} {
+		if got, _, ok := sink.SessionFor(idOf[p].device, idOf[p].inode); !ok || got != derivedClaudeUUID {
+			t.Fatalf("live sink threaded the subagent %s as (%q, %v), want its parent's %q; the test no longer covers the bug", filepath.Base(p), got, ok, derivedClaudeUUID)
+		}
 	}
 	clock.advance(31 * time.Second)
 	cu.tick(context.Background())
@@ -340,11 +345,14 @@ func TestContentUploadLiveSubagentTranscriptNeverUploaded(t *testing.T) {
 		}
 		t.Fatalf("uploads = %d, want only the parent's transcript under its own id", sender.count())
 	}
-	if _, err := os.Stat(filepath.Join(state, contentPendingName(idOf[subagent].device, idOf[subagent].inode))); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a pending record was written for the subagent transcript (stat err %v)", err)
+	for _, p := range []string{subagent, second} {
+		if _, err := os.Stat(filepath.Join(state, contentPendingName(idOf[p].device, idOf[p].inode))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a pending record was written for the subagent transcript %s (stat err %v)", filepath.Base(p), err)
+		}
 	}
 
-	// It grows: still never uploaded, and logged and counted once.
+	// It grows: still never uploaded. Each subagent transcript is counted once, and only the run's
+	// first skip is logged.
 	if err := os.WriteFile(subagent, []byte(bodies[subagent]+claudeTranscriptLines(derivedClaudeUUID)), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -367,33 +375,52 @@ func TestContentUploadLiveSubagentTranscriptNeverUploaded(t *testing.T) {
 			n++
 		}
 	}
-	if skips != 1 || n != 1 {
-		t.Fatalf("subagent skips counted %d, logged %d; want 1 each (logs %q)", skips, n, logs)
+	if skips != 2 || n != 1 {
+		t.Fatalf("subagent skips counted %d, logged %d; want 2 counted, 1 logged (logs %q)", skips, n, logs)
 	}
 }
 
 // A pending record an earlier release wrote for a Claude subagent transcript (under its parent's id)
-// is not owed: the uploader discards it at startup instead of ever keying the subagent by it.
+// is not owed: the uploader discards it at startup instead of ever keying the subagent by it, and logs
+// it apart from content discarded because the consent it was queued under no longer applies.
 func TestContentUploadDiscardsPendingRecordOfASubagentTranscript(t *testing.T) {
 	state := t.TempDir()
-	write := func(ino uint64, locator string) string {
+	write := func(ino uint64, locator, consentRoot string) string {
 		t.Helper()
-		data, _ := json.Marshal(contentPending{Version: contentPendingVersion, Device: 7, Inode: ino, NativeSessionID: derivedClaudeUUID, Provider: "claude", Locator: locator, Size: 1, ModNanos: 1})
+		data, _ := json.Marshal(contentPending{Version: contentPendingVersion, Device: 7, Inode: ino, NativeSessionID: derivedClaudeUUID, Provider: "claude", ConsentRoot: consentRoot, Locator: locator, Size: 1, ModNanos: 1})
 		name := contentPendingName(7, ino)
 		if err := writeStateFile(state, name, contentPendingTempPrefix, data); err != nil {
 			t.Fatal(err)
 		}
 		return filepath.Join(state, name)
 	}
-	sub := write(1, "-work-p/"+derivedClaudeUUID+"/subagents/agent-a1b2c3d4.jsonl")
-	own := write(2, "-work-p/"+derivedClaudeUUID+".jsonl")
-	if _, err := newContentUploader(contentUploaderConfig{sender: &fakeContentSender{}, sessions: newSessions(), stateDir: state}); err != nil {
+	sub := write(1, "-work-p/"+derivedClaudeUUID+"/subagents/agent-a1b2c3d4.jsonl", "")
+	own := write(2, "-work-p/"+derivedClaudeUUID+".jsonl", "")
+	// Queued under a live consent policy, which this static-configuration uploader cannot honour.
+	withdrawn := write(3, "-work-q/"+derivedClaudeUUID+".jsonl", "/work-q")
+	var discarded []string
+	log := func(s string) {
+		if strings.Contains(s, "discarded") {
+			discarded = append(discarded, s)
+		}
+	}
+	if _, err := newContentUploader(contentUploaderConfig{sender: &fakeContentSender{}, sessions: newSessions(), stateDir: state, log: log}); err != nil {
 		t.Fatalf("newContentUploader: %v", err)
 	}
 	if _, err := os.Stat(sub); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the subagent's pending record survived startup (stat err %v)", err)
 	}
+	if _, err := os.Stat(withdrawn); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the pending record queued under withdrawn consent survived startup (stat err %v)", err)
+	}
 	if _, err := os.Stat(own); err != nil {
 		t.Fatalf("the parent's pending record was discarded: %v", err)
+	}
+	want := []string{
+		"content upload: discarded the queued content of 1 Claude subagent transcripts an earlier release queued: the content lane never uploads a subagent transcript",
+		"content upload: discarded the queued content of 1 transcripts: the consent it was queued under no longer applies",
+	}
+	if !slices.Equal(discarded, want) {
+		t.Fatalf("startup discard lines = %q, want %q", discarded, want)
 	}
 }

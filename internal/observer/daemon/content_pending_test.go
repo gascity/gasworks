@@ -517,9 +517,9 @@ func TestSweepContentPendingContinuesPastAFailedDelete(t *testing.T) {
 	withdrawn := record(2, 2, "/withdrawn")
 	kept := record(3, 3, "/kept")
 
-	n, err := sweepContentPending(dir, func(o consentOrigin) bool { return o.root == "/kept" })
-	if n != 1 {
-		t.Fatalf("deleted %d records, want the 1 withdrawn one", n)
+	n, subagents, err := sweepContentPending(dir, func(o consentOrigin) bool { return o.root == "/kept" })
+	if n != 1 || subagents != 0 {
+		t.Fatalf("deleted %d records (%d of a subagent transcript), want the 1 withdrawn one", n, subagents)
 	}
 	if err == nil || !strings.Contains(err.Error(), contentPendingName(1, 1)) {
 		t.Fatalf("sweep error = %v, want it to report the record it could not delete", err)

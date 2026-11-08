@@ -287,9 +287,9 @@ type contentState struct {
 	// guardLogged latches the once-per-transcript log + count of an always-on content-guard refusal,
 	// so a persistently-refused file does not re-log or re-count on every tick.
 	guardLogged bool
-	// subagentLogged latches the once-per-transcript log + count of a Claude subagent transcript the
-	// content lane skips.
-	subagentLogged bool
+	// subagentCounted latches the once-per-transcript count of a Claude subagent transcript the content
+	// lane skips (recordSubagentSkipLocked).
+	subagentCounted bool
 }
 
 // newContentUploader validates cfg and returns a ready uploader.
@@ -350,9 +350,13 @@ func newContentUploader(cfg contentUploaderConfig) (*contentUploader, error) {
 		guardRefusals: map[contentguard.Reason]int{},
 	}
 	// Content an earlier run queued under consent that no longer applies — withdrawn or re-registered
-	// while the daemon was stopped — is discarded before anything can key it.
-	n, err := sweepContentPending(u.stateDir, u.pendingConsented)
-	if n > 0 {
+	// while the daemon was stopped — is discarded before anything can key it, and so is the content an
+	// earlier release queued for a Claude subagent transcript, which the content lane never uploads.
+	n, subagents, err := sweepContentPending(u.stateDir, u.pendingConsented)
+	if subagents > 0 {
+		u.logf("content upload: discarded the queued content of %d Claude subagent transcripts an earlier release queued: the content lane never uploads a subagent transcript", subagents)
+	}
+	if n -= subagents; n > 0 {
 		u.logf("content upload: discarded the queued content of %d transcripts: the consent it was queued under no longer applies", n)
 	}
 	if err != nil {
@@ -501,7 +505,8 @@ func (u *contentUploader) plan(now time.Time) ([]contentJob, []pendingSave) {
 		// A Claude subagent transcript is never uploaded: its records carry its parent's session id,
 		// so whatever keyed it would replace the parent session's snapshot in the content store
 		// (isClaudeSubagentTranscript). It is skipped before its session is resolved or a pending
-		// record is loaded or written, and never read; logged and counted once per transcript.
+		// record is loaded or written, and never read; counted once per transcript, and the run's
+		// first is logged (recordSubagentSkipLocked).
 		if isClaudeSubagentTranscript(st.locator) {
 			u.recordSubagentSkipLocked(st)
 			st.markEvaluated(st.size, st.modNanos, st.gcSessionID)
@@ -1171,15 +1176,20 @@ func (u *contentUploader) recordGuardRefusalLocked(st *contentState, locator str
 	u.logf("content upload: refusing %s: %s guard", locator, reason)
 }
 
-// recordSubagentSkipLocked logs and counts, once per transcript, a Claude subagent transcript the
-// content lane skips. Called under u.mu.
+// recordSubagentSkipLocked counts, once per transcript, a Claude subagent transcript the content lane
+// skips, and logs the first one of the run. Only the first is logged: subagent transcripts can be most
+// of a machine's Claude transcripts, each is skipped by its name alone, and none ever gets a marker,
+// so a line per transcript would repeat every one of them after each restart and bury every other
+// content-upload line. Called under u.mu.
 func (u *contentUploader) recordSubagentSkipLocked(st *contentState) {
-	if st.subagentLogged {
+	if st.subagentCounted {
 		return
 	}
-	st.subagentLogged = true
+	st.subagentCounted = true
 	u.subagentSkips++
-	u.logf("content upload: skipping %s: a Claude subagent transcript carries its parent's session id and would replace the parent's snapshot", st.locator)
+	if u.subagentSkips == 1 {
+		u.logf("content upload: skipping Claude subagent transcripts (agent-<hex>.jsonl; first: %s): a subagent's records carry its parent's session id, so uploading one would replace the parent session's snapshot; the rest are skipped without a line", st.locator)
+	}
 }
 
 // serverMessage renders the collector's typed error message as a log suffix, or "" when the
