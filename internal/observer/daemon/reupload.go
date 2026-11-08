@@ -148,6 +148,7 @@ type ReuploadReport struct {
 	NativeDiffersName  int // located Claude transcripts whose marker id is not their file's uuid (resumed/forked)
 	Unkeyed            int // located, but neither marker nor name yields a valid native session id
 	Guarded            int // refused by the always-on content guards
+	Subagent           int // located Claude subagent transcripts, never sent: their records carry the parent's session id (isClaudeSubagentTranscript)
 	Oversize           int
 	ReadErrors         int
 	Sent               int // transcripts POSTed (counted once, however many attempts)
@@ -265,6 +266,12 @@ func RunContentReupload(ctx context.Context, cfg ReuploadConfig) (ReuploadReport
 			continue
 		}
 		rep.Located++
+		if isClaudeSubagentTranscript(f.locator) {
+			// An earlier release uploaded it under its parent's session id, replacing the parent's
+			// snapshot; re-sending it would do so again.
+			rep.Subagent++
+			continue
+		}
 		it := reuploadItem{marker: m, root: f.root, locator: f.locator, path: f.path}
 		nameNative, nameProvider, named := deriveSessionFromName(f.locator)
 		switch {

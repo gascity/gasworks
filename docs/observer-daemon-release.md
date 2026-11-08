@@ -375,6 +375,16 @@ always-on content guard (secret-filename denylist, per-provider transcript-shape
 PEM/PKCS key sniff) working as designed, but it can refuse a file that previously uploaded.
 Read the refusals on day one.
 
+New since older builds: a Claude subagent transcript (`agent-<hex>.jsonl`, under
+`<project>/<session>/subagents/` or beside the session's transcript) is no longer content-uploaded.
+Every record in it carries its parent session's id, so an upload replaced the parent session's
+snapshot in the content store. Expect one line per run:
+`content upload: skipping Claude subagent transcripts (agent-<hex>.jsonl; first: <locator>): ...`.
+The rest are skipped without a line. On the first start, the pending records older builds wrote
+for subagent transcripts are deleted, with one
+`content upload: discarded the queued content of N Claude subagent transcripts ...` line.
+The metadata lane does not change: a subagent's usage still counts under its parent's session.
+
 New with `parser_version` `codex-transcript-v2`:
 
 - USAGE atoms are one per Claude response, not one per transcript record.
@@ -556,6 +566,11 @@ the marker's `content_sha256`. Transcripts only grow, so this proves the file is
 marker recorded. A reused inode, a rewritten file, or a marker whose id does not name the file fails
 the check, is counted as `IdentityMismatch`, and is never sent. `-dry-run` reads no content, so it
 cannot run this check; its `IdentityMismatch` counts only name/provider mismatches.
+
+**Subagent transcripts.** A located Claude subagent transcript (`agent-<hex>.jsonl`) is never
+re-sent and is counted as `Subagent`. An older build uploaded it under its parent's session id,
+which replaced the parent's snapshot. The parent's transcript keeps its own marker and is selected
+by it like any other transcript.
 
 **Answers.**
 - 2xx: accepted. 201 is a new snapshot, 200 a duplicate. Expect mostly 201s: the same bytes under

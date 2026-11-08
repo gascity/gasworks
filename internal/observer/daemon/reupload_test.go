@@ -450,3 +450,19 @@ func TestContentReuploadSurvivesAMarkerWriteFailure(t *testing.T) {
 		t.Fatalf("journal lines = %d, want 0", f.journalLines())
 	}
 }
+
+// A marker an earlier release wrote for a Claude subagent transcript (uploaded under its parent's id,
+// replacing the parent's snapshot) is never re-sent; the parent's transcript is.
+func TestContentReuploadSkipsSubagentTranscripts(t *testing.T) {
+	f := newReuploadFixture(t)
+	f.transcript(claudeName(reupClaude), "parent\n", reupClaude, "claude", reupOld)
+	f.transcript(filepath.Join("-work-p", reupClaude, "subagents", "agent-a1b2c3d4.jsonl"), "subagent\n", reupClaude, "claude", reupOld)
+	sender := &fakeContentSender{}
+	rep, err := RunContentReupload(context.Background(), f.config(sender))
+	if err != nil {
+		t.Fatalf("re-upload: %v", err)
+	}
+	if rep.Subagent != 1 || rep.Located != 2 || rep.Sent != 1 || sender.count() != 1 || sender.at(0).SourcePath != filepath.Join(f.root, claudeName(reupClaude)) {
+		t.Fatalf("rep=%+v sent=%d", rep, sender.count())
+	}
+}

@@ -86,3 +86,33 @@ func isLowerUUID(s string) bool {
 	}
 	return true
 }
+
+// isClaudeSubagentTranscript reports whether a transcript's locator (or path) names a Claude Code
+// subagent transcript: a basename of the shape agent-<hex>.jsonl, which Claude Code writes under
+// <project>/<session>/subagents/ (and older releases wrote beside the session's own transcript).
+//
+// Such a transcript is never uploaded on the content lane. Every one of its records carries the
+// PARENT session's sessionId (and isSidechain=true), so the live sink threads it to the parent's
+// native id; the content store resolves a snapshot by (source, provider, provider_session_id) before
+// it looks at the path, and its active snapshot is last-upload-wins, so an upload of the subagent's
+// bytes under that id would replace the parent session's snapshot, and every reader of the session's
+// transcript (the transcript view, transcript-extracted references, the K9-T segments) would read the
+// subagent's conversation instead of the parent's, alternating as each file is written. The parent's
+// transcript carries the Task call and its result. The metadata lane is unaffected: the subagent's
+// usage still counts under its parent's session (attribution design 5.4).
+func isClaudeSubagentTranscript(locator string) bool {
+	stem, ok := strings.CutSuffix(filepath.Base(filepath.ToSlash(locator)), ".jsonl")
+	if !ok {
+		return false
+	}
+	hex, ok := strings.CutPrefix(strings.ToLower(stem), "agent-")
+	if !ok || hex == "" {
+		return false
+	}
+	for i := 0; i < len(hex); i++ {
+		if c := hex[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
