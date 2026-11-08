@@ -1,0 +1,57 @@
+{
+  "name": "11_no_usage_between_changes_merges",
+  "description": "A segment is a stretch of usage: a bead that was current only between two usage records with no usage of its own yields no segment.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "c3",
+      "command": "bd close gc-b",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "",
+        "usage_refs": [
+          "u1",
+          "u2"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

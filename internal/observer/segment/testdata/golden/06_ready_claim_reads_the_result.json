@@ -1,0 +1,74 @@
+{
+  "name": "06_ready_claim_reads_the_result",
+  "description": "bd ready --claim opens the id its result names (text or --json); 'No ready work to claim' opens nothing.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd ready --claim",
+      "result": "\n✓ Claimed issue: gc-a: Fix the thing\n",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd ready --claim --json",
+      "result": "[{\"id\":\"gc-b\",\"title\":\"x\",\"status\":\"in_progress\"}]",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "bd ready --claim",
+      "result": "\n○ No ready work to claim\n",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "",
+        "usage_refs": [
+          "u2",
+          "u3"
+        ],
+        "multi_claim": true
+      }
+    ],
+    "diagnostics": 0
+  }
+}

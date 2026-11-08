@@ -1,0 +1,53 @@
+{
+  "name": "02_issuing_message_stays_in_previous_segment",
+  "description": "The assistant message that issues the claim keeps its usage in the previous segment; the next message opens the new one.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": null,
+        "open_ref": "",
+        "close_ref": "c1",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "name": "09_unresolved_and_ambiguous_ids_have_no_effect",
+  "description": "An id that resolves to no project has no effect; a boundary command naming no id has no effect and counts a diagnostic.",
+  "initial": [],
+  "unresolved": [
+    "gc-zz"
+  ],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-zz --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "c3",
+      "command": "bd close",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "c4",
+      "command": "bd ready --claim",
+      "result": "something unexpected",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": null,
+        "open_ref": "",
+        "close_ref": "",
+        "usage_refs": [
+          "u1",
+          "u2"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 3
+  }
+}

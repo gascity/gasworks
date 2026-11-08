@@ -1,0 +1,86 @@
+{
+  "name": "10_initial_bead_and_quality_split",
+  "description": "A session that starts with a declared or inherited bead charges it from the start; tokens are summed per quality and never across.",
+  "initial": [
+    "gc-a"
+  ],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_creation_tokens": 5,
+        "cache_read_tokens": 1000
+      }
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "ESTIMATED",
+        "input_tokens": 50,
+        "output_tokens": 10
+      }
+    },
+    {
+      "ref": "c1",
+      "command": "bd close gc-a",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 1,
+        "output_tokens": 1
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "",
+        "close_ref": "c1",
+        "usage_refs": [
+          "u1",
+          "u2"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c1",
+        "close_ref": "",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0,
+    "tokens": [
+      {
+        "PROVIDER_REPORTED": {
+          "input_tokens": 100,
+          "output_tokens": 20,
+          "cache_creation_tokens": 5,
+          "cache_read_tokens": 1000
+        },
+        "ESTIMATED": {
+          "input_tokens": 50,
+          "output_tokens": 10
+        }
+      },
+      {
+        "PROVIDER_REPORTED": {
+          "input_tokens": 1,
+          "output_tokens": 1
+        }
+      }
+    ]
+  }
+}

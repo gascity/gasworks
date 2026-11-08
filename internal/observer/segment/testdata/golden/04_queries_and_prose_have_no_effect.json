@@ -1,0 +1,93 @@
+{
+  "name": "04_queries_and_prose_have_no_effect",
+  "description": "Queries, git/gh, echo and quoted prose never change the current bead.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "q1",
+      "command": "bd show gc-b",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q2",
+      "command": "bd list --status in_progress",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q3",
+      "command": "git commit -m \"bd close gc-a\"",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q4",
+      "command": "echo \"bd update gc-b --claim\"",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q5",
+      "command": "gh pr create --title 'bd close gc-a'",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q6",
+      "command": "bd ready --json",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q7",
+      "command": "bd update gc-a --notes 'close gc-b soon'",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "q8",
+      "command": "bd comments add gc-a 'bd close gc-a'",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "",
+        "usage_refs": [
+          "u1",
+          "u2"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

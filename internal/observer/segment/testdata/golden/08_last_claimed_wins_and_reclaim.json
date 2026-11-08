@@ -1,0 +1,88 @@
+{
+  "name": "08_last_claimed_wins_and_reclaim",
+  "description": "A batch claim charges the last-claimed bead; claiming an open bead again moves it to the top; closing several ids at once removes them all.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c4",
+      "command": "bd close gc-a gc-b --reason done",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "c3",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": "gc-a",
+        "open_ref": "c3",
+        "close_ref": "c4",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": null,
+        "open_ref": "c4",
+        "close_ref": "",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}
