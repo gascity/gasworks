@@ -1,0 +1,105 @@
+{
+  "name": "12_unclaim_closes",
+  "description": "bd unclaim clears the assignee and resets the status, so it closes every id it names, exactly like a status change. An id-shaped --if-assignee value is a flag value, not an id.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --status in_progress",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "bd unclaim gc-b --if-assignee gc-a --reason 'handing off'",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c4",
+      "command": "bd unclaim gc-a",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u4",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "c3",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": "gc-a",
+        "open_ref": "c3",
+        "close_ref": "c4",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": null,
+        "open_ref": "c4",
+        "close_ref": "",
+        "usage_refs": [
+          "u4"
+        ],
+        "multi_claim": false
+      }
+    ],
+    "diagnostics": 0
+  }
+}

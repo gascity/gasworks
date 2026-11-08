@@ -1,0 +1,105 @@
+{
+  "name": "13_heredoc_bodies_are_data",
+  "description": "A here-document body is data: a file that mentions bd close runs nothing, and an apostrophe in the body never swallows the commands after the delimiter. A here-document fed to a shell is a script, so its lines run.",
+  "initial": [],
+  "unresolved": [],
+  "events": [
+    {
+      "ref": "c1",
+      "command": "bd update gc-a --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u1",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c2",
+      "command": "bd update gc-b --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u2",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c3",
+      "command": "cat > /tmp/handoff.md <<'EOF'\nWhen review passes, run:\nbd close gc-b\nIt's blocked on CI.\nEOF\nbd update gc-c --claim",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u3",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    },
+    {
+      "ref": "c4",
+      "command": "bash <<'EOF'\nbd close gc-c\nEOF",
+      "result": "",
+      "is_error": false
+    },
+    {
+      "ref": "u4",
+      "usage": {
+        "quality": "PROVIDER_REPORTED",
+        "input_tokens": 10,
+        "output_tokens": 5
+      }
+    }
+  ],
+  "want": {
+    "segments": [
+      {
+        "bead": "gc-a",
+        "open_ref": "c1",
+        "close_ref": "c2",
+        "usage_refs": [
+          "u1"
+        ],
+        "multi_claim": false
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c2",
+        "close_ref": "c3",
+        "usage_refs": [
+          "u2"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": "gc-c",
+        "open_ref": "c3",
+        "close_ref": "c4",
+        "usage_refs": [
+          "u3"
+        ],
+        "multi_claim": true
+      },
+      {
+        "bead": "gc-b",
+        "open_ref": "c4",
+        "close_ref": "",
+        "usage_refs": [
+          "u4"
+        ],
+        "multi_claim": true
+      }
+    ],
+    "diagnostics": 0
+  }
+}

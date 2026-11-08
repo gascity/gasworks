@@ -11,8 +11,9 @@ import (
 
 // The golden corpus is shared with gasworks-platform's vendored copy (internal/beadsegment). A
 // case is one session: its initial claims, the ids the lane cannot resolve, and its ordered
-// events (tool calls with their command, result and error flag; usage records). Both repositories
-// run every case through both lane forms and require the same answer.
+// events (tool calls with their command, result, error flag and truncation; usage records). Both
+// repositories run every case through both lane forms and require the same answer. A truncated
+// command is one a lane holds only a byte-capped prefix of (ParseCommandPrefix).
 
 const goldenProject = "proj"
 
@@ -26,11 +27,12 @@ type goldenCase struct {
 }
 
 type goldenEvent struct {
-	Ref     string        `json:"ref"`
-	Command *string       `json:"command,omitempty"`
-	Result  string        `json:"result,omitempty"`
-	IsError bool          `json:"is_error,omitempty"`
-	Usage   *goldenTokens `json:"usage,omitempty"`
+	Ref       string        `json:"ref"`
+	Command   *string       `json:"command,omitempty"`
+	Result    string        `json:"result,omitempty"`
+	IsError   bool          `json:"is_error,omitempty"`
+	Truncated bool          `json:"truncated,omitempty"`
+	Usage     *goldenTokens `json:"usage,omitempty"`
 }
 
 type goldenTokens struct {
@@ -109,6 +111,9 @@ func boundaryOf(c goldenCase, e goldenEvent) ([]ResolvedEffect, int, bool) {
 		return nil, 0, false
 	}
 	p := ParseCommand(*e.Command, e.Result)
+	if e.Truncated {
+		p = ParseCommandPrefix(*e.Command, e.Result)
+	}
 	return resolveGolden(c, p.Effects), p.Ambiguous, true
 }
 

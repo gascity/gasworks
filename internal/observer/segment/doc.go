@@ -7,9 +7,15 @@
 //   - OPEN(id): `bd update <id> --claim`, `bd ready --claim` (id read from the result),
 //     `bd update <id> --status in_progress` / `-s in_progress`. The id is pushed onto the
 //     session's claim stack, or moved to the top if it is already there.
-//   - CLOSE(id): `bd close <ids…>`, `bd update <id> --status <anything else>`,
+//   - CLOSE(id): `bd close <ids…>`, `bd unclaim <ids…>` (it clears the assignee and resets the
+//     status, so it is a status change), `bd update <id> --status <anything else>`,
 //     `bd update <id> --assignee <x>` without --claim. Each id is removed from the stack.
-//   - Everything else (queries, failed commands, git/gh, prose) has no effect.
+//   - Everything else (queries, failed commands, git/gh, prose, here-document bodies that are not
+//     fed to a shell) has no effect.
+//
+// A lane that holds only a byte-capped prefix of a command (the transcript lane: CASS caps a
+// tool_call command at 2 KiB) reads it with ParseCommandPrefix, which keeps only the effects the
+// prefix makes certain; a boundary past the cut is lost, never guessed.
 //
 // The current bead is the top of the stack ("last-claimed wins"). Closing the top reveals the
 // previous still-open claim; an empty stack is "none". A boundary applies after the tool result
