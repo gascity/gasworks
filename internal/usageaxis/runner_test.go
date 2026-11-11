@@ -2,13 +2,39 @@ package usageaxis
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gascity/gasworks/internal/saauth"
 )
+
+// logCapture collects the axis's log lines so a test can assert on them.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logCapture) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logCapture) count(substr string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, ln := range l.lines {
+		if strings.Contains(ln, substr) {
+			n++
+		}
+	}
+	return n
+}
 
 func testCfg(t *testing.T, ledger string) Config {
 	t.Helper()
@@ -95,6 +121,69 @@ func TestRunOnceNoFactsNoBatch(t *testing.T) {
 	_ = r.RunOnce(context.Background())
 	if len(fp.batches) != 0 {
 		t.Fatalf("empty ledger must POST nothing, got %d batches", len(fp.batches))
+	}
+}
+
+func TestHeartbeatReportsProgressOnCatchUp(t *testing.T) {
+	ledger := writeLedger(t, factLine("r1", "m")+factLine("r2", "m"))
+	lc := &logCapture{}
+	r := NewRunner(testCfg(t, ledger), lc.logf)
+	fp := &fakePoster{result: postResult{advance: true}}
+	r.post = fp.post
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := lc.count("caught up"); got != 1 {
+		t.Fatalf("want exactly one heartbeat, got %d: %v", got, lc.lines)
+	}
+	if got := lc.count("2 forwarded since last report"); got != 1 {
+		t.Fatalf("heartbeat must report the forwarded count: %v", lc.lines)
+	}
+}
+
+func TestHeartbeatIsThrottled(t *testing.T) {
+	ledger := writeLedger(t, factLine("r1", "m"))
+	lc := &logCapture{}
+	r := NewRunner(testCfg(t, ledger), lc.logf)
+	r.heartbeatEvery = time.Hour
+	fp := &fakePoster{result: postResult{advance: true}}
+	r.post = fp.post
+
+	for i := 0; i < 3; i++ {
+		_ = r.RunOnce(context.Background())
+	}
+	if got := lc.count("caught up"); got != 1 {
+		t.Fatalf("heartbeat must be throttled to one per interval, got %d: %v", got, lc.lines)
+	}
+}
+
+func TestHeartbeatResumesAfterInterval(t *testing.T) {
+	ledger := writeLedger(t, factLine("r1", "m"))
+	lc := &logCapture{}
+	r := NewRunner(testCfg(t, ledger), lc.logf)
+	r.heartbeatEvery = 0 // interval always elapsed: every healthy drain reports
+	fp := &fakePoster{result: postResult{advance: true}}
+	r.post = fp.post
+
+	_ = r.RunOnce(context.Background())
+	_ = r.RunOnce(context.Background())
+	if got := lc.count("caught up"); got != 2 {
+		t.Fatalf("want a heartbeat per drain once the interval elapses, got %d: %v", got, lc.lines)
+	}
+}
+
+func TestHeartbeatSilentWhileHoldingCursor(t *testing.T) {
+	ledger := writeLedger(t, factLine("r1", "m"))
+	lc := &logCapture{}
+	r := NewRunner(testCfg(t, ledger), lc.logf)
+	r.heartbeatEvery = 0 // even unthrottled, a held batch must never claim progress
+	fp := &fakePoster{result: postResult{retryable: true}}
+	r.post = fp.post
+
+	_ = r.RunOnce(context.Background())
+	if got := lc.count("caught up"); got != 0 {
+		t.Fatalf("a held batch must not emit a progress heartbeat: %v", lc.lines)
 	}
 }
 

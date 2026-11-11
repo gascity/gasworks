@@ -17,6 +17,12 @@ type Logf func(format string, args ...any)
 
 const postTimeout = 30 * time.Second
 
+// defaultHeartbeatEvery bounds how often the healthy path reports progress. Only
+// failures log otherwise, so a caught-up axis and a wedged one look identical in the
+// journal — both just stop at whatever failed last. One line per interval is enough to
+// tell them apart without flooding a 5s tick.
+const defaultHeartbeatEvery = 5 * time.Minute
+
 // postResult is the outcome of one batch POST.
 type postResult struct {
 	advance   bool // 2xx: commit the cursor
@@ -31,6 +37,12 @@ type Runner struct {
 	log        Logf
 	postClient *http.Client
 
+	// heartbeat state for the healthy path: how often to report, when we last did, and
+	// how many facts have been confirmed-forwarded since that report.
+	heartbeatEvery time.Duration
+	lastBeat       time.Time
+	sentSince      uint64
+
 	// seams for tests
 	tail func(path string, cur Cursor, max int) ([]Fact, Cursor, bool, error)
 	post func(ctx context.Context, b Batch) postResult
@@ -42,7 +54,7 @@ func NewRunner(cfg Config, log Logf) *Runner {
 	if log == nil {
 		log = func(string, ...any) {}
 	}
-	r := &Runner{cfg: cfg, log: log, tail: Tail}
+	r := &Runner{cfg: cfg, log: log, tail: Tail, heartbeatEvery: defaultHeartbeatEvery}
 	if cfg.Enabled() {
 		r.postClient = newPostClient()
 	}
@@ -138,6 +150,7 @@ func (r *Runner) drain(ctx context.Context, cur Cursor, st *State) Cursor {
 				r.commit(st, next)
 				cur = next
 			}
+			r.beat(cur) // caught up to EOF: the healthy resting state
 			return cur
 		}
 		res := r.post(ctx, Batch{SourceID: r.cfg.SourceID, SchemaVersion: SchemaVersion, Facts: facts})
@@ -149,8 +162,23 @@ func (r *Runner) drain(ctx context.Context, cur Cursor, st *State) Cursor {
 		}
 		r.commit(st, next)
 		cur = next
+		r.sentSince += uint64(len(facts))
 	}
+	r.beat(cur) // hit the per-drain batch cap with more to send: still healthy
 	return cur
+}
+
+// beat emits a throttled progress line for the healthy path, so a caught-up axis is
+// distinguishable from a stalled one in the journal. It is called only where the drain
+// is healthy — every failure path already logs its own reason.
+func (r *Runner) beat(cur Cursor) {
+	now := time.Now()
+	if !r.lastBeat.IsZero() && now.Sub(r.lastBeat) < r.heartbeatEvery {
+		return
+	}
+	r.log("usage: caught up (next_seq=%d offset=%d, %d forwarded since last report)", cur.NextSeq, cur.Offset, r.sentSince)
+	r.lastBeat = now
+	r.sentSince = 0
 }
 
 // commit persists the cursor for this source, logging (never failing) on a write
