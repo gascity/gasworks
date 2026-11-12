@@ -2,7 +2,7 @@ module github.com/gascity/gasworks
 
 go 1.26.9
 
-toolchain go1.26.10
+toolchain go1.26.11
 
 require (
 	github.com/gastownhall/gascity v1.4.1-0.20260805194759-b19a3da8b5bb
