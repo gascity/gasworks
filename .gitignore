@@ -5,3 +5,7 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+# `go build` run inside a command's directory leaves its binary there.
+/cmd/gasworks/gasworks
+/cmd/gasworks-companion/gasworks-companion
+/cmd/gasworks-forwarder/gasworks-forwarder
