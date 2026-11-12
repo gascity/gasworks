@@ -914,6 +914,39 @@ func (e SessionLifecyclePayloadTransition) Valid() bool {
 	}
 }
 
+// Defines values for SessionOperatorPrincipalClass.
+const (
+	SessionOperatorPrincipalClassSERVICE SessionOperatorPrincipalClass = "SERVICE"
+	SessionOperatorPrincipalClassUSER    SessionOperatorPrincipalClass = "USER"
+)
+
+// Valid indicates whether the value is a known member of the SessionOperatorPrincipalClass enum.
+func (e SessionOperatorPrincipalClass) Valid() bool {
+	switch e {
+	case SessionOperatorPrincipalClassSERVICE:
+		return true
+	case SessionOperatorPrincipalClassUSER:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for SessionOperatorReportedBy.
+const (
+	SessionOperatorReportedByBDLOGINFILE SessionOperatorReportedBy = "BD_LOGIN_FILE"
+)
+
+// Valid indicates whether the value is a known member of the SessionOperatorReportedBy enum.
+func (e SessionOperatorReportedBy) Valid() bool {
+	switch e {
+	case SessionOperatorReportedByBDLOGINFILE:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for SourceBindingState.
 const (
 	SourceBindingStateDECOMMISSIONED SourceBindingState = "DECOMMISSIONED"
@@ -1999,9 +2032,12 @@ type RunListResponse struct {
 // RunStartedBoundary RUN_STARTED opens an explicit run. No drain fields exist on this shape.
 type RunStartedBoundary struct {
 	BoundarySource RunStartedBoundaryBoundarySource `json:"boundary_source"`
-	RunId          string                           `json:"run_id"`
-	Transition     RunStartedBoundaryTransition     `json:"transition"`
-	WorkItemRefs   *[]WorkReference                 `json:"work_item_refs,omitempty"`
+
+	// Operator Optional (S10 M3): the bd login principal at run start, as on SESSION_LIFECYCLE STARTED.
+	Operator     *SessionOperator             `json:"operator,omitempty"`
+	RunId        string                       `json:"run_id"`
+	Transition   RunStartedBoundaryTransition `json:"transition"`
+	WorkItemRefs *[]WorkReference             `json:"work_item_refs,omitempty"`
 }
 
 // RunStartedBoundaryBoundarySource defines model for RunStartedBoundary.BoundarySource.
@@ -2049,6 +2085,9 @@ type SessionLifecyclePayload struct {
 	// NativeSessionId The provider/native session id this evidence belongs to; bounded and non-empty.
 	NativeSessionId string `json:"native_session_id"`
 
+	// Operator Optional (S10 M3, attribution.md §2.1): the principal bd was logged in as on this machine for this org, reported from bd's login file. Only on STARTED and RESUMED; a CLEARED or COMPACTED transition carrying it is 422. Observer ingest splits it into the control ledger and never stores it in ClickHouse.
+	Operator *SessionOperator `json:"operator,omitempty"`
+
 	// Provider Provider name, e.g. codex; bounded and non-empty.
 	Provider    string                             `json:"provider"`
 	StartSource SessionLifecyclePayloadStartSource `json:"start_source"`
@@ -2060,6 +2099,28 @@ type SessionLifecyclePayloadStartSource string
 
 // SessionLifecyclePayloadTransition defines model for SessionLifecyclePayload.Transition.
 type SessionLifecyclePayloadTransition string
+
+// SessionOperator The bd login principal a machine reports for a session (attribution.md §2.1, §7.1). principal_id is "" when no bd login exists for the org, after a logout, or when the login is newer than the session's first record (not_at_start). principal_class is required with a principal and forbidden without one, and matches its prefix (usr_ USER, sp_ SERVICE). Machine-reported, so the Run API serves it as REPORTED until a verified change corroborates it.
+type SessionOperator struct {
+	// NotAtStart True when a login exists but began after the session's first record, so principal_id is "".
+	NotAtStart     *bool                          `json:"not_at_start,omitempty"`
+	PrincipalClass *SessionOperatorPrincipalClass `json:"principal_class,omitempty"`
+
+	// PrincipalId An Accounts principal id (usr_… or sp_…), or "".
+	PrincipalId string `json:"principal_id"`
+
+	// PrincipalSince When the login the principal comes from began.
+	PrincipalSince *time.Time `json:"principal_since,omitempty"`
+
+	// ReportedBy Where the machine read the principal from.
+	ReportedBy SessionOperatorReportedBy `json:"reported_by"`
+}
+
+// SessionOperatorPrincipalClass defines model for SessionOperator.PrincipalClass.
+type SessionOperatorPrincipalClass string
+
+// SessionOperatorReportedBy Where the machine read the principal from.
+type SessionOperatorReportedBy string
 
 // SessionSummary A native session and its immutable attachment intervals.
 type SessionSummary struct {

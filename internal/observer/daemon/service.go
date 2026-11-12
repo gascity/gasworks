@@ -230,6 +230,9 @@ type WatchLoopConfig struct {
 	Interval time.Duration
 	// Match selects which regular-file names under a root are transcripts; nil tracks all.
 	Match func(name string) bool
+	// Operator supplies the bd-login operator the sink stamps on live session starts (S10 M3;
+	// -operator-file). Optional: nil stamps none.
+	Operator OperatorSource
 }
 
 // NewService opens the WAL spool, rebuilds the boundary/ancestry projection from the WAL, and
@@ -490,6 +493,7 @@ func (s *Service) buildSink(cfg *WatchLoopConfig, socketPath string) (*Candidate
 		// The sink stamps run_context by reading the daemon's own session→run index in-process, so a
 		// wrapper-bound explicit run carries its child agent session's usage natively.
 		RunResolver: s.registry,
+		Operator:    cfg.Operator,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("observer daemon: build candidate sink: %w", err)

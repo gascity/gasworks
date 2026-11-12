@@ -275,6 +275,8 @@ type SessionLifecycleCandidate struct {
 	StartSource     wire.SessionLifecyclePayloadStartSource
 	Transition      wire.SessionLifecyclePayloadTransition
 	Model           string // optional; empty becomes absent
+	// Operator is the bd-login principal the sink stamps on a live start (S10 M3); nil is absent.
+	Operator *wire.SessionOperator
 }
 
 // TransformSessionLifecycle projects a SESSION_LIFECYCLE candidate to a clean observation.
@@ -289,6 +291,7 @@ func (p Policy) TransformSessionLifecycle(env PolicyEnvelope, raw SessionLifecyc
 		StartSource:     raw.StartSource,
 		Transition:      raw.Transition,
 		Model:           raw.Model,
+		Operator:        raw.Operator,
 	})
 	if err != nil {
 		return p.failClosed(env, "SESSION_LIFECYCLE", err)
