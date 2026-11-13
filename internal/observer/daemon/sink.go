@@ -60,6 +60,12 @@ type CandidateSinkAdapter struct {
 	// provider is threaded the same way so one watcher can tail Codex and Claude roots together and
 	// each session still gets its true provider on provenance.
 	sessions map[transcriptIdentity]*transcriptSession
+
+	// operator is the bd-login operator source (operator.go); nil stamps no operator. operatorStamped
+	// holds the native sessions whose start already carried one (first operator wins), under
+	// sessionMu.
+	operator        OperatorSource
+	operatorStamped map[string]bool
 }
 
 // sessionRunResolver looks up the explicit run a native session was bound to (satisfied by the
@@ -128,6 +134,9 @@ type SinkConfig struct {
 	// RunResolver maps a native session id to a wrapper-bound run so the sink can stamp run_context.
 	// Optional: nil captures passively (no run binding).
 	RunResolver sessionRunResolver
+	// Operator supplies the bd-login operator stamped on live session starts (S10 M3). Optional:
+	// nil stamps none.
+	Operator OperatorSource
 }
 
 // NewCandidateSinkAdapter validates cfg and returns a ready sink. The Policy is validated once here
@@ -152,6 +161,8 @@ func NewCandidateSinkAdapter(cfg SinkConfig) (*CandidateSinkAdapter, error) {
 		now:              now,
 		runResolver:      cfg.RunResolver,
 		sessions:         map[transcriptIdentity]*transcriptSession{},
+		operator:         cfg.Operator,
+		operatorStamped:  map[string]bool{},
 	}, nil
 }
 
@@ -190,8 +201,10 @@ func (a *CandidateSinkAdapter) deliverOne(ctx context.Context, ref codex.Transcr
 	if provider == "" {
 		provider = a.provider
 	}
+	capturedAt := a.now()
+	a.stampOperator(native, cand, capturedAt)
 	env := evidence.PolicyEnvelope{
-		CapturedAt: a.now(),
+		CapturedAt: capturedAt,
 		Provenance: evidence.RawProvenance{
 			Provider:            provider,
 			NativeSessionID:     native,
@@ -217,6 +230,7 @@ func (a *CandidateSinkAdapter) deliverOne(ctx context.Context, ref codex.Transcr
 		return 0, fmt.Errorf("observer daemon: deliver candidate to daemon: %w", err)
 	}
 	a.recordAppended(ref, cand, native)
+	a.recordOperatorStamped(native, cand)
 	return ack.Sequence, nil
 }
 

@@ -10,12 +10,12 @@ contract travels with the binary and drift is caught by CI.
 | Item | Value |
 | --- | --- |
 | Upstream repo | `gasworks-platform` |
-| Upstream commit | `6b24350bace8abb5a5a10ddc01296842d8b195b4` (P0.4) + additive `UsagePayload.message_id` (observer real-spend join, coordinated with the gasworks-platform PR that adds the same optional property to `docs/reference/schema/observer.openapi.json`) |
+| Upstream commit | `6b24350bace8abb5a5a10ddc01296842d8b195b4` (P0.4) + additive `UsagePayload.message_id` (observer real-spend join, coordinated with the gasworks-platform PR that adds the same optional property to `docs/reference/schema/observer.openapi.json`) + additive `SessionOperator` and the optional `operator` on `SessionLifecyclePayload` and `RunStartedBoundary` (S10 M3, bts-xpw.204.10.4; the same definitions as the gasworks-platform PR that adds them, which must be promoted before a Companion sends the field) |
 | Upstream artifact | `docs/reference/schema/observer.openapi.json` |
 | Upstream corpus | `internal/observercontract/testdata/` (`fixtures/` + `manifest.json`) |
 | Upstream canonical hashes | `internal/observercontract/apigen/testdata/canonical_golden.json` |
-| Artifact SHA-256 | `f12e80f57cc7f23c04936eaa189029778fdface006903cd3f9b37753a49c6a35` |
-| Manifest SHA-256 | `c860ec9e32c2d1ab7da3844d2cc69894db28e68c159f19adb3269581f8d53421` |
+| Artifact SHA-256 | `2f6459809c045d45845969fd6b6152a113c68aeddfdeac4afa25e101594e5cd1` |
+| Manifest SHA-256 | `385dd4ed635b92e1724c109b6fd864a7197473c829765dbf5958c27097cd373f` |
 
 The upstream artifact is the hand-authored source of truth. It is **OpenAPI
 3.0.3 with zero 2020-12-only keywords** (the Checkpoint-0 dialect ruling):

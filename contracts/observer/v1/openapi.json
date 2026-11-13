@@ -1183,6 +1183,14 @@
               "$ref": "#/components/schemas/WorkReference"
             },
             "maxItems": 32
+          },
+          "operator": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionOperator"
+              }
+            ],
+            "description": "Optional (S10 M3): the bd login principal at run start, as on SESSION_LIFECYCLE STARTED."
           }
         },
         "additionalProperties": false
@@ -1324,6 +1332,54 @@
             "minLength": 1,
             "maxLength": 128,
             "description": "Optional bounded provider-reported model identifier; absent (never empty) when unknown."
+          },
+          "operator": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionOperator"
+              }
+            ],
+            "description": "Optional (S10 M3, attribution.md \u00a72.1): the principal bd was logged in as on this machine for this org, reported from bd's login file. Only on STARTED and RESUMED; a CLEARED or COMPACTED transition carrying it is 422. Observer ingest splits it into the control ledger and never stores it in ClickHouse."
+          }
+        },
+        "additionalProperties": false
+      },
+      "SessionOperator": {
+        "description": "The bd login principal a machine reports for a session (attribution.md \u00a72.1, \u00a77.1). principal_id is \"\" when no bd login exists for the org, after a logout, or when the login is newer than the session's first record (not_at_start). principal_class is required with a principal and forbidden without one, and matches its prefix (usr_ USER, sp_ SERVICE). Machine-reported, so the Run API serves it as REPORTED until a verified change corroborates it.",
+        "type": "object",
+        "required": [
+          "principal_id",
+          "reported_by"
+        ],
+        "properties": {
+          "principal_id": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^((usr|sp)_[A-Za-z0-9_-]+)?$",
+            "description": "An Accounts principal id (usr_\u2026 or sp_\u2026), or \"\"."
+          },
+          "principal_class": {
+            "type": "string",
+            "enum": [
+              "USER",
+              "SERVICE"
+            ]
+          },
+          "reported_by": {
+            "type": "string",
+            "enum": [
+              "BD_LOGIN_FILE"
+            ],
+            "description": "Where the machine read the principal from."
+          },
+          "principal_since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the login the principal comes from began."
+          },
+          "not_at_start": {
+            "type": "boolean",
+            "description": "True when a login exists but began after the session's first record, so principal_id is \"\"."
           }
         },
         "additionalProperties": false

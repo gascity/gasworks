@@ -153,6 +153,61 @@ func (p PendingObservation) Seal(seq int64, observationID string) (wire.Observat
 	return p.seal(seq, observationID)
 }
 
+// ---- session operator (S10 M3) ----
+
+// maxOperatorPrincipalID is SessionOperator.principal_id's maxLength.
+const maxOperatorPrincipalID = 64
+
+// operatorPrincipalPattern is SessionOperator.principal_id's pattern without the empty alternative:
+// an Accounts principal id, usr_ or sp_ and a UUIDv7 with hyphens.
+var operatorPrincipalPattern = regexp.MustCompile(`^(usr|sp)_[A-Za-z0-9_-]+$`)
+
+// checkedOperator validates a reported operator against the contract's couplings and returns a
+// defensively-copied value: only STARTED and RESUMED carry one; principal_id is a principal id or "";
+// principal_class goes with a principal, never without one, and matches its prefix. The principal id
+// is never interpolated into an error.
+func checkedOperator(transition wire.SessionLifecyclePayloadTransition, op *wire.SessionOperator) (*wire.SessionOperator, error) {
+	if op == nil {
+		return nil, nil
+	}
+	if transition != wire.SessionLifecyclePayloadTransitionSTARTED && transition != wire.SessionLifecyclePayloadTransitionRESUMED {
+		return nil, buildErr("session_lifecycle.operator", "is reported only on STARTED and RESUMED")
+	}
+	if err := validEnum("session_lifecycle.operator.reported_by", op.ReportedBy); err != nil {
+		return nil, err
+	}
+	out := *op
+	switch {
+	case op.PrincipalId == "":
+		if op.PrincipalClass != nil {
+			return nil, buildErr("session_lifecycle.operator.principal_class", "is set without a principal")
+		}
+	case len(op.PrincipalId) > maxOperatorPrincipalID || !operatorPrincipalPattern.MatchString(op.PrincipalId):
+		return nil, buildErr("session_lifecycle.operator.principal_id", "is not a usr_/sp_ principal id")
+	case op.PrincipalClass == nil:
+		return nil, buildErr("session_lifecycle.operator.principal_class", "is required with a principal")
+	default:
+		want := wire.SessionOperatorPrincipalClassUSER
+		if strings.HasPrefix(op.PrincipalId, "sp_") {
+			want = wire.SessionOperatorPrincipalClassSERVICE
+		}
+		if *op.PrincipalClass != want {
+			return nil, buildErr("session_lifecycle.operator.principal_class", "does not match the principal's prefix")
+		}
+		class := *op.PrincipalClass
+		out.PrincipalClass = &class
+	}
+	if op.PrincipalSince != nil {
+		since := op.PrincipalSince.UTC()
+		out.PrincipalSince = &since
+	}
+	if op.NotAtStart != nil {
+		nas := *op.NotAtStart
+		out.NotAtStart = &nas
+	}
+	return &out, nil
+}
+
 // ---- shared field validation ----
 
 func boundedNonEmpty(field, value string, max int) error {
@@ -542,6 +597,9 @@ type SessionLifecycleInput struct {
 	StartSource     wire.SessionLifecyclePayloadStartSource
 	Transition      wire.SessionLifecyclePayloadTransition
 	Model           string // optional
+	// Operator is the bd-login principal reported for the session (S10 M3); optional, and only on
+	// STARTED and RESUMED.
+	Operator *wire.SessionOperator
 }
 
 // NewSessionLifecycle builds a pre-sequence SESSION_LIFECYCLE observation.
@@ -566,12 +624,17 @@ func NewSessionLifecycle(c Common, in SessionLifecycleInput) (PendingObservation
 	if err != nil {
 		return PendingObservation{}, err
 	}
+	operator, err := checkedOperator(in.Transition, in.Operator)
+	if err != nil {
+		return PendingObservation{}, err
+	}
 	payload := wire.SessionLifecyclePayload{
 		NativeSessionId: in.NativeSessionID,
 		Provider:        in.Provider,
 		StartSource:     in.StartSource,
 		Transition:      in.Transition,
 		Model:           model,
+		Operator:        operator,
 	}
 	return PendingObservation{
 		kind:       string(wire.ObservationEnvelopeKindSESSIONLIFECYCLE),

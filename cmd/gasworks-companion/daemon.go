@@ -19,6 +19,7 @@ import (
 	"github.com/gascity/gasworks/internal/observer/consent"
 	"github.com/gascity/gasworks/internal/observer/daemon"
 	"github.com/gascity/gasworks/internal/observer/evidence"
+	"github.com/gascity/gasworks/internal/observer/operatorfile"
 	"github.com/gascity/gasworks/internal/observer/prefixmap"
 	"github.com/gascity/gasworks/internal/observer/rootpolicy"
 	"github.com/gascity/gasworks/internal/observer/spool"
@@ -88,6 +89,12 @@ func runDaemon(args []string) int {
 	// logged, until bd writes a valid one). Mutually exclusive with the single-project
 	// -bead-prefix/-beads-project.
 	beadPrefixMapFile := fs.String("bead-prefix-map-file", "", "multi-project bead prefix map: JSON array of {prefix, project_id}, hot-reloaded on change (mutually exclusive with -bead-prefix/-beads-project)")
+	// -operator-file is bd's per-org bd-login file (S10 M3): the principal bd is logged in as, which
+	// the daemon stamps on the session starts it captures live so the observer can name each run's
+	// human. It is re-read when it changes (polled at the watcher cadence); a missing or malformed
+	// file never stops the daemon (sessions then report no operator, logged without the content), and
+	// the file is never uploaded.
+	operatorFile := fs.String("operator-file", "", "bd-login operator file (bd.operator/v1) whose principal is stamped on live session starts; hot-reloaded on change")
 
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -201,6 +208,16 @@ func runDaemon(args []string) int {
 			return 2
 		}
 		cfg.Watch = newWatchLoopConfig(approvedRoots, *cursorDir, *pollInterval, references)
+	}
+	if *operatorFile != "" {
+		operators, err := openOperatorFile(*operatorFile, *pollInterval, cfg.Log)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gasworks-companion daemon:", err)
+			return 2
+		}
+		if cfg.Watch != nil {
+			cfg.Watch.Operator = operators
+		}
 	}
 
 	svc, err := daemon.NewService(cfg)
@@ -415,6 +432,15 @@ func openPrefixMap(path string, pollInterval time.Duration, log func(string)) (*
 		pollInterval = codex.DefaultPollInterval
 	}
 	return prefixmap.Open(prefixmap.Config{Path: path, CheckInterval: pollInterval, Log: log})
+}
+
+// openOperatorFile arms the -operator-file reader at the transcript watcher's poll cadence. Like the
+// prefix map, the file never fails startup: only a relative or empty path does.
+func openOperatorFile(path string, pollInterval time.Duration, log func(string)) (*operatorfile.File, error) {
+	if pollInterval <= 0 {
+		pollInterval = codex.DefaultPollInterval
+	}
+	return operatorfile.Open(operatorfile.Config{Path: path, CheckInterval: pollInterval, Log: log})
 }
 
 // transcriptNameMatch reports whether a regular-file basename under an approved root is a real
